@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+.git/
+.env
+*.db
+*.db-wal
+*.db-shm
+bot.log
+bot.log.*
+.bot.pid
+.ai/
+AGENTS.md
+tests/
+.pytest_cache/

@@ -1,0 +1,2030 @@
+#!/usr/bin/env python3
+"""
+Peptide Inventory Telegram Bot
+──────────────────────────────
+Multi-shop inventory, cart/checkout, payment options, admin confirmations.
+Stock is deducted only after an admin confirms payment.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+from logging.handlers import RotatingFileHandler
+
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ChatType, ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
+import db
+import payment_templates as pt
+import setup_wizard
+from config import BRAND_NAME, CURRENCY_SYMBOL, LOG_PATH, OWNER_IDS, TELEGRAM_BOT_TOKEN
+
+log = logging.getLogger("inventory_bot")
+
+
+def setup_logging() -> None:
+    """Log to stdout and a rotating file for post-crash debugging."""
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    root.setLevel(logging.INFO)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fh = RotatingFileHandler(
+            LOG_PATH, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+        )
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    except OSError as exc:
+        log.warning("Could not open log file %s: %s", LOG_PATH, exc)
+
+
+def brand_for(chat_id: int | None) -> str:
+    if chat_id is None:
+        return BRAND_NAME
+    shop = db.get_shop(chat_id)
+    return db.shop_display(shop)["brand_name"]
+
+
+def symbol_for(chat_id: int | None) -> str:
+    if chat_id is None:
+        return CURRENCY_SYMBOL
+    shop = db.get_shop(chat_id)
+    return db.shop_display(shop)["currency_symbol"]
+
+# ── Conversation states ──────────────────────────────────────────────────────
+(
+    ADD_PROD_NAME,
+    ADD_PROD_PRICE,
+    ADD_PROD_STOCK,
+    ADD_PROD_DESC,
+    EDIT_PRICE_VALUE,
+    EDIT_STOCK_VALUE,
+    ADD_PAY_NAME,
+    ADD_PAY_INSTR,
+    SHIP_FEE,
+    SHIP_FREE,
+    ADD_ADMIN_ID,
+    CHECKOUT_NAME,
+    CHECKOUT_ADDRESS,
+    CHECKOUT_NOTES,
+    PAY_TPL_DETAILS,
+) = range(15)
+
+SYM = CURRENCY_SYMBOL
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def money(n: float) -> str:
+    return db.money(float(n), SYM)
+
+
+def cart(context: ContextTypes.DEFAULT_TYPE) -> dict[int, int]:
+    """product_id -> qty stored on user_data."""
+    if "cart" not in context.user_data:
+        context.user_data["cart"] = {}
+    return context.user_data["cart"]
+
+
+def shop_id(context: ContextTypes.DEFAULT_TYPE, update: Update | None = None) -> int | None:
+    """Active shop chat_id for this user session."""
+    sid = context.user_data.get("shop_id")
+    if sid is not None:
+        return int(sid)
+    if update and update.effective_chat:
+        ch = update.effective_chat
+        if ch.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            return int(ch.id)
+    return None
+
+
+def set_shop(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    context.user_data["shop_id"] = int(chat_id)
+
+
+def user_label(user) -> str:
+    name = " ".join(x for x in [user.first_name, user.last_name] if x) or "User"
+    un = f" @{user.username}" if user.username else ""
+    return f"{name}{un} (`{user.id}`)"
+
+
+async def safe_edit(query, text: str, reply_markup=None) -> None:
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        # Fallback without markdown if parse fails
+        if "parse" in str(e).lower() or "entities" in str(e).lower():
+            await query.edit_message_text(
+                text.replace("*", "").replace("_", "").replace("`", ""),
+                reply_markup=reply_markup,
+            )
+        else:
+            log.warning("edit failed: %s", e)
+
+
+def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("🧬 Catalog", callback_data="cat"),
+            InlineKeyboardButton("🛒 Cart", callback_data="cart"),
+        ],
+        [
+            InlineKeyboardButton("📦 My Orders", callback_data="myorders"),
+            InlineKeyboardButton("ℹ️ Help", callback_data="help"),
+        ],
+    ]
+    if is_admin:
+        rows.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+def back_main_kb(extra: list | None = None) -> InlineKeyboardMarkup:
+    rows = list(extra or [])
+    rows.append([InlineKeyboardButton("« Main menu", callback_data="main")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ── /start & shop selection ──────────────────────────────────────────────────
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    assert user and chat
+
+    # Deep-link: /start shop_<chat_id> or setup_<chat_id>
+    if context.args:
+        arg0 = context.args[0]
+        if arg0.startswith("shop_"):
+            try:
+                sid = int(arg0.removeprefix("shop_"))
+                shop = db.get_shop(sid) or db.ensure_shop(sid)
+                set_shop(context, sid)
+                await _show_main(update, context, shop)
+                return
+            except ValueError:
+                pass
+        if arg0.startswith("setup_"):
+            try:
+                sid = int(arg0.removeprefix("setup_"))
+                context.user_data["setup_chat_id"] = sid
+                await update.message.reply_text(
+                    "Continuing shop setup…\nSend /setup to open the wizard, "
+                    "or tap the button below.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "✅ Set up shop",
+                                    callback_data=f"wizoffer:yes:{sid}",
+                                )
+                            ]
+                        ]
+                    ),
+                )
+                return
+            except ValueError:
+                pass
+
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        shop = db.ensure_shop(chat.id, title=chat.title or "Shop")
+        set_shop(context, chat.id)
+        # Auto-promote group creator/admins? Only owners via OWNER_IDS + explicit add.
+        text = (
+            f"*{BRAND_NAME}*\n"
+            f"Shop linked to this group: *{shop['title']}*\n\n"
+            "Members: use /catalog or /order in DM with the bot for a private cart.\n"
+            "Admins: /admin here or in DM after being added."
+        )
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu_kb(db.is_admin(chat.id, user.id)),
+        )
+        return
+
+    # Private chat
+    shops = db.shops_for_admin(user.id)
+    # Also allow picking any known shop if they have a deep link — otherwise list admin shops
+    # or prompt to open from a group.
+    all_shops = shops
+    if not all_shops:
+        # If owner, list all; else show setup help
+        if db.is_owner(user.id):
+            with db.get_db() as conn:
+                rows = conn.execute("SELECT * FROM shops ORDER BY title").fetchall()
+            all_shops = [dict(r) for r in rows]
+
+    if len(all_shops) == 1:
+        set_shop(context, all_shops[0]["chat_id"])
+        await _show_main(update, context, all_shops[0])
+        return
+
+    if all_shops:
+        buttons = [
+            [InlineKeyboardButton(s["title"] or str(s["chat_id"]), callback_data=f"pickshop:{s['chat_id']}")]
+            for s in all_shops
+        ]
+        await update.message.reply_text(
+            f"*{BRAND_NAME}*\nSelect a shop:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # No shops yet — owner can bootstrap a personal shop (uses private chat id)
+    if db.is_owner(user.id):
+        shop = db.ensure_shop(user.id, title=f"{user.first_name or 'Owner'}'s Shop")
+        db.add_admin(user.id, user.id, user.username, user.id)
+        set_shop(context, user.id)
+        await update.message.reply_text(
+            f"*{BRAND_NAME}*\n"
+            "No shops yet — created a personal shop for you (owner).\n"
+            "Add products via Admin Panel. To use a group shop, add the bot to a group and /start there.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu_kb(True),
+        )
+        return
+
+    await update.message.reply_text(
+        f"*{BRAND_NAME}*\n\n"
+        "No shop is linked yet.\n"
+        "• Join a seller group that uses this bot, or\n"
+        "• Open the bot from a group with `/start`, or\n"
+        "• Use a shop link: `t.me/<bot>?start=shop_<id>`\n\n"
+        "Owners: set your Telegram ID in `OWNER_IDS` and /start again.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cb_pickshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid = int(query.data.split(":")[1])
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    set_shop(context, sid)
+    await _show_main(update, context, shop, edit=True)
+
+
+async def _show_main(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    shop: dict,
+    edit: bool = False,
+) -> None:
+    user = update.effective_user
+    assert user
+    is_adm = db.is_admin(shop["chat_id"], user.id)
+    welcome = shop.get("welcome_text") or (
+        f"Welcome to *{shop['title']}*.\nBrowse the catalog, add items to your cart, and checkout."
+    )
+    ship = ""
+    if shop.get("shipping_enabled"):
+        fee = money(float(shop["shipping_fee"]))
+        free = float(shop.get("free_shipping_above") or 0)
+        ship = f"\n🚚 Shipping: {fee}"
+        if free > 0:
+            ship += f" (free over {money(free)})"
+    text = f"*{BRAND_NAME}*\n🏪 *{shop['title']}*\n\n{welcome}{ship}"
+    kb = main_menu_kb(is_adm)
+    if edit and update.callback_query:
+        await safe_edit(update.callback_query, text, kb)
+    elif update.message:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    elif update.callback_query:
+        await safe_edit(update.callback_query, text, kb)
+
+
+async def cb_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid = shop_id(context, update)
+    if sid is None:
+        await safe_edit(query, "No shop selected. Send /start")
+        return ConversationHandler.END
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    await _show_main(update, context, shop, edit=True)
+    return ConversationHandler.END
+
+
+# ── Catalog & cart ───────────────────────────────────────────────────────────
+
+
+async def cmd_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_catalog(update, context)
+
+
+async def cb_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await _send_catalog(update, context, edit=True)
+
+
+async def _send_catalog(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False
+) -> None:
+    sid = shop_id(context, update)
+    if sid is None:
+        msg = "No shop selected. Send /start first."
+        if edit and update.callback_query:
+            await safe_edit(update.callback_query, msg)
+        elif update.message:
+            await update.message.reply_text(msg)
+        return
+
+    products = db.list_products(sid, active_only=True)
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+
+    if not products:
+        text = f"*{shop['title']}* — catalog is empty."
+        kb = back_main_kb()
+        if edit and update.callback_query:
+            await safe_edit(update.callback_query, text, kb)
+        elif update.message:
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        return
+
+    text = f"🧬 *{shop['title']} — Catalog*\n\nTap a product to add to cart:"
+    buttons = []
+    for p in products:
+        stock = int(p["stock"])
+        label = f"{p['name']} · {money(p['price'])}"
+        if stock <= 0:
+            label += " (out)"
+        else:
+            label += f" · {stock} left"
+        buttons.append(
+            [InlineKeyboardButton(label, callback_data=f"prod:{p['id']}")]
+        )
+    buttons.append(
+        [
+            InlineKeyboardButton("🛒 Cart", callback_data="cart"),
+            InlineKeyboardButton("« Menu", callback_data="main"),
+        ]
+    )
+    kb = InlineKeyboardMarkup(buttons)
+    if edit and update.callback_query:
+        await safe_edit(update.callback_query, text, kb)
+    elif update.message:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    elif update.callback_query:
+        await safe_edit(update.callback_query, text, kb)
+
+
+async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    pid = int(query.data.split(":")[1])
+    p = db.get_product(pid)
+    if not p or not p["active"]:
+        await query.answer("Product unavailable", show_alert=True)
+        return
+    stock = int(p["stock"])
+    text = (
+        f"*{p['name']}*\n"
+        f"Price: *{money(p['price'])}* / {p.get('unit') or 'vial'}\n"
+        f"Stock: {stock}\n"
+    )
+    if p.get("description"):
+        text += f"\n{p['description']}\n"
+    buttons = []
+    if stock > 0:
+        buttons.append(
+            [
+                InlineKeyboardButton("＋1", callback_data=f"add:{pid}:1"),
+                InlineKeyboardButton("＋2", callback_data=f"add:{pid}:2"),
+                InlineKeyboardButton("＋5", callback_data=f"add:{pid}:5"),
+            ]
+        )
+    else:
+        text += "\n_Currently out of stock._"
+    buttons.append(
+        [
+            InlineKeyboardButton("« Catalog", callback_data="cat"),
+            InlineKeyboardButton("🛒 Cart", callback_data="cart"),
+        ]
+    )
+    await safe_edit(query, text, InlineKeyboardMarkup(buttons))
+
+
+async def cb_add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, pid_s, qty_s = query.data.split(":")
+    pid, qty = int(pid_s), int(qty_s)
+    p = db.get_product(pid)
+    if not p or not p["active"]:
+        await query.answer("Unavailable", show_alert=True)
+        return
+    stock = int(p["stock"])
+    c = cart(context)
+    new_qty = c.get(pid, 0) + qty
+    if new_qty > stock:
+        await query.answer(f"Only {stock} available", show_alert=True)
+        return
+    c[pid] = new_qty
+    await query.answer(f"Added {qty}× {p['name']} (cart: {new_qty})")
+
+
+async def cb_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await _render_cart(update, context, edit=True)
+
+
+async def cmd_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _render_cart(update, context, edit=False)
+
+
+async def _render_cart(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool
+) -> None:
+    sid = shop_id(context, update)
+    c = cart(context)
+    if not c:
+        text = "🛒 Your cart is empty."
+        kb = back_main_kb([[InlineKeyboardButton("🧬 Catalog", callback_data="cat")]])
+        if edit and update.callback_query:
+            await safe_edit(update.callback_query, text, kb)
+        elif update.message:
+            await update.message.reply_text(text, reply_markup=kb)
+        return
+
+    shop = db.get_shop(sid) if sid else None
+    lines = ["🛒 *Your cart*\n"]
+    subtotal = 0.0
+    buttons = []
+    stale = []
+    for pid, qty in list(c.items()):
+        p = db.get_product(pid)
+        if not p or not p["active"]:
+            stale.append(pid)
+            continue
+        line = float(p["price"]) * qty
+        subtotal += line
+        lines.append(f"• {p['name']} × {qty} = {money(line)}")
+        buttons.append(
+            [
+                InlineKeyboardButton(f"− {p['name'][:18]}", callback_data=f"sub:{pid}"),
+                InlineKeyboardButton("🗑", callback_data=f"rm:{pid}"),
+            ]
+        )
+    for pid in stale:
+        del c[pid]
+
+    if not c:
+        text = "🛒 Your cart is empty."
+        kb = back_main_kb([[InlineKeyboardButton("🧬 Catalog", callback_data="cat")]])
+        if edit and update.callback_query:
+            await safe_edit(update.callback_query, text, kb)
+        return
+
+    shipping = db.calc_shipping(shop, subtotal) if shop else 0.0
+    total = subtotal + shipping
+    lines += [
+        "",
+        f"Subtotal: {money(subtotal)}",
+        f"Shipping: {money(shipping)}",
+        f"*Total: {money(total)}*",
+    ]
+    if shop and shop.get("shipping_enabled") and float(shop.get("free_shipping_above") or 0) > 0:
+        free_at = float(shop["free_shipping_above"])
+        if subtotal < free_at:
+            lines.append(f"_Free shipping over {money(free_at)}_")
+
+    buttons.append([InlineKeyboardButton("✅ Checkout", callback_data="checkout")])
+    buttons.append(
+        [
+            InlineKeyboardButton("🧬 Catalog", callback_data="cat"),
+            InlineKeyboardButton("🗑 Clear", callback_data="clearcart"),
+            InlineKeyboardButton("« Menu", callback_data="main"),
+        ]
+    )
+    text = "\n".join(lines)
+    kb = InlineKeyboardMarkup(buttons)
+    if edit and update.callback_query:
+        await safe_edit(update.callback_query, text, kb)
+    elif update.message:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+
+async def cb_sub_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    pid = int(query.data.split(":")[1])
+    c = cart(context)
+    if pid in c:
+        c[pid] -= 1
+        if c[pid] <= 0:
+            del c[pid]
+    await query.answer("Updated")
+    await _render_cart(update, context, edit=True)
+
+
+async def cb_rm_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    pid = int(query.data.split(":")[1])
+    cart(context).pop(pid, None)
+    await query.answer("Removed")
+    await _render_cart(update, context, edit=True)
+
+
+async def cb_clear_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    context.user_data["cart"] = {}
+    await query.answer("Cart cleared")
+    await _render_cart(update, context, edit=True)
+
+
+# ── Checkout conversation ────────────────────────────────────────────────────
+
+
+async def cb_checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid = shop_id(context, update)
+    c = cart(context)
+    if not sid or not c:
+        await safe_edit(query, "Cart is empty or no shop selected.")
+        return ConversationHandler.END
+
+    methods = db.list_payment_methods(sid, active_only=True)
+    if not methods:
+        await safe_edit(
+            query,
+            "⚠️ No payment methods configured yet. Please contact the shop admin.",
+            back_main_kb(),
+        )
+        return ConversationHandler.END
+
+    # Build cart items & validate stock
+    items = []
+    for pid, qty in c.items():
+        p = db.get_product(pid)
+        if not p or not p["active"] or int(p["stock"]) < qty:
+            await safe_edit(
+                query,
+                f"Stock issue with product id {pid}. Adjust cart and try again.",
+                back_main_kb([[InlineKeyboardButton("🛒 Cart", callback_data="cart")]]),
+            )
+            return ConversationHandler.END
+        items.append(
+            {
+                "product_id": pid,
+                "product_name": p["name"],
+                "unit_price": float(p["price"]),
+                "quantity": qty,
+            }
+        )
+    context.user_data["checkout_items"] = items
+
+    buttons = [
+        [InlineKeyboardButton(m["name"], callback_data=f"paym:{m['id']}")]
+        for m in methods
+    ]
+    buttons.append([InlineKeyboardButton("« Cancel", callback_data="cart")])
+    await safe_edit(
+        query,
+        "💳 *Select payment method:*\n(You'll get pay instructions after confirming shipping.)",
+        InlineKeyboardMarkup(buttons),
+    )
+    return CHECKOUT_NAME  # intermediate; actual name asked after pay method
+
+
+async def cb_pay_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    mid = int(query.data.split(":")[1])
+    method = db.get_payment_method(mid)
+    if not method or not method["active"]:
+        await safe_edit(query, "Payment method unavailable.")
+        return ConversationHandler.END
+    context.user_data["checkout_pay"] = method
+    await safe_edit(
+        query,
+        "📬 *Shipping — full name*\n\nReply with the recipient's full name.\n/cancel to abort.",
+    )
+    return CHECKOUT_NAME
+
+
+async def checkout_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not context.user_data.get("checkout_pay"):
+        await update.message.reply_text(
+            "Please pick a payment method from the buttons above first (or /cancel)."
+        )
+        return CHECKOUT_NAME
+    context.user_data["ship_name"] = (update.message.text or "").strip()
+    await update.message.reply_text(
+        "📬 *Shipping address*\n\n"
+        "Reply with full address (street, city, state/region, ZIP, country).\n"
+        "/cancel to abort.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return CHECKOUT_ADDRESS
+
+
+async def checkout_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["ship_address"] = (update.message.text or "").strip()
+    await update.message.reply_text(
+        "📝 Any delivery notes? (or send `-` for none)\n/cancel to abort.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return CHECKOUT_NOTES
+
+
+async def checkout_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    notes = (update.message.text or "").strip()
+    if notes == "-":
+        notes = ""
+    user = update.effective_user
+    sid = shop_id(context, update)
+    items = context.user_data.get("checkout_items") or []
+    pay = context.user_data.get("checkout_pay")
+    ship_name = context.user_data.get("ship_name") or ""
+    ship_address = context.user_data.get("ship_address") or ""
+
+    if not sid or not items or not pay:
+        await update.message.reply_text("Checkout expired. Start again from cart.")
+        return ConversationHandler.END
+
+    order = db.create_order(
+        chat_id=sid,
+        user_id=user.id,
+        username=user.username,
+        full_name=user.full_name,
+        items=items,
+        payment_method=pay,
+        ship_name=ship_name,
+        ship_address=ship_address,
+        ship_notes=notes,
+    )
+    if not order:
+        await update.message.reply_text(
+            "❌ Could not create order (stock may have changed). Check cart and try again.",
+            reply_markup=back_main_kb([[InlineKeyboardButton("🛒 Cart", callback_data="cart")]]),
+        )
+        return ConversationHandler.END
+
+    # Clear cart
+    context.user_data["cart"] = {}
+    context.user_data.pop("checkout_items", None)
+    context.user_data.pop("checkout_pay", None)
+
+    items_db = db.get_order_items(order["id"])
+    summary = db.format_order_summary(order, items_db, SYM)
+    pay_instr = pay.get("instructions") or "(no instructions set)"
+
+    text = (
+        f"*Order #{order['id']}* — Total: *{money(order['total'])}*\n\n"
+        f"{summary}\n\n"
+        f"{pay_instr}\n\n"
+        "Once you've sent payment, tap below:\n"
+        "_Inventory is only reduced after the seller confirms payment._"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ I've Paid", callback_data=f"paid:{order['id']}")],
+            [InlineKeyboardButton("❌ Cancel order", callback_data=f"cancelord:{order['id']}")],
+            [InlineKeyboardButton("« Menu", callback_data="main")],
+        ]
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+    # Notify shop admins
+    await _notify_admins_new_order(context, order, items_db)
+    return ConversationHandler.END
+
+
+async def _notify_admins_new_order(context, order: dict, items: list[dict]) -> None:
+    summary = db.format_order_summary(order, items, SYM)
+    buyer = order.get("full_name") or order.get("username") or order["user_id"]
+    text = (
+        f"🛒 *New order — payment pending*\n"
+        f"Order *#{order['id']}*\n"
+        f"Buyer: {buyer}\n"
+        f"Method: {order.get('payment_method_name') or '—'}\n"
+        f"Total: *{money(order['total'])}*\n\n"
+        f"{summary}"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Confirm", callback_data=f"admconfirm:{order['id']}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"admreject:{order['id']}"),
+            ],
+            [InlineKeyboardButton("📋 Orders", callback_data="adm_orders")],
+        ]
+    )
+    recipients: set[int] = set(OWNER_IDS)
+    for a in db.list_admins(order["chat_id"]):
+        recipients.add(int(a["user_id"]))
+    for uid in recipients:
+        try:
+            await context.bot.send_message(
+                uid, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+            )
+        except Exception as e:
+            log.info("Could not notify admin %s: %s", uid, e)
+
+
+async def cb_customer_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    oid = int(query.data.split(":")[1])
+    order = db.get_order(oid)
+    user = update.effective_user
+    if not order or order["user_id"] != user.id:
+        await query.answer("Not your order", show_alert=True)
+        return
+    if order["status"] not in ("pending_payment", "awaiting_confirmation"):
+        await query.answer(f"Status: {order['status']}", show_alert=True)
+        return
+    ok = db.mark_order_awaiting_confirmation(oid)
+    if not ok and order["status"] != "awaiting_confirmation":
+        await query.answer("Could not update", show_alert=True)
+        return
+    await query.answer("Marked as paid — awaiting confirmation")
+    items = db.get_order_items(oid)
+    order = db.get_order(oid)
+    summary = db.format_order_summary(order, items, SYM)
+    await safe_edit(
+        query,
+        f"✅ Got it — order *#{oid}* is awaiting confirmation.\n"
+        "The seller will confirm once payment is received.\n\n"
+        f"{summary}",
+        back_main_kb(),
+    )
+    buyer = order.get("full_name") or order.get("username") or order["user_id"]
+    text = (
+        f"💵 *New payment claim — Order #{oid}*\n\n"
+        f"Buyer: {buyer}\n"
+        f"Items: see below\n"
+        f"Total: *{money(order['total'])}*\n"
+        f"Method: {order.get('payment_method_name') or '—'}\n\n"
+        f"{summary}"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Confirm", callback_data=f"admconfirm:{oid}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"admreject:{oid}"),
+            ]
+        ]
+    )
+    recipients: set[int] = set(OWNER_IDS)
+    for a in db.list_admins(order["chat_id"]):
+        recipients.add(int(a["user_id"]))
+    for uid in recipients:
+        try:
+            await context.bot.send_message(
+                uid, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+            )
+        except Exception:
+            pass
+
+
+async def cb_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    oid = int(query.data.split(":")[1])
+    user = update.effective_user
+    ok, msg = db.cancel_order(oid, user.id)
+    await query.answer(msg, show_alert=True)
+    if ok:
+        await safe_edit(query, f"❌ Order #{oid} cancelled.\nInventory unchanged.", back_main_kb())
+
+
+async def cb_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    orders = db.list_user_orders(user.id, limit=15)
+    if not orders:
+        await safe_edit(query, "No orders yet.", back_main_kb())
+        return
+    lines = ["📦 *Your orders*\n"]
+    buttons = []
+    for o in orders:
+        lines.append(
+            f"#{o['id']} · {o['status']} · {money(o['total'])} · {o['created_at'][:10]}"
+        )
+        buttons.append(
+            [InlineKeyboardButton(f"Order #{o['id']}", callback_data=f"vieword:{o['id']}")]
+        )
+    buttons.append([InlineKeyboardButton("« Menu", callback_data="main")])
+    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+
+async def cb_view_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    oid = int(query.data.split(":")[1])
+    order = db.get_order(oid)
+    user = update.effective_user
+    if not order:
+        await query.answer("Not found", show_alert=True)
+        return
+    is_adm = db.is_admin(order["chat_id"], user.id)
+    if order["user_id"] != user.id and not is_adm:
+        await query.answer("Not allowed", show_alert=True)
+        return
+    items = db.get_order_items(oid)
+    text = db.format_order_summary(order, items, SYM)
+    buttons = []
+    if order["user_id"] == user.id and order["status"] == "pending_payment":
+        buttons.append(
+            [InlineKeyboardButton("✅ I've paid", callback_data=f"paid:{oid}")]
+        )
+        buttons.append(
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancelord:{oid}")]
+        )
+    if is_adm and order["status"] in ("pending_payment", "awaiting_confirmation"):
+        buttons.append(
+            [
+                InlineKeyboardButton("✅ Confirm paid", callback_data=f"admconfirm:{oid}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"admreject:{oid}"),
+            ]
+        )
+    buttons.append([InlineKeyboardButton("« Back", callback_data="myorders")])
+    await safe_edit(query, text, InlineKeyboardMarkup(buttons))
+
+
+async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Cancelled.", reply_markup=main_menu_kb())
+    return ConversationHandler.END
+
+
+# ── Admin panel ──────────────────────────────────────────────────────────────
+
+
+def _require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[int | None, bool]:
+    user = update.effective_user
+    sid = shop_id(context, update)
+    if not user:
+        return None, False
+    if sid is None:
+        # Try private shop / first admin shop
+        shops = db.shops_for_admin(user.id)
+        if shops:
+            sid = shops[0]["chat_id"]
+            set_shop(context, sid)
+    if sid is None:
+        return None, False
+    return sid, db.is_admin(sid, user.id)
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await update.message.reply_text("Admin only. Ask an owner to add you with /admin.")
+        return
+    await _admin_home(update, context, sid, edit=False)
+
+
+async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await safe_edit(query, "Admin only.")
+        return ConversationHandler.END
+    await _admin_home(update, context, sid, edit=True)
+    return ConversationHandler.END
+
+
+async def _admin_home(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sid: int, edit: bool
+) -> None:
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    products = db.list_products(sid)
+    pending = db.list_orders(sid, status="awaiting_confirmation", limit=50)
+    open_pay = db.list_orders(sid, status="pending_payment", limit=50)
+    text = (
+        f"⚙️ *Admin — {shop['title']}*\n"
+        f"Shop ID: `{sid}`\n"
+        f"Products: {len(products)} · "
+        f"Awaiting confirm: {len(pending)} · Pending pay: {len(open_pay)}\n\n"
+        f"Shipping: {'ON' if shop.get('shipping_enabled') else 'OFF'} · "
+        f"{money(shop['shipping_fee'])} · free over {money(shop['free_shipping_above'])}"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📦 Products", callback_data="adm_prods"),
+                InlineKeyboardButton("➕ Add product", callback_data="adm_addprod"),
+            ],
+            [
+                InlineKeyboardButton("📋 Orders", callback_data="adm_orders"),
+                InlineKeyboardButton("⏳ Needs confirm", callback_data="adm_awaiting"),
+            ],
+            [
+                InlineKeyboardButton("💳 Payments", callback_data="adm_pays"),
+                InlineKeyboardButton("🚚 Shipping", callback_data="adm_ship"),
+            ],
+            [
+                InlineKeyboardButton("👥 Admins", callback_data="adm_admins"),
+                InlineKeyboardButton("🔗 Shop link", callback_data="adm_link"),
+            ],
+            [InlineKeyboardButton("« Menu", callback_data="main")],
+        ]
+    )
+    if edit and update.callback_query:
+        await safe_edit(update.callback_query, text, kb)
+    elif update.message:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+
+async def cb_adm_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return
+    me = await context.bot.get_me()
+    link = f"https://t.me/{me.username}?start=shop_{sid}"
+    await safe_edit(
+        query,
+        f"🔗 *Customer shop link*\n\n`{link}`\n\nShare this so buyers open the right catalog.",
+        back_main_kb([[InlineKeyboardButton("« Admin", callback_data="admin")]]),
+    )
+
+
+# Products admin
+
+
+async def cb_adm_prods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return
+    products = db.list_products(sid)
+    if not products:
+        await safe_edit(
+            query,
+            "No products yet.",
+            InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("➕ Add product", callback_data="adm_addprod")],
+                    [InlineKeyboardButton("« Admin", callback_data="admin")],
+                ]
+            ),
+        )
+        return
+    lines = ["📦 *Products*\n"]
+    buttons = []
+    for p in products:
+        flag = "✅" if p["active"] else "⏸"
+        lines.append(
+            f"{flag} #{p['id']} *{p['name']}* — {money(p['price'])} · stock {p['stock']}"
+        )
+        buttons.append(
+            [InlineKeyboardButton(f"#{p['id']} {p['name'][:24]}", callback_data=f"admp:{p['id']}")]
+        )
+    buttons.append(
+        [
+            InlineKeyboardButton("➕ Add", callback_data="adm_addprod"),
+            InlineKeyboardButton("« Admin", callback_data="admin"),
+        ]
+    )
+    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+
+async def cb_adm_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return
+    pid = int(query.data.split(":")[1])
+    p = db.get_product(pid)
+    if not p:
+        await query.answer("Missing", show_alert=True)
+        return
+    text = (
+        f"*{p['name']}* (#{p['id']})\n"
+        f"Price: {money(p['price'])} / {p.get('unit')}\n"
+        f"Stock: {p['stock']}\n"
+        f"Active: {'yes' if p['active'] else 'no'}\n"
+        f"{p.get('description') or ''}"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💲 Price", callback_data=f"setprice:{pid}"),
+                InlineKeyboardButton("📊 Stock", callback_data=f"setstock:{pid}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "⏸ Deactivate" if p["active"] else "▶️ Activate",
+                    callback_data=f"togglep:{pid}",
+                ),
+                InlineKeyboardButton("🗑 Delete", callback_data=f"delp:{pid}"),
+            ],
+            [InlineKeyboardButton("« Products", callback_data="adm_prods")],
+        ]
+    )
+    await safe_edit(query, text, kb)
+
+
+async def cb_toggle_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        await query.answer("Denied", show_alert=True)
+        return
+    pid = int(query.data.split(":")[1])
+    p = db.get_product(pid)
+    if not p:
+        await query.answer("Missing", show_alert=True)
+        return
+    db.update_product(pid, active=0 if p["active"] else 1)
+    await query.answer("Updated")
+    query.data = f"admp:{pid}"
+    await cb_adm_product(update, context)
+
+
+async def cb_del_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        await query.answer("Denied", show_alert=True)
+        return
+    pid = int(query.data.split(":")[1])
+    db.delete_product(pid)
+    await query.answer("Deleted")
+    await cb_adm_prods(update, context)
+
+
+async def cb_set_price_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    pid = int(query.data.split(":")[1])
+    context.user_data["edit_pid"] = pid
+    await safe_edit(query, f"Send new price for product #{pid} (e.g. `45.00`)\n/cancel")
+    return EDIT_PRICE_VALUE
+
+
+async def edit_price_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    try:
+        price = float((update.message.text or "").replace("$", "").strip())
+        if price < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Invalid price. Try again or /cancel")
+        return EDIT_PRICE_VALUE
+    pid = context.user_data.get("edit_pid")
+    db.update_product(pid, price=price)
+    await update.message.reply_text(
+        f"✅ Price set to {money(price)}",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Product", callback_data=f"admp:{pid}")]]
+        ),
+    )
+    return ConversationHandler.END
+
+
+async def cb_set_stock_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    pid = int(query.data.split(":")[1])
+    context.user_data["edit_pid"] = pid
+    await safe_edit(
+        query,
+        f"Send new *absolute* stock for #{pid}, or `+5` / `-2` to adjust.\n/cancel",
+    )
+    return EDIT_STOCK_VALUE
+
+
+async def edit_stock_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    raw = (update.message.text or "").strip()
+    pid = context.user_data.get("edit_pid")
+    actor = update.effective_user.id if update.effective_user else None
+    try:
+        if raw.startswith(("+", "-")) and raw[1:].isdigit():
+            new = db.adjust_stock(
+                pid, int(raw), actor_id=actor, reason="admin_stock_delta"
+            )
+        else:
+            stock = int(raw)
+            if stock < 0:
+                raise ValueError
+            prod = db.get_product(pid)
+            before = int(prod["stock"]) if prod else 0
+            delta = stock - before
+            new = db.adjust_stock(
+                pid, delta, actor_id=actor, reason="admin_stock_set"
+            )
+            if new is None:
+                raise ValueError
+    except ValueError:
+        await update.message.reply_text("Invalid. Send a number or +N / -N. /cancel")
+        return EDIT_STOCK_VALUE
+    await update.message.reply_text(
+        f"✅ Stock is now {new}",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Product", callback_data=f"admp:{pid}")]]
+        ),
+    )
+    return ConversationHandler.END
+
+
+async def cb_add_prod_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    context.user_data["new_prod"] = {}
+    await safe_edit(query, "➕ *New product*\n\nSend product name:\n/cancel")
+    return ADD_PROD_NAME
+
+
+async def add_prod_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.setdefault("new_prod", {})["name"] = (update.message.text or "").strip()
+    await update.message.reply_text("Price? (e.g. `39.99`)")
+    return ADD_PROD_PRICE
+
+
+async def add_prod_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        price = float((update.message.text or "").replace("$", "").strip())
+        if price < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Invalid price. Try again.")
+        return ADD_PROD_PRICE
+    context.user_data["new_prod"]["price"] = price
+    await update.message.reply_text("Starting stock quantity? (integer)")
+    return ADD_PROD_STOCK
+
+
+async def add_prod_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        stock = int((update.message.text or "").strip())
+        if stock < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Invalid stock. Try again.")
+        return ADD_PROD_STOCK
+    context.user_data["new_prod"]["stock"] = stock
+    await update.message.reply_text("Short description? (or `-` for none)")
+    return ADD_PROD_DESC
+
+
+async def add_prod_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return ConversationHandler.END
+    desc = (update.message.text or "").strip()
+    if desc == "-":
+        desc = ""
+    np = context.user_data.get("new_prod") or {}
+    pid = db.add_product(
+        sid,
+        name=np["name"],
+        price=np["price"],
+        stock=np["stock"],
+        description=desc,
+    )
+    context.user_data.pop("new_prod", None)
+    await update.message.reply_text(
+        f"✅ Added *{np['name']}* (#{pid}) — {money(np['price'])}, stock {np['stock']}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("« Products", callback_data="adm_prods")],
+                [InlineKeyboardButton("« Admin", callback_data="admin")],
+            ]
+        ),
+    )
+    return ConversationHandler.END
+
+
+# Orders admin
+
+
+async def cb_adm_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return
+    orders = db.list_orders(sid, limit=25)
+    if not orders:
+        await safe_edit(
+            query,
+            "No orders yet.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("« Admin", callback_data="admin")]]),
+        )
+        return
+    lines = ["📋 *Recent orders*\n"]
+    buttons = []
+    for o in orders:
+        lines.append(f"#{o['id']} · `{o['status']}` · {money(o['total'])}")
+        buttons.append(
+            [InlineKeyboardButton(f"#{o['id']} {o['status']}", callback_data=f"vieword:{o['id']}")]
+        )
+    buttons.append([InlineKeyboardButton("« Admin", callback_data="admin")])
+    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+
+async def cb_adm_awaiting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return
+    orders = db.list_orders(sid, status="awaiting_confirmation", limit=30)
+    pending = db.list_orders(sid, status="pending_payment", limit=30)
+    lines = ["⏳ *Needs confirmation*\n"]
+    buttons = []
+    for o in orders:
+        lines.append(f"#{o['id']} reported paid · {money(o['total'])}")
+        buttons.append(
+            [
+                InlineKeyboardButton(f"✅ #{o['id']}", callback_data=f"admconfirm:{o['id']}"),
+                InlineKeyboardButton(f"❌ #{o['id']}", callback_data=f"admreject:{o['id']}"),
+            ]
+        )
+    if pending:
+        lines.append("\n*Still pending payment:*")
+        for o in pending:
+            lines.append(f"#{o['id']} · {money(o['total'])}")
+            buttons.append(
+                [InlineKeyboardButton(f"View #{o['id']}", callback_data=f"vieword:{o['id']}")]
+            )
+    if not orders and not pending:
+        lines.append("_Nothing waiting._")
+    buttons.append([InlineKeyboardButton("« Admin", callback_data="admin")])
+    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+
+async def cb_adm_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    oid = int(query.data.split(":")[1])
+    order = db.get_order(oid)
+    if not order or not db.is_admin(order["chat_id"], user.id):
+        await query.answer("Not allowed", show_alert=True)
+        return
+    ok, msg, low_alerts = db.confirm_order_payment(oid, user.id)
+    await query.answer(msg, show_alert=True)
+    order = db.get_order(oid)
+    items = db.get_order_items(oid)
+    text = f"{'✅' if ok else '⚠️'} {msg}\n\n{db.format_order_summary(order, items, SYM)}"
+    await safe_edit(
+        query,
+        text,
+        InlineKeyboardMarkup([[InlineKeyboardButton("« Orders", callback_data="adm_orders")]]),
+    )
+    if ok:
+        try:
+            await context.bot.send_message(
+                order["user_id"],
+                f"✅ Payment confirmed for order *#{oid}* — thanks!\n"
+                f"Total: {money(order['total'])}\n"
+                "We'll ship to the address you provided.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+        if low_alerts:
+            await _notify_low_stock(context, order["chat_id"], low_alerts)
+
+
+async def cb_adm_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    oid = int(query.data.split(":")[1])
+    order = db.get_order(oid)
+    if not order or not db.is_admin(order["chat_id"], user.id):
+        await query.answer("Not allowed", show_alert=True)
+        return
+    ok, msg = db.reject_order(oid, user.id)
+    await query.answer(msg, show_alert=True)
+    order = db.get_order(oid)
+    items = db.get_order_items(oid)
+    await safe_edit(
+        query,
+        f"{'❌' if ok else '⚠️'} {msg}\n\n{db.format_order_summary(order, items, SYM)}",
+        InlineKeyboardMarkup([[InlineKeyboardButton("« Orders", callback_data="adm_orders")]]),
+    )
+    if ok:
+        try:
+            await context.bot.send_message(
+                order["user_id"],
+                f"❌ Order #{oid} was rejected by the shop. Inventory was not charged. "
+                "Contact the seller if you already paid.",
+            )
+        except Exception:
+            pass
+
+
+# Payment methods admin
+
+
+async def cb_adm_pays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return
+    methods = db.list_payment_methods(sid, active_only=False)
+    lines = ["💳 *Payment methods*\n"]
+    buttons = []
+    for m in methods:
+        flag = "✅" if m["active"] else "⏸"
+        lines.append(f"{flag} #{m['id']} *{m['name']}*")
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{'⏸' if m['active'] else '▶️'} {m['name'][:20]}",
+                    callback_data=f"togglem:{m['id']}",
+                ),
+                InlineKeyboardButton("🗑", callback_data=f"delm:{m['id']}"),
+            ]
+        )
+    if not methods:
+        lines.append("_None configured._")
+    lines.append("\n_Quick add:_")
+    buttons.append(
+        [
+            InlineKeyboardButton("➕ Cash App", callback_data="paytpl:cashapp"),
+            InlineKeyboardButton("➕ Venmo", callback_data="paytpl:venmo"),
+        ]
+    )
+    buttons.append(
+        [
+            InlineKeyboardButton("➕ Crypto", callback_data="paytpl:crypto"),
+            InlineKeyboardButton("➕ Zelle", callback_data="paytpl:zelle"),
+        ]
+    )
+    buttons.append(
+        [
+            InlineKeyboardButton("➕ Custom", callback_data="paytpl:custom"),
+            InlineKeyboardButton("➕ Freeform", callback_data="adm_addpay"),
+        ]
+    )
+    buttons.append([InlineKeyboardButton("« Admin", callback_data="admin")])
+    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+
+async def cb_toggle_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        await query.answer("Denied", show_alert=True)
+        return
+    mid = int(query.data.split(":")[1])
+    m = db.get_payment_method(mid)
+    if not m:
+        await query.answer("Missing", show_alert=True)
+        return
+    db.update_payment_method(mid, active=0 if m["active"] else 1)
+    await query.answer("Updated")
+    await cb_adm_pays(update, context)
+
+
+async def cb_del_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        await query.answer("Denied", show_alert=True)
+        return
+    mid = int(query.data.split(":")[1])
+    db.delete_payment_method(mid)
+    await query.answer("Deleted")
+    await cb_adm_pays(update, context)
+
+
+async def cb_add_pay_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    await safe_edit(
+        query,
+        "➕ Payment method name (e.g. `Cash App`, `Zelle`, `BTC`):\n/cancel",
+    )
+    return ADD_PAY_NAME
+
+
+async def cb_pay_template_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin one-tap Cash App / Venmo / Crypto / Zelle / Custom."""
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return ConversationHandler.END
+    mt = (query.data or "").split(":")[-1]
+    if mt not in pt.METHOD_TYPES:
+        return ConversationHandler.END
+    context.user_data["pay_tpl_type"] = mt
+    context.user_data["pay_tpl_answers"] = []
+    prompts = pt.template_prompts(mt)
+    await safe_edit(query, prompts[0] + "\n\n/cancel")
+    return PAY_TPL_DETAILS
+
+
+async def pay_tpl_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return ConversationHandler.END
+    mt = context.user_data.get("pay_tpl_type") or "custom"
+    answers: list = context.user_data.setdefault("pay_tpl_answers", [])
+    answers.append((update.message.text or "").strip())
+    context.user_data["pay_tpl_answers"] = answers
+    prompts = pt.template_prompts(mt)
+    if len(answers) < len(prompts):
+        await update.message.reply_text(prompts[len(answers)])
+        return PAY_TPL_DETAILS
+    payload = pt.render_from_answers(mt, answers)
+    mid = db.add_payment_from_template(sid, payload)
+    context.user_data.pop("pay_tpl_type", None)
+    context.user_data.pop("pay_tpl_answers", None)
+    await update.message.reply_text(
+        f"✅ Added *{payload['name']}* (#{mid})\n\n"
+        f"{payload['instructions']}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Payments", callback_data="adm_pays")]]
+        ),
+    )
+    return ConversationHandler.END
+
+
+async def add_pay_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["new_pay_name"] = (update.message.text or "").strip()
+    await update.message.reply_text(
+        "Payment instructions (handle, address, memo rules — multi-line OK):"
+    )
+    return ADD_PAY_INSTR
+
+
+async def add_pay_instr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return ConversationHandler.END
+    name = context.user_data.pop("new_pay_name", "Payment")
+    instr = (update.message.text or "").strip()
+    mid = db.add_payment_method(sid, name, instr, method_type="custom")
+    await update.message.reply_text(
+        f"✅ Added payment method *{name}* (#{mid})",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Payments", callback_data="adm_pays")]]
+        ),
+    )
+    return ConversationHandler.END
+
+
+# Shipping admin
+
+
+async def cb_adm_ship(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    text = (
+        f"🚚 *Shipping settings*\n\n"
+        f"Enabled: {'yes' if shop.get('shipping_enabled') else 'no'}\n"
+        f"Flat fee: {money(shop['shipping_fee'])}\n"
+        f"Free above: {money(shop['free_shipping_above'])} "
+        f"(0 = never free)\n"
+        f"Label: {shop.get('shipping_label') or 'Standard shipping'}\n\n"
+        "Shipping is auto-added at checkout based on cart subtotal."
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Toggle ON/OFF",
+                    callback_data="ship_toggle",
+                )
+            ],
+            [InlineKeyboardButton("Set flat fee", callback_data="ship_fee")],
+            [InlineKeyboardButton("Set free-shipping threshold", callback_data="ship_free")],
+            [InlineKeyboardButton("« Admin", callback_data="admin")],
+        ]
+    )
+    await safe_edit(query, text, kb)
+
+
+async def cb_ship_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await query.answer("Denied", show_alert=True)
+        return
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    db.update_shop(sid, shipping_enabled=0 if shop.get("shipping_enabled") else 1)
+    await query.answer("Toggled")
+    await cb_adm_ship(update, context)
+
+
+async def cb_ship_fee_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    await safe_edit(query, "Send flat shipping fee (e.g. `8.00`):\n/cancel")
+    return SHIP_FEE
+
+
+async def ship_fee_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return ConversationHandler.END
+    try:
+        fee = float((update.message.text or "").replace("$", "").strip())
+        if fee < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Invalid. Try again or /cancel")
+        return SHIP_FEE
+    db.update_shop(sid, shipping_fee=fee)
+    await update.message.reply_text(
+        f"✅ Shipping fee set to {money(fee)}",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Shipping", callback_data="adm_ship")]]
+        ),
+    )
+    return ConversationHandler.END
+
+
+async def cb_ship_free_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    await safe_edit(
+        query,
+        "Send free-shipping threshold subtotal (e.g. `150`). Use `0` to disable free shipping.\n/cancel",
+    )
+    return SHIP_FREE
+
+
+async def ship_free_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return ConversationHandler.END
+    try:
+        val = float((update.message.text or "").replace("$", "").strip())
+        if val < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Invalid. Try again or /cancel")
+        return SHIP_FREE
+    db.update_shop(sid, free_shipping_above=val)
+    await update.message.reply_text(
+        f"✅ Free shipping above {money(val)}" if val > 0 else "✅ Free shipping disabled",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Shipping", callback_data="adm_ship")]]
+        ),
+    )
+    return ConversationHandler.END
+
+
+# Admins management
+
+
+async def cb_adm_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return
+    admins = db.list_admins(sid)
+    lines = [
+        "👥 *Shop admins*\n",
+        f"Global owners (env): {', '.join(str(i) for i in sorted(OWNER_IDS)) or 'none'}\n",
+    ]
+    buttons = []
+    for a in admins:
+        un = f"@{a['username']}" if a.get("username") else "—"
+        lines.append(f"• `{a['user_id']}` {un}")
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"Remove {a['user_id']}", callback_data=f"rmadmin:{a['user_id']}"
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton("➕ Add admin", callback_data="adm_addadmin")])
+    buttons.append([InlineKeyboardButton("« Admin", callback_data="admin")])
+    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+
+async def cb_rm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await query.answer("Denied", show_alert=True)
+        return
+    # Only owners can remove admins (or self-removal allowed)
+    target = int(query.data.split(":")[1])
+    if not db.is_owner(user.id) and target != user.id:
+        await query.answer("Only owners can remove other admins", show_alert=True)
+        return
+    db.remove_admin(sid, target)
+    await query.answer("Removed")
+    await cb_adm_admins(update, context)
+
+
+async def cb_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    if not db.is_owner(user.id) and not ok:
+        await safe_edit(query, "Only owners/admins can add.")
+        return ConversationHandler.END
+    await safe_edit(
+        query,
+        "Send the new admin's numeric Telegram *user ID*.\n"
+        "They can get it from @userinfobot.\n/cancel",
+    )
+    return ADD_ADMIN_ID
+
+
+async def add_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return ConversationHandler.END
+    raw = (update.message.text or "").strip()
+    if not raw.isdigit():
+        await update.message.reply_text("Need a numeric user ID. Try again or /cancel")
+        return ADD_ADMIN_ID
+    uid = int(raw)
+    db.ensure_shop(sid)
+    db.add_admin(sid, uid, None, update.effective_user.id)
+    try:
+        await context.bot.send_message(
+            uid,
+            f"You were added as an admin for shop `{sid}` on *{BRAND_NAME}*.\n"
+            "Open the bot and use /admin.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        pass
+    await update.message.reply_text(
+        f"✅ Added admin `{uid}`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Admins", callback_data="adm_admins")]]
+        ),
+    )
+    return ConversationHandler.END
+
+
+# Help
+
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    text = (
+        f"*{BRAND_NAME} — Help*\n\n"
+        "*Customers*\n"
+        "• Browse Catalog → add items → Cart → Checkout\n"
+        "• Choose payment method, enter shipping details\n"
+        "• Shipping fee is auto-added (free over threshold if set)\n"
+        "• Pay using the instructions, then tap *I've paid*\n"
+        "• Inventory only drops after an admin confirms payment\n\n"
+        "*Admins* (`/admin`)\n"
+        "• Products: add, price, stock\n"
+        "• Orders: confirm/reject payments\n"
+        "• Payment methods & shipping settings\n"
+        "• Add other admins per shop\n\n"
+        "*Commands*\n"
+        "/start /catalog /cart /orders /admin /cancel /help"
+    )
+    await safe_edit(query, text, back_main_kb())
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sid = shop_id(context, update)
+    await update.message.reply_text(
+        f"*{brand_for(sid)}*\nUse the menu buttons or /start.\n"
+        "Customers: /catalog /cart /myorders\n"
+        "Admins: /admin /orders\n"
+        "_Stock only drops after an admin confirms payment._",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(
+            db.is_admin(sid or 0, update.effective_user.id)
+            if update.effective_user
+            else False
+        ),
+    )
+
+
+async def _send_user_order_history(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, limit: int = 15
+) -> None:
+    user = update.effective_user
+    orders = db.list_user_orders(user.id, limit=limit)
+    if not orders:
+        await update.message.reply_text("No orders yet.", reply_markup=main_menu_kb())
+        return
+    lines = ["📦 *Your orders*\n"]
+    buttons = []
+    for o in orders:
+        lines.append(f"#{o['id']} · {o['status']} · {money(o['total'])}")
+        buttons.append(
+            [InlineKeyboardButton(f"Order #{o['id']}", callback_data=f"vieword:{o['id']}")]
+        )
+    buttons.append([InlineKeyboardButton("« Menu", callback_data="main")])
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _send_admin_order_history(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sid: int, limit: int = 20
+) -> None:
+    orders = db.list_orders(sid, status=None, limit=limit)
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    if not orders:
+        await update.message.reply_text(
+            f"No orders yet for *{shop['title']}*.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu_kb(True),
+        )
+        return
+    lines = [f"📋 *Orders — {shop['title']}* (last {len(orders)})\n"]
+    buttons = []
+    for o in orders:
+        uname = o.get("username") or o.get("full_name") or o["user_id"]
+        lines.append(
+            f"#{o['id']} · `{o['status']}` · {money(o['total'])} · {uname}"
+        )
+        buttons.append(
+            [InlineKeyboardButton(f"#{o['id']} {o['status']}", callback_data=f"vieword:{o['id']}")]
+        )
+    buttons.append([InlineKeyboardButton("« Admin", callback_data="admin")])
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cmd_myorders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Buyer order history."""
+    await _send_user_order_history(update, context)
+
+
+async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admins: shop order history. Buyers: fall back to personal orders."""
+    user = update.effective_user
+    sid, ok = _require_admin(update, context)
+    if ok and sid is not None:
+        await _send_admin_order_history(update, context, sid)
+        return
+    await _send_user_order_history(update, context)
+
+
+async def _notify_low_stock(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, alerts: list[dict]
+) -> None:
+    if not alerts:
+        return
+    lines = ["⚠️ *Low stock alert*\n"]
+    for a in alerts:
+        lines.append(
+            f"• *{a['name']}* — {a['stock']} left (threshold ≤ {a['threshold']})"
+        )
+    text = "\n".join(lines)
+    recipients: set[int] = set(OWNER_IDS)
+    for a in db.list_admins(chat_id):
+        recipients.add(int(a["user_id"]))
+    for uid in recipients:
+        try:
+            await context.bot.send_message(uid, text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+
+
+async def post_init(app: Application) -> None:
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Open shop menu"),
+            BotCommand("catalog", "Browse products"),
+            BotCommand("cart", "View cart"),
+            BotCommand("myorders", "Your order history"),
+            BotCommand("orders", "Orders (admin shop / your orders)"),
+            BotCommand("admin", "Admin panel"),
+            BotCommand("setup", "Guided shop setup (group admins)"),
+            BotCommand("help", "Help"),
+            BotCommand("cancel", "Cancel current step"),
+        ]
+    )
+
+
+def build_app() -> Application:
+    if not TELEGRAM_BOT_TOKEN:
+        print("ERROR: Set TELEGRAM_BOT_TOKEN in .env")
+        sys.exit(1)
+
+    db.init_db()
+    version = db.get_schema_version()
+    log.info(
+        "DB ready path=%s schema_version=%s",
+        db.get_db_path(),
+        version,
+    )
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    # Conversations (admin + checkout)
+    conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(cb_checkout_start, pattern=r"^checkout$"),
+            CallbackQueryHandler(cb_add_prod_start, pattern=r"^adm_addprod$"),
+            CallbackQueryHandler(cb_set_price_start, pattern=r"^setprice:\d+$"),
+            CallbackQueryHandler(cb_set_stock_start, pattern=r"^setstock:\d+$"),
+            CallbackQueryHandler(cb_add_pay_start, pattern=r"^adm_addpay$"),
+            CallbackQueryHandler(cb_pay_template_start, pattern=r"^paytpl:(cashapp|venmo|crypto|zelle|custom)$"),
+            CallbackQueryHandler(cb_ship_fee_start, pattern=r"^ship_fee$"),
+            CallbackQueryHandler(cb_ship_free_start, pattern=r"^ship_free$"),
+            CallbackQueryHandler(cb_add_admin_start, pattern=r"^adm_addadmin$"),
+        ],
+        states={
+            CHECKOUT_NAME: [
+                CallbackQueryHandler(cb_pay_method, pattern=r"^paym:\d+$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_name),
+            ],
+            CHECKOUT_ADDRESS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_address),
+            ],
+            CHECKOUT_NOTES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_notes),
+            ],
+            ADD_PROD_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_prod_name),
+            ],
+            ADD_PROD_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_prod_price),
+            ],
+            ADD_PROD_STOCK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_prod_stock),
+            ],
+            ADD_PROD_DESC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_prod_desc),
+            ],
+            EDIT_PRICE_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_price_value),
+            ],
+            EDIT_STOCK_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_stock_value),
+            ],
+            ADD_PAY_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_pay_name),
+            ],
+            ADD_PAY_INSTR: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_pay_instr),
+            ],
+            PAY_TPL_DETAILS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pay_tpl_details),
+            ],
+            SHIP_FEE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ship_fee_value),
+            ],
+            SHIP_FREE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ship_free_value),
+            ],
+            ADD_ADMIN_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_admin_id),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_conv),
+            CallbackQueryHandler(cb_cart, pattern=r"^cart$"),
+            CallbackQueryHandler(cb_main, pattern=r"^main$"),
+            CallbackQueryHandler(cb_admin, pattern=r"^admin$"),
+        ],
+        allow_reentry=True,
+        name="main_conv",
+        persistent=False,
+    )
+
+    # Guided group setup (any group admin) — before generic handlers
+    app.add_handler(setup_wizard.build_setup_conversation())
+    app.add_handler(
+        ChatMemberHandler(setup_wizard.on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
+
+    app.add_handler(conv)
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("catalog", cmd_catalog))
+    app.add_handler(CommandHandler("cart", cmd_cart))
+    app.add_handler(CommandHandler("myorders", cmd_myorders))
+    app.add_handler(CommandHandler("orders", cmd_orders))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+
+    app.add_handler(CallbackQueryHandler(cb_pickshop, pattern=r"^pickshop:-?\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_main, pattern=r"^main$"))
+    app.add_handler(CallbackQueryHandler(cb_catalog, pattern=r"^cat$"))
+    app.add_handler(CallbackQueryHandler(cb_product, pattern=r"^prod:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_add_to_cart, pattern=r"^add:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_cart, pattern=r"^cart$"))
+    app.add_handler(CallbackQueryHandler(cb_sub_cart, pattern=r"^sub:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_rm_cart, pattern=r"^rm:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_clear_cart, pattern=r"^clearcart$"))
+    app.add_handler(CallbackQueryHandler(cb_customer_paid, pattern=r"^paid:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_cancel_order, pattern=r"^cancelord:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_my_orders, pattern=r"^myorders$"))
+    app.add_handler(CallbackQueryHandler(cb_view_order, pattern=r"^vieword:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^help$"))
+
+    app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^admin$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_prods, pattern=r"^adm_prods$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_product, pattern=r"^admp:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_toggle_product, pattern=r"^togglep:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_del_product, pattern=r"^delp:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_orders, pattern=r"^adm_orders$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_awaiting, pattern=r"^adm_awaiting$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_confirm, pattern=r"^admconfirm:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_reject, pattern=r"^admreject:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_pays, pattern=r"^adm_pays$"))
+    app.add_handler(CallbackQueryHandler(cb_toggle_method, pattern=r"^togglem:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_del_method, pattern=r"^delm:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_ship, pattern=r"^adm_ship$"))
+    app.add_handler(CallbackQueryHandler(cb_ship_toggle, pattern=r"^ship_toggle$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_admins, pattern=r"^adm_admins$"))
+    app.add_handler(CallbackQueryHandler(cb_rm_admin, pattern=r"^rmadmin:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_link, pattern=r"^adm_link$"))
+
+    return app
+
+
+def main() -> None:
+    setup_logging()
+    # Python 3.12+ / 3.14: ensure a main-thread event loop exists for PTB
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    app = build_app()
+    log.info("%s starting… owners=%s log=%s", BRAND_NAME, sorted(OWNER_IDS), LOG_PATH)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()

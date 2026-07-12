@@ -1,0 +1,23 @@
+# Free-tier friendly blueprint (may spin down on inactivity on free plans).
+# Set env vars in Render dashboard: TELEGRAM_BOT_TOKEN, OWNER_IDS, BRAND_NAME
+services:
+  - type: worker
+    name: peptide-inventory-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: OWNER_IDS
+        sync: false
+      - key: BRAND_NAME
+        value: UnicornFartzzBot
+      - key: DB_PATH
+        value: /data/inventory.db
+      - key: LOG_PATH
+        value: /data/bot.log
+    disk:
+      name: inventory-data
+      mountPath: /data
+      sizeGB: 1
