@@ -27,6 +27,25 @@ Multi-shop inventory bot: catalog, cart, checkout, payment options, per-shop adm
 
 ---
 
+## Always on (free for a bit) + still editable
+
+Code lives on GitHub (edit anytime):  
+**https://github.com/RemyCastle/peptide-inventory-bot**
+
+| Goal | How |
+|------|-----|
+| Run 24/7 free-ish | Deploy to [Railway](https://railway.app/new/github) or Render from that repo |
+| Keep editing | Change files here → `git push` → host redeploys |
+| Secrets | Host env vars only (`.env` is gitignored) |
+| Local click-to-run | Desktop **Run Inventory Bot** or `start.bat` |
+
+Double-click **`OPEN_FREE_HOSTING.bat`** for the setup links.  
+Details: [`deploy/ALWAYS_ON.md`](deploy/ALWAYS_ON.md)
+
+**Only one runner at a time** (cloud *or* local), or Telegram will conflict.
+
+---
+
 ## Quick start (Windows)
 
 ### 1. Create a bot
