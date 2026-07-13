@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     CallbackQueryHandler,
@@ -21,6 +21,12 @@ import payment_templates as pt
 from permissions import can_setup_group_shop, is_group_admin
 
 log = logging.getLogger("inventory_bot.setup")
+
+
+def _force_reply(placeholder: str = "Type your answer...") -> ForceReply:
+    ph = (placeholder or "Type your answer...").strip() or "Type your answer..."
+    return ForceReply(selective=True, input_field_placeholder=ph[:64])
+
 
 # Conversation states (offset to avoid collision with main bot states 0-13)
 (
@@ -286,6 +292,7 @@ async def _begin_wizard(
     await _safe_reply(
         update,
         "What should we call this shop? (This is what buyers will see.)",
+        reply_markup=_force_reply("Shop display name..."),
     )
     return WIZ_NAME
 
@@ -337,8 +344,9 @@ async def cb_existing_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         db.update_shop(chat_id, setup_complete=0)
         user = update.effective_user
         db.add_admin(chat_id, user.id, user.username, user.id)
-        await query.edit_message_text(
-            "What should we call this shop? (This is what buyers will see.)"
+        await query.message.reply_text(
+            "What should we call this shop? (This is what buyers will see.)",
+            reply_markup=_force_reply("Shop display name..."),
         )
         return WIZ_NAME
 
@@ -387,7 +395,17 @@ async def cb_wiz_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["pay_answers"] = []
     context.user_data["pay_prompt_i"] = 0
     prompts = pt.template_prompts(mt)
-    await query.edit_message_text(prompts[0] + "\n\n/cancel to abort setup.")
+    placeholders = {
+        "cashapp": "$Cashtag...",
+        "venmo": "@Venmo handle...",
+        "crypto": "Coin e.g. USDT...",
+        "zelle": "Zelle email or phone...",
+        "custom": "Payment instructions...",
+    }
+    await query.message.reply_text(
+        prompts[0] + "\n\n/cancel to abort setup.",
+        reply_markup=_force_reply(placeholders.get(mt, "Type your answer...")),
+    )
     return WIZ_PAY_DETAILS
 
 
@@ -412,7 +430,15 @@ async def wiz_pay_details(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data["pay_answers"] = answers
     i = len(answers)
     if i < len(prompts):
-        await update.message.reply_text(prompts[i])
+        next_ph = "Type your answer..."
+        if mt == "crypto" and i == 1:
+            next_ph = "Wallet address..."
+        elif mt == "crypto" and i == 2:
+            next_ph = "Network note or - ..."
+        await update.message.reply_text(
+            prompts[i],
+            reply_markup=_force_reply(next_ph),
+        )
         return WIZ_PAY_DETAILS
 
     payload = pt.render_from_answers(mt, answers)
@@ -446,10 +472,11 @@ async def cb_wiz_ship(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return WIZ_PROD_NAME
 
     # yes — ask fee
-    await query.edit_message_text(
+    await query.message.reply_text(
         "What's the flat shipping fee? (number, e.g. `8`)\n"
         "Or send `skip` to use defaults.",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_force_reply("Shipping fee e.g. 8"),
     )
     context.user_data["ship_step"] = "fee"
     return WIZ_SHIP_FEE
@@ -472,12 +499,17 @@ async def wiz_ship_fee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         if fee < 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Send a number (e.g. 8) or `skip`.")
+        await update.message.reply_text(
+            "Send a number (e.g. 8) or `skip`.",
+            reply_markup=_force_reply("Shipping fee e.g. 8"),
+        )
         return WIZ_SHIP_FEE
     context.user_data["ship_fee"] = fee
     await update.message.reply_text(
         "Free shipping over what amount? (e.g. `150`)\n"
-        "Or send `skip` for no free-shipping threshold."
+        "Or send `skip` for no free-shipping threshold.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_force_reply("Free ship over e.g. 150"),
     )
     return WIZ_SHIP_FREE
 
@@ -495,7 +527,10 @@ async def wiz_ship_free(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             if free_above < 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("Send a number or `skip`.")
+            await update.message.reply_text(
+                "Send a number or `skip`.",
+                reply_markup=_force_reply("Free ship over e.g. 150"),
+            )
             return WIZ_SHIP_FREE
     db.update_shop(
         chat_id,
@@ -516,7 +551,10 @@ async def cb_wiz_prod(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     action = (query.data or "").split(":")[-1]
     if action == "skip":
         return await _finish_wizard(update, context)
-    await query.edit_message_text("Product name?")
+    await query.message.reply_text(
+        "Product name?",
+        reply_markup=_force_reply("Product name..."),
+    )
     return WIZ_PROD_NAME
 
 
@@ -526,10 +564,17 @@ async def wiz_prod_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return await cb_wiz_prod(update, context)
     name = (update.message.text or "").strip()
     if not name:
-        await update.message.reply_text("Send a product name.")
+        await update.message.reply_text(
+            "Send a product name.",
+            reply_markup=_force_reply("Product name..."),
+        )
         return WIZ_PROD_NAME
     context.user_data["prod_name"] = name
-    await update.message.reply_text("Price? (number, e.g. `50`)")
+    await update.message.reply_text(
+        "Price? (number, e.g. `50`)",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_force_reply("Price e.g. 50"),
+    )
     return WIZ_PROD_PRICE
 
 
@@ -540,10 +585,16 @@ async def wiz_prod_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if price < 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Send a valid price number.")
+        await update.message.reply_text(
+            "Send a valid price number.",
+            reply_markup=_force_reply("Price e.g. 50"),
+        )
         return WIZ_PROD_PRICE
     context.user_data["prod_price"] = price
-    await update.message.reply_text("Starting stock quantity? (integer, e.g. `10`)")
+    await update.message.reply_text(
+        "Starting stock quantity? (integer, e.g. `10`)",
+        reply_markup=_force_reply("Stock quantity..."),
+    )
     return WIZ_PROD_STOCK
 
 
@@ -557,12 +608,17 @@ async def wiz_prod_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if stock < 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Send a whole number for stock.")
+        await update.message.reply_text(
+            "Send a whole number for stock.",
+            reply_markup=_force_reply("Stock quantity..."),
+        )
         return WIZ_PROD_STOCK
     name = context.user_data.get("prod_name") or "Product"
     price = float(context.user_data.get("prod_price") or 0)
     pid = db.add_product(chat_id, name=name, price=price, stock=stock)
-    await update.message.reply_text(f"✅ Added product *{name}* (#{pid})", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        f"✅ Added product *{name}* (#{pid})", parse_mode=ParseMode.MARKDOWN
+    )
     return await _finish_wizard(update, context)
 
 

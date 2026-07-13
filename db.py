@@ -176,6 +176,7 @@ def init_db() -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_products_chat ON products(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_products_chat_name ON products(chat_id, name);
             CREATE INDEX IF NOT EXISTS idx_orders_chat_status ON orders(chat_id, status);
             CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
             CREATE INDEX IF NOT EXISTS idx_admins_user ON admins(user_id);
@@ -213,6 +214,9 @@ def init_db() -> None:
         _ensure_column(conn, "payment_methods", "chain", "TEXT")
         _ensure_column(conn, "payment_methods", "address", "TEXT")
         _ensure_column(conn, "payment_methods", "network_note", "TEXT")
+
+        # Per-product COA (Certificate of Analysis) external URL
+        _ensure_column(conn, "products", "coa_url", "TEXT")
 
         now = _utc_now()
         row = conn.execute("SELECT version FROM schema_meta WHERE id = 1").fetchone()
@@ -447,6 +451,82 @@ def update_product(product_id: int, **fields: Any) -> bool:
         return cur.rowcount > 0
 
 
+def rename_product(
+    product_id: int, chat_id: int, new_name: str, *, max_len: int = 120
+) -> tuple[bool, str]:
+    """
+    Rename a product scoped to shop (chat_id). Returns (ok, message_or_name).
+    Rejects empty / whitespace-only names. Does not touch stock or price.
+    """
+    name = (new_name or "").strip()
+    if not name:
+        return False, "Name can't be empty. Send a new name or /cancel."
+    if len(name) > max_len:
+        return False, f"Name too long (max {max_len} characters). Try again or /cancel."
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            UPDATE products
+            SET name = ?, updated_at = ?
+            WHERE id = ? AND chat_id = ?
+            """,
+            (name, _utc_now(), product_id, chat_id),
+        )
+        if cur.rowcount <= 0:
+            return False, "Product not found in this shop."
+    return True, name
+
+
+def is_valid_coa_url(url: str) -> bool:
+    """Simple validation: http(s) URL, no whitespace."""
+    u = (url or "").strip()
+    if not u or any(c.isspace() for c in u):
+        return False
+    low = u.lower()
+    return low.startswith("http://") or low.startswith("https://")
+
+
+def set_product_coa_url(
+    product_id: int, chat_id: int, url: str
+) -> tuple[bool, str]:
+    """
+    Set COA URL for a product in a shop. Returns (ok, message_or_url).
+    """
+    u = (url or "").strip()
+    if not is_valid_coa_url(u):
+        return (
+            False,
+            "Invalid link. Send a full URL starting with http:// or https:// (no spaces).",
+        )
+    if len(u) > 2000:
+        return False, "URL too long. Try a shorter share link."
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            UPDATE products
+            SET coa_url = ?, updated_at = ?
+            WHERE id = ? AND chat_id = ?
+            """,
+            (u, _utc_now(), product_id, chat_id),
+        )
+        if cur.rowcount <= 0:
+            return False, "Product not found in this shop."
+    return True, u
+
+
+def clear_product_coa_url(product_id: int, chat_id: int) -> bool:
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            UPDATE products
+            SET coa_url = NULL, updated_at = ?
+            WHERE id = ? AND chat_id = ?
+            """,
+            (_utc_now(), product_id, chat_id),
+        )
+        return cur.rowcount > 0
+
+
 def _insert_audit(
     conn: sqlite3.Connection,
     *,
@@ -578,6 +658,55 @@ def list_products(chat_id: int, active_only: bool = False) -> list[dict]:
                 ORDER BY active DESC, sort_order, name
                 """,
                 (chat_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def search_products(
+    chat_id: int,
+    query: str,
+    *,
+    active_only: bool = True,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Per-shop product search (name + description).
+    Mirrors catalog: active products only when active_only=True (includes out-of-stock).
+    Case-insensitive partial match. Scoped to chat_id only (no cross-shop).
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    pattern = f"%{q}%"
+    with get_db() as conn:
+        if active_only:
+            rows = conn.execute(
+                """
+                SELECT * FROM products
+                WHERE chat_id = ?
+                  AND active = 1
+                  AND (
+                    name LIKE ? COLLATE NOCASE
+                    OR description LIKE ? COLLATE NOCASE
+                  )
+                ORDER BY sort_order, name
+                LIMIT ?
+                """,
+                (chat_id, pattern, pattern, int(limit)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM products
+                WHERE chat_id = ?
+                  AND (
+                    name LIKE ? COLLATE NOCASE
+                    OR description LIKE ? COLLATE NOCASE
+                  )
+                ORDER BY active DESC, sort_order, name
+                LIMIT ?
+                """,
+                (chat_id, pattern, pattern, int(limit)),
             ).fetchall()
         return [dict(r) for r in rows]
 

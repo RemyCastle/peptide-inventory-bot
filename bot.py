@@ -9,12 +9,16 @@ Stock is deducted only after an admin confirms payment.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import sys
+import time
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
 from telegram import (
     BotCommand,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
@@ -33,6 +37,7 @@ from telegram.ext import (
 
 import db
 import payment_templates as pt
+import reports
 import setup_wizard
 from config import BRAND_NAME, CURRENCY_SYMBOL, LOG_PATH, OWNER_IDS, TELEGRAM_BOT_TOKEN
 
@@ -81,6 +86,7 @@ def symbol_for(chat_id: int | None) -> str:
     ADD_PROD_DESC,
     EDIT_PRICE_VALUE,
     EDIT_STOCK_VALUE,
+    EDIT_NAME_VALUE,
     ADD_PAY_NAME,
     ADD_PAY_INSTR,
     SHIP_FEE,
@@ -90,7 +96,22 @@ def symbol_for(chat_id: int | None) -> str:
     CHECKOUT_ADDRESS,
     CHECKOUT_NOTES,
     PAY_TPL_DETAILS,
-) = range(15)
+    SEARCH_QUERY,
+    EDIT_COA_VALUE,
+) = range(18)
+
+# How long a pending admin/buyer prompt stays open (seconds)
+AWAITING_TTL_SEC = 600
+
+
+def force_reply(placeholder: str = "Type your answer...") -> ForceReply:
+    """
+    Open the user's keyboard and focus the input field.
+    selective=True → only the prompted user in groups.
+    Placeholder max length is 64 (Telegram limit).
+    """
+    ph = (placeholder or "Type your answer...").strip() or "Type your answer..."
+    return ForceReply(selective=True, input_field_placeholder=ph[:64])
 
 SYM = CURRENCY_SYMBOL
 
@@ -125,6 +146,66 @@ def set_shop(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     context.user_data["shop_id"] = int(chat_id)
 
 
+def set_awaiting(context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
+    """Mark that the next text message answers a bot prompt."""
+    context.user_data["awaiting"] = key
+    context.user_data["awaiting_at"] = time.time()
+
+
+def clear_awaiting(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("awaiting", None)
+    context.user_data.pop("awaiting_at", None)
+
+
+def awaiting_expired(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    at = context.user_data.get("awaiting_at")
+    if at is None:
+        return False
+    if time.time() - float(at) > AWAITING_TTL_SEC:
+        clear_awaiting(context)
+        return True
+    return False
+
+
+async def accept_prompt_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """
+    DMs: any plain text answers the open prompt (no Telegram 'Reply' required).
+    Groups: must reply-to the bot's prompt so unrelated chat is ignored.
+    """
+    if awaiting_expired(context):
+        if update.message:
+            await update.message.reply_text(
+                "That prompt expired. Tap the button again to restart."
+            )
+        return False
+
+    chat = update.effective_chat
+    msg = update.message
+    if not chat or not msg:
+        return False
+
+    if chat.type == ChatType.PRIVATE:
+        return True
+
+    # Group / supergroup: require reply to a bot message
+    reply = msg.reply_to_message
+    bot_id = context.bot.id
+    if (
+        not reply
+        or not reply.from_user
+        or reply.from_user.id != bot_id
+    ):
+        await msg.reply_text(
+            "In *groups*, please *reply* to my prompt message "
+            "(long-press → Reply). That way I don't grab normal chat.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return False
+    return True
+
+
 def user_label(user) -> str:
     name = " ".join(x for x in [user.first_name, user.last_name] if x) or "User"
     un = f" @{user.username}" if user.username else ""
@@ -154,10 +235,13 @@ def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton("🧬 Catalog", callback_data="cat"),
-            InlineKeyboardButton("🛒 Cart", callback_data="cart"),
+            InlineKeyboardButton("🔍 Search", callback_data="search"),
         ],
         [
+            InlineKeyboardButton("🛒 Cart", callback_data="cart"),
             InlineKeyboardButton("📦 My Orders", callback_data="myorders"),
+        ],
+        [
             InlineKeyboardButton("ℹ️ Help", callback_data="help"),
         ],
     ]
@@ -338,41 +422,12 @@ async def cb_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # ── Catalog & cart ───────────────────────────────────────────────────────────
 
 
-async def cmd_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_catalog(update, context)
-
-
-async def cb_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    await _send_catalog(update, context, edit=True)
-
-
-async def _send_catalog(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False
-) -> None:
-    sid = shop_id(context, update)
-    if sid is None:
-        msg = "No shop selected. Send /start first."
-        if edit and update.callback_query:
-            await safe_edit(update.callback_query, msg)
-        elif update.message:
-            await update.message.reply_text(msg)
-        return
-
-    products = db.list_products(sid, active_only=True)
-    shop = db.get_shop(sid) or db.ensure_shop(sid)
-
-    if not products:
-        text = f"*{shop['title']}* — catalog is empty."
-        kb = back_main_kb()
-        if edit and update.callback_query:
-            await safe_edit(update.callback_query, text, kb)
-        elif update.message:
-            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-        return
-
-    text = f"🧬 *{shop['title']} — Catalog*\n\nTap a product to add to cart:"
+def product_list_keyboard(
+    products: list,
+    *,
+    footer_rows: list | None = None,
+) -> InlineKeyboardMarkup:
+    """Shared product-card buttons used by Catalog and Search."""
     buttons = []
     for p in products:
         stock = int(p["stock"])
@@ -381,22 +436,211 @@ async def _send_catalog(
             label += " (out)"
         else:
             label += f" · {stock} left"
+        row = [InlineKeyboardButton(label, callback_data=f"prod:{p['id']}")]
+        coa = (p.get("coa_url") or "").strip()
+        if coa:
+            row.append(InlineKeyboardButton("📄 COA", url=coa))
+        buttons.append(row)
+    if footer_rows:
+        buttons.extend(footer_rows)
+    else:
         buttons.append(
-            [InlineKeyboardButton(label, callback_data=f"prod:{p['id']}")]
+            [
+                InlineKeyboardButton("🛒 Cart", callback_data="cart"),
+                InlineKeyboardButton("« Menu", callback_data="main"),
+            ]
         )
+    return InlineKeyboardMarkup(buttons)
+
+
+def product_detail_keyboard(p: dict, *, stock: int) -> InlineKeyboardMarkup:
+    """Buyer product detail: add-to-cart + optional COA url button."""
+    buttons: list[list] = []
+    coa = (p.get("coa_url") or "").strip()
+    if stock > 0:
+        add_row = [
+            InlineKeyboardButton("＋1", callback_data=f"add:{p['id']}:1"),
+            InlineKeyboardButton("＋2", callback_data=f"add:{p['id']}:2"),
+            InlineKeyboardButton("＋5", callback_data=f"add:{p['id']}:5"),
+        ]
+        buttons.append(add_row)
+    if coa:
+        buttons.append([InlineKeyboardButton("📄 COA", url=coa)])
     buttons.append(
         [
+            InlineKeyboardButton("« Catalog", callback_data="cat"),
             InlineKeyboardButton("🛒 Cart", callback_data="cart"),
-            InlineKeyboardButton("« Menu", callback_data="main"),
         ]
     )
-    kb = InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup(buttons)
+
+
+async def _reply_or_edit(
+    update: Update,
+    text: str,
+    kb: InlineKeyboardMarkup | None = None,
+    *,
+    edit: bool = False,
+) -> None:
     if edit and update.callback_query:
         await safe_edit(update.callback_query, text, kb)
     elif update.message:
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+        )
     elif update.callback_query:
         await safe_edit(update.callback_query, text, kb)
+
+
+async def cmd_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("awaiting_search", None)
+    await _send_catalog(update, context)
+
+
+async def cb_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("awaiting_search", None)
+    await _send_catalog(update, context, edit=True)
+
+
+async def _send_catalog(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False
+) -> None:
+    sid = shop_id(context, update)
+    if sid is None:
+        await _reply_or_edit(update, "No shop selected. Send /start first.", edit=edit)
+        return
+
+    products = db.list_products(sid, active_only=True)
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+
+    if not products:
+        text = f"*{shop['title']}* — catalog is empty."
+        await _reply_or_edit(update, text, back_main_kb(), edit=edit)
+        return
+
+    text = f"🧬 *{shop['title']} — Catalog*\n\nTap a product to add to cart:"
+    footer = [
+        [
+            InlineKeyboardButton("🔍 Search", callback_data="search"),
+            InlineKeyboardButton("🛒 Cart", callback_data="cart"),
+        ],
+        [InlineKeyboardButton("« Menu", callback_data="main")],
+    ]
+    kb = product_list_keyboard(products, footer_rows=footer)
+    await _reply_or_edit(update, text, kb, edit=edit)
+
+
+async def _send_search_results(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    query_text: str,
+    *,
+    edit: bool = False,
+) -> None:
+    sid = shop_id(context, update)
+    if sid is None:
+        await _reply_or_edit(update, "No shop selected. Send /start first.", edit=edit)
+        return
+
+    q = (query_text or "").strip()
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    if not q:
+        await _reply_or_edit(
+            update,
+            "Type what you're looking for, or use `/search tren`.",
+            back_main_kb(
+                [
+                    [
+                        InlineKeyboardButton("🧬 Catalog", callback_data="cat"),
+                        InlineKeyboardButton("🔍 Search", callback_data="search"),
+                    ]
+                ]
+            ),
+            edit=edit,
+        )
+        return
+
+    products = db.search_products(sid, q, active_only=True, limit=20)
+    if not products:
+        text = (
+            f"No products matched `{q}`.\n"
+            "Try browsing the full catalog:"
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🧬 Browse catalog", callback_data="cat")],
+                [InlineKeyboardButton("🔍 Search again", callback_data="search")],
+                [InlineKeyboardButton("« Menu", callback_data="main")],
+            ]
+        )
+        await _reply_or_edit(update, text, kb, edit=edit)
+        return
+
+    text = (
+        f"🔍 *{shop['title']} — Search*\n"
+        f"Results for `{q}` ({len(products)}):\n\n"
+        "Tap a product to view / add to cart:"
+    )
+    footer = [
+        [
+            InlineKeyboardButton("🧬 Catalog", callback_data="cat"),
+            InlineKeyboardButton("🔍 New search", callback_data="search"),
+        ],
+        [
+            InlineKeyboardButton("🛒 Cart", callback_data="cart"),
+            InlineKeyboardButton("« Menu", callback_data="main"),
+        ],
+    ]
+    kb = product_list_keyboard(products, footer_rows=footer)
+    await _reply_or_edit(update, text, kb, edit=edit)
+
+
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """ /search <term> — per-shop product search. """
+    context.user_data.pop("awaiting_search", None)
+    if context.args:
+        clear_awaiting(context)
+        await _send_search_results(update, context, " ".join(context.args))
+        return ConversationHandler.END
+    if shop_id(context, update) is None:
+        await update.message.reply_text("No shop selected. Send /start first.")
+        return ConversationHandler.END
+    set_awaiting(context, "search")
+    await update.message.reply_text(
+        "🔍 *Search*\nType what you're looking for:\n(/cancel to abort)",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Search products..."),
+    )
+    return SEARCH_QUERY
+
+
+async def cb_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid = shop_id(context, update)
+    if sid is None:
+        await safe_edit(query, "No shop selected. Send /start first.")
+        return ConversationHandler.END
+    set_awaiting(context, "search")
+    # New message with ForceReply (edit can't always focus keyboard reliably)
+    await query.message.reply_text(
+        "🔍 *Search*\nType what you're looking for:\n(/cancel to abort)",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Search products..."),
+    )
+    return SEARCH_QUERY
+
+
+async def on_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Capture free-text query after Search button / bare /search."""
+    if not await accept_prompt_message(update, context):
+        return SEARCH_QUERY
+    text = (update.message.text or "").strip()
+    clear_awaiting(context)
+    await _send_search_results(update, context, text)
+    return ConversationHandler.END
 
 
 async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -415,24 +659,11 @@ async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
     if p.get("description"):
         text += f"\n{p['description']}\n"
-    buttons = []
-    if stock > 0:
-        buttons.append(
-            [
-                InlineKeyboardButton("＋1", callback_data=f"add:{pid}:1"),
-                InlineKeyboardButton("＋2", callback_data=f"add:{pid}:2"),
-                InlineKeyboardButton("＋5", callback_data=f"add:{pid}:5"),
-            ]
-        )
-    else:
+    if stock <= 0:
         text += "\n_Currently out of stock._"
-    buttons.append(
-        [
-            InlineKeyboardButton("« Catalog", callback_data="cat"),
-            InlineKeyboardButton("🛒 Cart", callback_data="cart"),
-        ]
-    )
-    await safe_edit(query, text, InlineKeyboardMarkup(buttons))
+    if p.get("coa_url"):
+        text += "\n_COA available — tap 📄 COA below._"
+    await safe_edit(query, text, product_detail_keyboard(p, stock=stock))
 
 
 async def cb_add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -626,9 +857,10 @@ async def cb_pay_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await safe_edit(query, "Payment method unavailable.")
         return ConversationHandler.END
     context.user_data["checkout_pay"] = method
-    await safe_edit(
-        query,
-        "📬 *Shipping — full name*\n\nReply with the recipient's full name.\n/cancel to abort.",
+    await query.message.reply_text(
+        "📬 *Shipping — full name*\n\nSend the recipient's full name.\n/cancel to abort.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Full name..."),
     )
     return CHECKOUT_NAME
 
@@ -639,26 +871,34 @@ async def checkout_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             "Please pick a payment method from the buttons above first (or /cancel)."
         )
         return CHECKOUT_NAME
+    if not await accept_prompt_message(update, context):
+        return CHECKOUT_NAME
     context.user_data["ship_name"] = (update.message.text or "").strip()
     await update.message.reply_text(
         "📬 *Shipping address*\n\n"
-        "Reply with full address (street, city, state/region, ZIP, country).\n"
+        "Send full address (street, city, state/region, ZIP, country).\n"
         "/cancel to abort.",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Shipping address..."),
     )
     return CHECKOUT_ADDRESS
 
 
 async def checkout_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return CHECKOUT_ADDRESS
     context.user_data["ship_address"] = (update.message.text or "").strip()
     await update.message.reply_text(
         "📝 Any delivery notes? (or send `-` for none)\n/cancel to abort.",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Delivery notes or - ..."),
     )
     return CHECKOUT_NOTES
 
 
 async def checkout_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return CHECKOUT_NOTES
     notes = (update.message.text or "").strip()
     if notes == "-":
         notes = ""
@@ -874,6 +1114,8 @@ async def cb_view_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    clear_awaiting(context)
+    context.user_data.pop("edit_pid", None)
     await update.message.reply_text("Cancelled.", reply_markup=main_menu_kb())
     return ConversationHandler.END
 
@@ -946,6 +1188,9 @@ async def _admin_home(
                 InlineKeyboardButton("🚚 Shipping", callback_data="adm_ship"),
             ],
             [
+                InlineKeyboardButton("📤 Export Reports", callback_data="adm_export"),
+            ],
+            [
                 InlineKeyboardButton("👥 Admins", callback_data="adm_admins"),
                 InlineKeyboardButton("🔗 Shop link", callback_data="adm_link"),
             ],
@@ -971,6 +1216,75 @@ async def cb_adm_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🔗 *Customer shop link*\n\n`{link}`\n\nShare this so buyers open the right catalog.",
         back_main_kb([[InlineKeyboardButton("« Admin", callback_data="admin")]]),
     )
+
+
+async def cb_adm_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin export submenu: inventory / pending / both."""
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await safe_edit(query, "Admin only.")
+        return
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    await safe_edit(
+        query,
+        f"📤 *Export Reports — {shop['title']}*\n\n"
+        "Generates a `.txt` file and sends it here (nothing saved on disk).",
+        InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📦 Inventory", callback_data="export:inv")],
+                [InlineKeyboardButton("⏳ Pending Orders", callback_data="export:pending")],
+                [InlineKeyboardButton("📋 Full Report (both)", callback_data="export:both")],
+                [InlineKeyboardButton("« Admin", callback_data="admin")],
+            ]
+        ),
+    )
+
+
+async def cb_export_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Build report in-memory and send as Telegram document."""
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await query.answer("Admin only", show_alert=True)
+        return
+    kind = (query.data or "").split(":")[-1]
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    title = reports.safe_filename_part(shop.get("title") or f"shop{sid}")
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+    if kind == "inv":
+        body = reports.generate_inventory_report(sid)
+        filename = f"inventory_{title}_{day}.txt"
+        caption = f"📦 Inventory — {shop['title']}"
+    elif kind == "pending":
+        body = reports.generate_pending_orders_report(sid)
+        filename = f"pending_orders_{title}_{day}.txt"
+        caption = f"⏳ Pending orders — {shop['title']}"
+    elif kind == "both":
+        body = reports.generate_full_report(sid)
+        filename = f"full_report_{title}_{day}.txt"
+        caption = f"📋 Full report — {shop['title']}"
+    else:
+        await query.answer("Unknown report", show_alert=True)
+        return
+
+    buf = io.BytesIO(body.encode("utf-8"))
+    buf.name = filename
+    chat_id = update.effective_chat.id if update.effective_chat else query.message.chat_id
+    try:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=buf,
+            filename=filename,
+            caption=caption,
+        )
+        await query.answer("Report sent")
+    except Exception as exc:
+        log.warning("export send failed: %s", exc)
+        await query.answer("Could not send report — try again in DM", show_alert=True)
 
 
 # Products admin
@@ -1025,30 +1339,42 @@ async def cb_adm_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not p:
         await query.answer("Missing", show_alert=True)
         return
+    coa = (p.get("coa_url") or "").strip()
+    coa_line = f"COA: `{coa}`\n" if coa else "COA: _not set_\n"
     text = (
         f"*{p['name']}* (#{p['id']})\n"
         f"Price: {money(p['price'])} / {p.get('unit')}\n"
         f"Stock: {p['stock']}\n"
         f"Active: {'yes' if p['active'] else 'no'}\n"
+        f"{coa_line}"
         f"{p.get('description') or ''}"
     )
-    kb = InlineKeyboardMarkup(
+    rows = [
+        [InlineKeyboardButton("✏️ Edit Name", callback_data=f"setname:{pid}")],
         [
+            InlineKeyboardButton("💲 Price", callback_data=f"setprice:{pid}"),
+            InlineKeyboardButton("📊 Stock", callback_data=f"setstock:{pid}"),
+        ],
+        [InlineKeyboardButton("📄 Add/Edit COA Link", callback_data=f"setcoa:{pid}")],
+    ]
+    if coa:
+        rows.append(
             [
-                InlineKeyboardButton("💲 Price", callback_data=f"setprice:{pid}"),
-                InlineKeyboardButton("📊 Stock", callback_data=f"setstock:{pid}"),
-            ],
-            [
-                InlineKeyboardButton(
-                    "⏸ Deactivate" if p["active"] else "▶️ Activate",
-                    callback_data=f"togglep:{pid}",
-                ),
-                InlineKeyboardButton("🗑 Delete", callback_data=f"delp:{pid}"),
-            ],
-            [InlineKeyboardButton("« Products", callback_data="adm_prods")],
+                InlineKeyboardButton("📄 Open COA", url=coa),
+                InlineKeyboardButton("🗑 Remove COA", callback_data=f"clearcoa:{pid}"),
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "⏸ Deactivate" if p["active"] else "▶️ Activate",
+                callback_data=f"togglep:{pid}",
+            ),
+            InlineKeyboardButton("🗑 Delete", callback_data=f"delp:{pid}"),
         ]
     )
-    await safe_edit(query, text, kb)
+    rows.append([InlineKeyboardButton("« Products", callback_data="adm_prods")])
+    await safe_edit(query, text, InlineKeyboardMarkup(rows))
 
 
 async def cb_toggle_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1080,6 +1406,125 @@ async def cb_del_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await cb_adm_prods(update, context)
 
 
+async def cb_set_coa_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return ConversationHandler.END
+    pid = int(query.data.split(":")[1])
+    p = db.get_product(pid)
+    if not p or int(p["chat_id"]) != int(sid):
+        await query.answer("Product not in this shop", show_alert=True)
+        return ConversationHandler.END
+    context.user_data["edit_pid"] = pid
+    set_awaiting(context, "product_coa")
+    await query.message.reply_text(
+        f"📄 *COA link for {p['name']}*\n\n"
+        "Send the COA URL (must start with `http://` or `https://`).\n"
+        "Google Drive / Dropbox share links work fine.\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("https://..."),
+    )
+    return EDIT_COA_VALUE
+
+
+async def edit_coa_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return EDIT_COA_VALUE
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    pid = context.user_data.get("edit_pid")
+    raw = update.message.text or ""
+    success, result = db.set_product_coa_url(int(pid), int(sid), raw)
+    if not success:
+        await update.message.reply_text(result)
+        return EDIT_COA_VALUE
+    clear_awaiting(context)
+    p = db.get_product(int(pid))
+    name = p["name"] if p else f"#{pid}"
+    await update.message.reply_text(
+        f"✅ COA link added for *{name}*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📄 Open COA", url=result)],
+                [InlineKeyboardButton("« Product", callback_data=f"admp:{pid}")],
+                [InlineKeyboardButton("« Products", callback_data="adm_prods")],
+            ]
+        ),
+    )
+    return ConversationHandler.END
+
+
+async def cb_clear_coa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await query.answer("Denied", show_alert=True)
+        return
+    pid = int(query.data.split(":")[1])
+    if not db.clear_product_coa_url(pid, sid):
+        await query.answer("Not found", show_alert=True)
+        return
+    await query.answer("COA link removed")
+    query.data = f"admp:{pid}"
+    await cb_adm_product(update, context)
+
+
+async def cb_set_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    pid = int(query.data.split(":")[1])
+    p = db.get_product(pid)
+    if not p or int(p["chat_id"]) != int(sid):
+        await query.answer("Product not in this shop", show_alert=True)
+        return ConversationHandler.END
+    context.user_data["edit_pid"] = pid
+    set_awaiting(context, "edit_name")
+    old = p["name"]
+    await query.message.reply_text(
+        f"✏️ *Edit name*\n\nCurrent: *{old}*\n\n"
+        f"Send the new name for this product.\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("New product name..."),
+    )
+    return EDIT_NAME_VALUE
+
+
+async def edit_name_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return EDIT_NAME_VALUE
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    pid = context.user_data.get("edit_pid")
+    raw = update.message.text or ""
+    success, result = db.rename_product(int(pid), int(sid), raw)
+    if not success:
+        # Keep state so admin can retry
+        await update.message.reply_text(result)
+        return EDIT_NAME_VALUE
+    clear_awaiting(context)
+    await update.message.reply_text(
+        f"✅ Renamed to *{result}*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("« Product", callback_data=f"admp:{pid}")],
+                [InlineKeyboardButton("« Products", callback_data="adm_prods")],
+            ]
+        ),
+    )
+    return ConversationHandler.END
+
+
 async def cb_set_price_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -1087,14 +1532,26 @@ async def cb_set_price_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not ok:
         return ConversationHandler.END
     pid = int(query.data.split(":")[1])
+    p = db.get_product(pid)
+    if p and sid is not None and int(p["chat_id"]) != int(sid):
+        await query.answer("Product not in this shop", show_alert=True)
+        return ConversationHandler.END
     context.user_data["edit_pid"] = pid
-    await safe_edit(query, f"Send new price for product #{pid} (e.g. `45.00`)\n/cancel")
+    set_awaiting(context, "edit_price")
+    await query.message.reply_text(
+        f"Send new price for product #{pid} (e.g. `45.00`)\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Price e.g. 45.00"),
+    )
     return EDIT_PRICE_VALUE
 
 
 async def edit_price_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return EDIT_PRICE_VALUE
     sid, ok = _require_admin(update, context)
     if not ok:
+        clear_awaiting(context)
         return ConversationHandler.END
     try:
         price = float((update.message.text or "").replace("$", "").strip())
@@ -1104,7 +1561,13 @@ async def edit_price_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("Invalid price. Try again or /cancel")
         return EDIT_PRICE_VALUE
     pid = context.user_data.get("edit_pid")
+    p = db.get_product(int(pid)) if pid else None
+    if not p or (sid is not None and int(p["chat_id"]) != int(sid)):
+        clear_awaiting(context)
+        await update.message.reply_text("Product not found in this shop.")
+        return ConversationHandler.END
     db.update_product(pid, price=price)
+    clear_awaiting(context)
     await update.message.reply_text(
         f"✅ Price set to {money(price)}",
         reply_markup=InlineKeyboardMarkup(
@@ -1121,21 +1584,35 @@ async def cb_set_stock_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not ok:
         return ConversationHandler.END
     pid = int(query.data.split(":")[1])
+    p = db.get_product(pid)
+    if p and sid is not None and int(p["chat_id"]) != int(sid):
+        await query.answer("Product not in this shop", show_alert=True)
+        return ConversationHandler.END
     context.user_data["edit_pid"] = pid
-    await safe_edit(
-        query,
+    set_awaiting(context, "edit_stock")
+    await query.message.reply_text(
         f"Send new *absolute* stock for #{pid}, or `+5` / `-2` to adjust.\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Stock qty or +5 / -2"),
     )
     return EDIT_STOCK_VALUE
 
 
 async def edit_stock_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return EDIT_STOCK_VALUE
     sid, ok = _require_admin(update, context)
     if not ok:
+        clear_awaiting(context)
         return ConversationHandler.END
     raw = (update.message.text or "").strip()
     pid = context.user_data.get("edit_pid")
     actor = update.effective_user.id if update.effective_user else None
+    p = db.get_product(int(pid)) if pid else None
+    if not p or (sid is not None and int(p["chat_id"]) != int(sid)):
+        clear_awaiting(context)
+        await update.message.reply_text("Product not found in this shop.")
+        return ConversationHandler.END
     try:
         if raw.startswith(("+", "-")) and raw[1:].isdigit():
             new = db.adjust_stock(
@@ -1145,8 +1622,7 @@ async def edit_stock_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             stock = int(raw)
             if stock < 0:
                 raise ValueError
-            prod = db.get_product(pid)
-            before = int(prod["stock"]) if prod else 0
+            before = int(p["stock"])
             delta = stock - before
             new = db.adjust_stock(
                 pid, delta, actor_id=actor, reason="admin_stock_set"
@@ -1156,6 +1632,7 @@ async def edit_stock_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except ValueError:
         await update.message.reply_text("Invalid. Send a number or +N / -N. /cancel")
         return EDIT_STOCK_VALUE
+    clear_awaiting(context)
     await update.message.reply_text(
         f"✅ Stock is now {new}",
         reply_markup=InlineKeyboardMarkup(
@@ -1172,45 +1649,78 @@ async def cb_add_prod_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not ok:
         return ConversationHandler.END
     context.user_data["new_prod"] = {}
-    await safe_edit(query, "➕ *New product*\n\nSend product name:\n/cancel")
+    set_awaiting(context, "add_prod")
+    await query.message.reply_text(
+        "➕ *New product*\n\nSend product name:\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Product name..."),
+    )
     return ADD_PROD_NAME
 
 
 async def add_prod_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return ADD_PROD_NAME
     context.user_data.setdefault("new_prod", {})["name"] = (update.message.text or "").strip()
-    await update.message.reply_text("Price? (e.g. `39.99`)")
+    set_awaiting(context, "add_prod_price")
+    await update.message.reply_text(
+        "Price? (e.g. `39.99`)",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Price e.g. 39.99"),
+    )
     return ADD_PROD_PRICE
 
 
 async def add_prod_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return ADD_PROD_PRICE
     try:
         price = float((update.message.text or "").replace("$", "").strip())
         if price < 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Invalid price. Try again.")
+        await update.message.reply_text(
+            "Invalid price. Try again.",
+            reply_markup=force_reply("Price e.g. 39.99"),
+        )
         return ADD_PROD_PRICE
     context.user_data["new_prod"]["price"] = price
-    await update.message.reply_text("Starting stock quantity? (integer)")
+    set_awaiting(context, "add_prod_stock")
+    await update.message.reply_text(
+        "Starting stock quantity? (integer)",
+        reply_markup=force_reply("Stock quantity..."),
+    )
     return ADD_PROD_STOCK
 
 
 async def add_prod_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return ADD_PROD_STOCK
     try:
         stock = int((update.message.text or "").strip())
         if stock < 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Invalid stock. Try again.")
+        await update.message.reply_text(
+            "Invalid stock. Try again.",
+            reply_markup=force_reply("Stock quantity..."),
+        )
         return ADD_PROD_STOCK
     context.user_data["new_prod"]["stock"] = stock
-    await update.message.reply_text("Short description? (or `-` for none)")
+    set_awaiting(context, "add_prod_desc")
+    await update.message.reply_text(
+        "Short description? (or `-` for none)",
+        reply_markup=force_reply("Description or -"),
+    )
     return ADD_PROD_DESC
 
 
 async def add_prod_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return ADD_PROD_DESC
     sid, ok = _require_admin(update, context)
     if not ok or sid is None:
+        clear_awaiting(context)
         return ConversationHandler.END
     desc = (update.message.text or "").strip()
     if desc == "-":
@@ -1224,6 +1734,7 @@ async def add_prod_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         description=desc,
     )
     context.user_data.pop("new_prod", None)
+    clear_awaiting(context)
     await update.message.reply_text(
         f"✅ Added *{np['name']}* (#{pid}) — {money(np['price'])}, stock {np['stock']}",
         parse_mode=ParseMode.MARKDOWN,
@@ -1440,9 +1951,11 @@ async def cb_add_pay_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     sid, ok = _require_admin(update, context)
     if not ok:
         return ConversationHandler.END
-    await safe_edit(
-        query,
+    set_awaiting(context, "add_pay_name")
+    await query.message.reply_text(
         "➕ Payment method name (e.g. `Cash App`, `Zelle`, `BTC`):\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Payment method name..."),
     )
     return ADD_PAY_NAME
 
@@ -1459,14 +1972,28 @@ async def cb_pay_template_start(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
     context.user_data["pay_tpl_type"] = mt
     context.user_data["pay_tpl_answers"] = []
+    set_awaiting(context, f"pay_tpl_{mt}")
     prompts = pt.template_prompts(mt)
-    await safe_edit(query, prompts[0] + "\n\n/cancel")
+    placeholders = {
+        "cashapp": "$Cashtag...",
+        "venmo": "@Venmo handle...",
+        "crypto": "Coin e.g. USDT...",
+        "zelle": "Zelle email or phone...",
+        "custom": "Payment instructions...",
+    }
+    await query.message.reply_text(
+        prompts[0] + "\n\n/cancel",
+        reply_markup=force_reply(placeholders.get(mt, "Type your answer...")),
+    )
     return PAY_TPL_DETAILS
 
 
 async def pay_tpl_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return PAY_TPL_DETAILS
     sid, ok = _require_admin(update, context)
     if not ok or sid is None:
+        clear_awaiting(context)
         return ConversationHandler.END
     mt = context.user_data.get("pay_tpl_type") or "custom"
     answers: list = context.user_data.setdefault("pay_tpl_answers", [])
@@ -1474,12 +2001,29 @@ async def pay_tpl_details(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data["pay_tpl_answers"] = answers
     prompts = pt.template_prompts(mt)
     if len(answers) < len(prompts):
-        await update.message.reply_text(prompts[len(answers)])
+        next_ph = {
+            1: "Wallet address...",
+            2: "Network note or - ...",
+        }.get(len(answers), "Type your answer...")
+        if mt == "crypto":
+            pass
+        else:
+            next_ph = "Type your answer..."
+        if mt == "crypto" and len(answers) == 1:
+            next_ph = "Wallet address..."
+        elif mt == "crypto" and len(answers) == 2:
+            next_ph = "Network note or - ..."
+        set_awaiting(context, f"pay_tpl_{mt}")
+        await update.message.reply_text(
+            prompts[len(answers)],
+            reply_markup=force_reply(next_ph),
+        )
         return PAY_TPL_DETAILS
     payload = pt.render_from_answers(mt, answers)
     mid = db.add_payment_from_template(sid, payload)
     context.user_data.pop("pay_tpl_type", None)
     context.user_data.pop("pay_tpl_answers", None)
+    clear_awaiting(context)
     await update.message.reply_text(
         f"✅ Added *{payload['name']}* (#{mid})\n\n"
         f"{payload['instructions']}",
@@ -1492,20 +2036,28 @@ async def pay_tpl_details(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def add_pay_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return ADD_PAY_NAME
     context.user_data["new_pay_name"] = (update.message.text or "").strip()
+    set_awaiting(context, "add_pay_instr")
     await update.message.reply_text(
-        "Payment instructions (handle, address, memo rules — multi-line OK):"
+        "Payment instructions (handle, address, memo rules — multi-line OK):",
+        reply_markup=force_reply("Payment instructions..."),
     )
     return ADD_PAY_INSTR
 
 
 async def add_pay_instr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return ADD_PAY_INSTR
     sid, ok = _require_admin(update, context)
     if not ok or sid is None:
+        clear_awaiting(context)
         return ConversationHandler.END
     name = context.user_data.pop("new_pay_name", "Payment")
     instr = (update.message.text or "").strip()
     mid = db.add_payment_method(sid, name, instr, method_type="custom")
+    clear_awaiting(context)
     await update.message.reply_text(
         f"✅ Added payment method *{name}* (#{mid})",
         parse_mode=ParseMode.MARKDOWN,
@@ -1569,22 +2121,34 @@ async def cb_ship_fee_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     sid, ok = _require_admin(update, context)
     if not ok:
         return ConversationHandler.END
-    await safe_edit(query, "Send flat shipping fee (e.g. `8.00`):\n/cancel")
+    set_awaiting(context, "ship_fee")
+    await query.message.reply_text(
+        "Send flat shipping fee (e.g. `8.00`):\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Shipping fee e.g. 8.00"),
+    )
     return SHIP_FEE
 
 
 async def ship_fee_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return SHIP_FEE
     sid, ok = _require_admin(update, context)
     if not ok or sid is None:
+        clear_awaiting(context)
         return ConversationHandler.END
     try:
         fee = float((update.message.text or "").replace("$", "").strip())
         if fee < 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Invalid. Try again or /cancel")
+        await update.message.reply_text(
+            "Invalid. Try again or /cancel",
+            reply_markup=force_reply("Shipping fee e.g. 8.00"),
+        )
         return SHIP_FEE
     db.update_shop(sid, shipping_fee=fee)
+    clear_awaiting(context)
     await update.message.reply_text(
         f"✅ Shipping fee set to {money(fee)}",
         reply_markup=InlineKeyboardMarkup(
@@ -1600,25 +2164,35 @@ async def cb_ship_free_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     sid, ok = _require_admin(update, context)
     if not ok:
         return ConversationHandler.END
-    await safe_edit(
-        query,
-        "Send free-shipping threshold subtotal (e.g. `150`). Use `0` to disable free shipping.\n/cancel",
+    set_awaiting(context, "ship_free")
+    await query.message.reply_text(
+        "Send free-shipping threshold subtotal (e.g. `150`). "
+        "Use `0` to disable free shipping.\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Free ship over e.g. 150"),
     )
     return SHIP_FREE
 
 
 async def ship_free_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return SHIP_FREE
     sid, ok = _require_admin(update, context)
     if not ok or sid is None:
+        clear_awaiting(context)
         return ConversationHandler.END
     try:
         val = float((update.message.text or "").replace("$", "").strip())
         if val < 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Invalid. Try again or /cancel")
+        await update.message.reply_text(
+            "Invalid. Try again or /cancel",
+            reply_markup=force_reply("Free ship over e.g. 150"),
+        )
         return SHIP_FREE
     db.update_shop(sid, free_shipping_above=val)
+    clear_awaiting(context)
     await update.message.reply_text(
         f"✅ Free shipping above {money(val)}" if val > 0 else "✅ Free shipping disabled",
         reply_markup=InlineKeyboardMarkup(
@@ -1685,25 +2259,34 @@ async def cb_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not db.is_owner(user.id) and not ok:
         await safe_edit(query, "Only owners/admins can add.")
         return ConversationHandler.END
-    await safe_edit(
-        query,
+    set_awaiting(context, "add_admin")
+    await query.message.reply_text(
         "Send the new admin's numeric Telegram *user ID*.\n"
         "They can get it from @userinfobot.\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Telegram user ID..."),
     )
     return ADD_ADMIN_ID
 
 
 async def add_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return ADD_ADMIN_ID
     sid, ok = _require_admin(update, context)
     if not ok or sid is None:
+        clear_awaiting(context)
         return ConversationHandler.END
     raw = (update.message.text or "").strip()
     if not raw.isdigit():
-        await update.message.reply_text("Need a numeric user ID. Try again or /cancel")
+        await update.message.reply_text(
+            "Need a numeric user ID. Try again or /cancel",
+            reply_markup=force_reply("Telegram user ID..."),
+        )
         return ADD_ADMIN_ID
     uid = int(raw)
     db.ensure_shop(sid)
     db.add_admin(sid, uid, None, update.effective_user.id)
+    clear_awaiting(context)
     try:
         await context.bot.send_message(
             uid,
@@ -1858,6 +2441,7 @@ async def post_init(app: Application) -> None:
         [
             BotCommand("start", "Open shop menu"),
             BotCommand("catalog", "Browse products"),
+            BotCommand("search", "Search products"),
             BotCommand("cart", "View cart"),
             BotCommand("myorders", "Your order history"),
             BotCommand("orders", "Orders (admin shop / your orders)"),
@@ -1896,11 +2480,15 @@ def build_app() -> Application:
             CallbackQueryHandler(cb_add_prod_start, pattern=r"^adm_addprod$"),
             CallbackQueryHandler(cb_set_price_start, pattern=r"^setprice:\d+$"),
             CallbackQueryHandler(cb_set_stock_start, pattern=r"^setstock:\d+$"),
+            CallbackQueryHandler(cb_set_name_start, pattern=r"^setname:\d+$"),
+            CallbackQueryHandler(cb_set_coa_start, pattern=r"^setcoa:\d+$"),
             CallbackQueryHandler(cb_add_pay_start, pattern=r"^adm_addpay$"),
             CallbackQueryHandler(cb_pay_template_start, pattern=r"^paytpl:(cashapp|venmo|crypto|zelle|custom)$"),
             CallbackQueryHandler(cb_ship_fee_start, pattern=r"^ship_fee$"),
             CallbackQueryHandler(cb_ship_free_start, pattern=r"^ship_free$"),
             CallbackQueryHandler(cb_add_admin_start, pattern=r"^adm_addadmin$"),
+            CallbackQueryHandler(cb_search, pattern=r"^search$"),
+            CommandHandler("search", cmd_search),
         ],
         states={
             CHECKOUT_NAME: [
@@ -1931,6 +2519,12 @@ def build_app() -> Application:
             EDIT_STOCK_VALUE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_stock_value),
             ],
+            EDIT_NAME_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_name_value),
+            ],
+            EDIT_COA_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_coa_value),
+            ],
             ADD_PAY_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_pay_name),
             ],
@@ -1949,16 +2543,21 @@ def build_app() -> Application:
             ADD_ADMIN_ID: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_admin_id),
             ],
+            SEARCH_QUERY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_search_text),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel_conv),
             CallbackQueryHandler(cb_cart, pattern=r"^cart$"),
             CallbackQueryHandler(cb_main, pattern=r"^main$"),
+            CallbackQueryHandler(cb_catalog, pattern=r"^cat$"),
             CallbackQueryHandler(cb_admin, pattern=r"^admin$"),
         ],
         allow_reentry=True,
         name="main_conv",
         persistent=False,
+        conversation_timeout=AWAITING_TTL_SEC,
     )
 
     # Guided group setup (any group admin) — before generic handlers
@@ -1997,6 +2596,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_adm_product, pattern=r"^admp:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_toggle_product, pattern=r"^togglep:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_del_product, pattern=r"^delp:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_clear_coa, pattern=r"^clearcoa:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_orders, pattern=r"^adm_orders$"))
     app.add_handler(CallbackQueryHandler(cb_adm_awaiting, pattern=r"^adm_awaiting$"))
     app.add_handler(CallbackQueryHandler(cb_adm_confirm, pattern=r"^admconfirm:\d+$"))
@@ -2009,6 +2609,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_adm_admins, pattern=r"^adm_admins$"))
     app.add_handler(CallbackQueryHandler(cb_rm_admin, pattern=r"^rmadmin:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_link, pattern=r"^adm_link$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_export, pattern=r"^adm_export$"))
+    app.add_handler(CallbackQueryHandler(cb_export_report, pattern=r"^export:(inv|pending|both)$"))
 
     return app
 

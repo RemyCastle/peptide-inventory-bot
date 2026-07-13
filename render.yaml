@@ -1,11 +1,15 @@
-# Free-tier friendly blueprint (may spin down on inactivity on free plans).
-# Set env vars in Render dashboard: TELEGRAM_BOT_TOKEN, OWNER_IDS, BRAND_NAME
+# UnicornFartzzBot on your existing Render account (separate from TyFit).
+# Web service keeps a public health URL; bot long-polls Telegram inside the same process.
+# Starter ≈ always-on (same tier idea as TyFit). Free sleeps after inactivity.
 services:
-  - type: worker
-    name: peptide-inventory-bot
+  - type: web
+    name: unicornfartzz-bot
     runtime: docker
     dockerfilePath: ./Dockerfile
-    plan: free
+    dockerContext: .
+    plan: starter
+    region: oregon
+    healthCheckPath: /
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
@@ -18,6 +22,6 @@ services:
       - key: LOG_PATH
         value: /data/bot.log
     disk:
-      name: inventory-data
+      name: unicornfartzz-data
       mountPath: /data
       sizeGB: 1
