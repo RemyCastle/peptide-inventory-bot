@@ -215,8 +215,11 @@ def init_db() -> None:
         _ensure_column(conn, "payment_methods", "address", "TEXT")
         _ensure_column(conn, "payment_methods", "network_note", "TEXT")
 
-        # Per-product COA (Certificate of Analysis) external URL
+        # Per-product COA (Certificate of Analysis)
         _ensure_column(conn, "products", "coa_url", "TEXT")
+        _ensure_column(conn, "products", "coa_file_id", "TEXT")
+        _ensure_column(conn, "products", "coa_file_type", "TEXT")  # document | photo
+        _ensure_column(conn, "products", "coa_filename", "TEXT")
 
         now = _utc_now()
         row = conn.execute("SELECT version FROM schema_meta WHERE id = 1").fetchone()
@@ -486,11 +489,19 @@ def is_valid_coa_url(url: str) -> bool:
     return low.startswith("http://") or low.startswith("https://")
 
 
+def product_has_coa_file(p: dict | None) -> bool:
+    """True if product has a Telegram-stored COA file (PDF/photo)."""
+    if not p:
+        return False
+    return bool((p.get("coa_file_id") or "").strip())
+
+
 def set_product_coa_url(
     product_id: int, chat_id: int, url: str
 ) -> tuple[bool, str]:
     """
     Set COA URL for a product in a shop. Returns (ok, message_or_url).
+    Prefer set_product_coa_file for buyer-facing COA delivery.
     """
     u = (url or "").strip()
     if not is_valid_coa_url(u):
@@ -514,17 +525,64 @@ def set_product_coa_url(
     return True, u
 
 
-def clear_product_coa_url(product_id: int, chat_id: int) -> bool:
+def set_product_coa_file(
+    product_id: int,
+    chat_id: int,
+    file_id: str,
+    file_type: str,
+    filename: str | None = None,
+) -> tuple[bool, str]:
+    """
+    Store Telegram file_id for COA (document PDF or photo).
+    file_type: 'document' | 'photo'
+    """
+    fid = (file_id or "").strip()
+    ftype = (file_type or "").strip().lower()
+    if not fid:
+        return False, "Missing file."
+    if ftype not in ("document", "photo"):
+        return False, "File type must be document or photo."
+    fname = (filename or "").strip() or None
+    if fname and len(fname) > 255:
+        fname = fname[:255]
     with get_db() as conn:
         cur = conn.execute(
             """
             UPDATE products
-            SET coa_url = NULL, updated_at = ?
+            SET coa_file_id = ?,
+                coa_file_type = ?,
+                coa_filename = ?,
+                updated_at = ?
+            WHERE id = ? AND chat_id = ?
+            """,
+            (fid, ftype, fname, _utc_now(), product_id, chat_id),
+        )
+        if cur.rowcount <= 0:
+            return False, "Product not found in this shop."
+    return True, ftype
+
+
+def clear_product_coa(product_id: int, chat_id: int) -> bool:
+    """Clear all COA fields (file + URL)."""
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            UPDATE products
+            SET coa_url = NULL,
+                coa_file_id = NULL,
+                coa_file_type = NULL,
+                coa_filename = NULL,
+                updated_at = ?
             WHERE id = ? AND chat_id = ?
             """,
             (_utc_now(), product_id, chat_id),
         )
         return cur.rowcount > 0
+
+
+def clear_product_coa_url(product_id: int, chat_id: int) -> bool:
+    """Back-compat alias: clears full COA (file + URL)."""
+    return clear_product_coa(product_id, chat_id)
 
 
 def _insert_audit(

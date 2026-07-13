@@ -437,9 +437,10 @@ def product_list_keyboard(
         else:
             label += f" · {stock} left"
         row = [InlineKeyboardButton(label, callback_data=f"prod:{p['id']}")]
-        coa = (p.get("coa_url") or "").strip()
-        if coa:
-            row.append(InlineKeyboardButton("📄 COA", url=coa))
+        if db.product_has_coa_file(p):
+            row.append(
+                InlineKeyboardButton("📄 COA", callback_data=f"viewcoa:{p['id']}")
+            )
         buttons.append(row)
     if footer_rows:
         buttons.extend(footer_rows)
@@ -454,9 +455,8 @@ def product_list_keyboard(
 
 
 def product_detail_keyboard(p: dict, *, stock: int) -> InlineKeyboardMarkup:
-    """Buyer product detail: add-to-cart + optional COA url button."""
+    """Buyer product detail: add-to-cart + optional COA file button."""
     buttons: list[list] = []
-    coa = (p.get("coa_url") or "").strip()
     if stock > 0:
         add_row = [
             InlineKeyboardButton("＋1", callback_data=f"add:{p['id']}:1"),
@@ -464,8 +464,10 @@ def product_detail_keyboard(p: dict, *, stock: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("＋5", callback_data=f"add:{p['id']}:5"),
         ]
         buttons.append(add_row)
-    if coa:
-        buttons.append([InlineKeyboardButton("📄 COA", url=coa)])
+    if db.product_has_coa_file(p):
+        buttons.append(
+            [InlineKeyboardButton("📄 COA", callback_data=f"viewcoa:{p['id']}")]
+        )
     buttons.append(
         [
             InlineKeyboardButton("« Catalog", callback_data="cat"),
@@ -661,8 +663,8 @@ async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         text += f"\n{p['description']}\n"
     if stock <= 0:
         text += "\n_Currently out of stock._"
-    if p.get("coa_url"):
-        text += "\n_COA available — tap 📄 COA below._"
+    if db.product_has_coa_file(p):
+        text += "\n_COA available — tap 📄 COA to receive the PDF/image._"
     await safe_edit(query, text, product_detail_keyboard(p, stock=stock))
 
 
@@ -1339,8 +1341,16 @@ async def cb_adm_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not p:
         await query.answer("Missing", show_alert=True)
         return
-    coa = (p.get("coa_url") or "").strip()
-    coa_line = f"COA: `{coa}`\n" if coa else "COA: _not set_\n"
+    has_file = db.product_has_coa_file(p)
+    if has_file:
+        ftype = (p.get("coa_file_type") or "file").strip()
+        fname = (p.get("coa_filename") or "").strip()
+        coa_line = f"COA: ✅ uploaded ({ftype}"
+        if fname:
+            coa_line += f" · {fname}"
+        coa_line += ")\n"
+    else:
+        coa_line = "COA: _not set — upload PDF or photo_\n"
     text = (
         f"*{p['name']}* (#{p['id']})\n"
         f"Price: {money(p['price'])} / {p.get('unit')}\n"
@@ -1355,12 +1365,12 @@ async def cb_adm_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             InlineKeyboardButton("💲 Price", callback_data=f"setprice:{pid}"),
             InlineKeyboardButton("📊 Stock", callback_data=f"setstock:{pid}"),
         ],
-        [InlineKeyboardButton("📄 Add/Edit COA Link", callback_data=f"setcoa:{pid}")],
+        [InlineKeyboardButton("📄 Upload COA (PDF/photo)", callback_data=f"setcoa:{pid}")],
     ]
-    if coa:
+    if has_file:
         rows.append(
             [
-                InlineKeyboardButton("📄 Open COA", url=coa),
+                InlineKeyboardButton("📄 Send COA", callback_data=f"viewcoa:{pid}"),
                 InlineKeyboardButton("🗑 Remove COA", callback_data=f"clearcoa:{pid}"),
             ]
         )
@@ -1420,16 +1430,19 @@ async def cb_set_coa_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data["edit_pid"] = pid
     set_awaiting(context, "product_coa")
     await query.message.reply_text(
-        f"📄 *COA link for {p['name']}*\n\n"
-        "Send the COA URL (must start with `http://` or `https://`).\n"
-        "Google Drive / Dropbox share links work fine.\n/cancel",
+        f"📄 *COA for {p['name']}*\n\n"
+        "Send the COA as a *PDF document* or a *photo* (screenshot is fine).\n\n"
+        "_Stored on Telegram — buyers get the file when they tap 📄 COA. "
+        "No Janoshik login required._\n\n"
+        "/cancel",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=force_reply("https://..."),
+        reply_markup=force_reply("PDF or photo..."),
     )
     return EDIT_COA_VALUE
 
 
 async def edit_coa_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Accept PDF document or photo for product COA."""
     if not await accept_prompt_message(update, context):
         return EDIT_COA_VALUE
     sid, ok = _require_admin(update, context)
@@ -1437,26 +1450,118 @@ async def edit_coa_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         clear_awaiting(context)
         return ConversationHandler.END
     pid = context.user_data.get("edit_pid")
-    raw = update.message.text or ""
-    success, result = db.set_product_coa_url(int(pid), int(sid), raw)
+    msg = update.message
+    if not msg or pid is None:
+        clear_awaiting(context)
+        return ConversationHandler.END
+
+    file_id: str | None = None
+    file_type: str | None = None
+    filename: str | None = None
+
+    if msg.document:
+        doc = msg.document
+        mime = (doc.mime_type or "").lower()
+        name = (doc.file_name or "").lower()
+        is_pdf = mime == "application/pdf" or name.endswith(".pdf")
+        if not is_pdf:
+            await msg.reply_text(
+                "Please send a *PDF* document, or send the COA as a *photo*.\n"
+                f"(Got: `{doc.mime_type or 'unknown'}`)",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return EDIT_COA_VALUE
+        file_id = doc.file_id
+        file_type = "document"
+        filename = doc.file_name
+    elif msg.photo:
+        # largest size last
+        file_id = msg.photo[-1].file_id
+        file_type = "photo"
+        filename = None
+    elif msg.text and msg.text.strip():
+        await msg.reply_text(
+            "Please *upload a PDF or photo* of the COA (not a web link).\n"
+            "Lab sites like Janoshik often block browsers — the file stays in Telegram.\n"
+            "/cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return EDIT_COA_VALUE
+    else:
+        await msg.reply_text("Send a PDF document or a photo of the COA. /cancel")
+        return EDIT_COA_VALUE
+
+    success, result = db.set_product_coa_file(
+        int(pid), int(sid), file_id, file_type, filename
+    )
     if not success:
-        await update.message.reply_text(result)
+        await msg.reply_text(result)
         return EDIT_COA_VALUE
     clear_awaiting(context)
     p = db.get_product(int(pid))
     name = p["name"] if p else f"#{pid}"
-    await update.message.reply_text(
-        f"✅ COA link added for *{name}*",
+    await msg.reply_text(
+        f"✅ COA *file* saved for *{name}*.\n"
+        "Buyers (and you) can tap 📄 COA to receive it in chat.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("📄 Open COA", url=result)],
+                [InlineKeyboardButton("📄 Send COA", callback_data=f"viewcoa:{pid}")],
                 [InlineKeyboardButton("« Product", callback_data=f"admp:{pid}")],
                 [InlineKeyboardButton("« Products", callback_data="adm_prods")],
             ]
         ),
     )
     return ConversationHandler.END
+
+
+async def cb_view_coa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send stored COA PDF/photo to the user who tapped 📄 COA."""
+    query = update.callback_query
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return
+    pid = int(query.data.split(":")[1])
+    p = db.get_product(pid)
+    if not p:
+        await query.answer("Product not found", show_alert=True)
+        return
+    # Buyers only see active products; admins of that shop can open any
+    is_adm = db.is_admin(int(p["chat_id"]), user.id)
+    if not p.get("active") and not is_adm:
+        await query.answer("Product unavailable", show_alert=True)
+        return
+    file_id = (p.get("coa_file_id") or "").strip()
+    if not file_id:
+        await query.answer(
+            "No COA file uploaded yet. Admin: Upload COA (PDF/photo).",
+            show_alert=True,
+        )
+        return
+    ftype = (p.get("coa_file_type") or "document").strip().lower()
+    caption = f"📄 COA — {p['name']}"
+    try:
+        if ftype == "photo":
+            await context.bot.send_photo(
+                chat_id=chat.id,
+                photo=file_id,
+                caption=caption,
+            )
+        else:
+            await context.bot.send_document(
+                chat_id=chat.id,
+                document=file_id,
+                caption=caption,
+                filename=p.get("coa_filename") or None,
+            )
+        await query.answer("COA sent")
+    except Exception as e:
+        log.warning("send COA failed product=%s: %s", pid, e)
+        await query.answer(
+            "Could not send COA file. Re-upload it in Admin → Product.",
+            show_alert=True,
+        )
 
 
 async def cb_clear_coa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1466,10 +1571,10 @@ async def cb_clear_coa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer("Denied", show_alert=True)
         return
     pid = int(query.data.split(":")[1])
-    if not db.clear_product_coa_url(pid, sid):
+    if not db.clear_product_coa(pid, sid):
         await query.answer("Not found", show_alert=True)
         return
-    await query.answer("COA link removed")
+    await query.answer("COA removed")
     query.data = f"admp:{pid}"
     await cb_adm_product(update, context)
 
@@ -2523,6 +2628,8 @@ def build_app() -> Application:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_name_value),
             ],
             EDIT_COA_VALUE: [
+                MessageHandler(filters.Document.ALL, edit_coa_value),
+                MessageHandler(filters.PHOTO, edit_coa_value),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_coa_value),
             ],
             ADD_PAY_NAME: [
@@ -2596,6 +2703,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_adm_product, pattern=r"^admp:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_toggle_product, pattern=r"^togglep:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_del_product, pattern=r"^delp:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_view_coa, pattern=r"^viewcoa:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_clear_coa, pattern=r"^clearcoa:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_orders, pattern=r"^adm_orders$"))
     app.add_handler(CallbackQueryHandler(cb_adm_awaiting, pattern=r"^adm_awaiting$"))

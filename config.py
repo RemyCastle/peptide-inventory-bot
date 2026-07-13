@@ -45,4 +45,4 @@ DEFAULT_FREE_SHIPPING_ABOVE = float(os.getenv("DEFAULT_FREE_SHIPPING_ABOVE", "15
 DEFAULT_LOW_STOCK_THRESHOLD = int(os.getenv("DEFAULT_LOW_STOCK_THRESHOLD", "2"))
 
 # Schema version expected by this code release
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5

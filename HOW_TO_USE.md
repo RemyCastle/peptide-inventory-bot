@@ -26,6 +26,7 @@ Tap **⚙️ Admin Panel** or send `/admin`, then do this in order:
 | Step | What to do |
 |------|------------|
 | **1. Products** | **➕ Add product** → name → price → stock qty → description |
+| **1b. COA** | Product → **📄 Upload COA (PDF/photo)** → send PDF or image (not a Janoshik link) |
 | **2. Payments** | **💳 Payments** → **➕ Add method** → e.g. Cash App / Zelle / BTC + pay instructions |
 | **3. Shipping** | **🚚 Shipping** → set flat fee + free-shipping threshold (or turn off) |
 | **4. Admins** (optional) | **👥 Admins** → **➕ Add admin** → their numeric Telegram user ID |
@@ -74,6 +75,20 @@ Tap **⚙️ Admin Panel** or send `/admin`, then do this in order:
 - **Shipping** is added automatically (or free if your cart is over the shop’s free-shipping amount)  
 - **Inventory is not removed** until an admin confirms payment  
 - If stock runs out before confirm, the admin may reject the order  
+- **📄 COA** sends a PDF/photo of the lab report **in chat** (no external website login)
+
+---
+
+## COA (Certificate of Analysis)
+
+| Who | How |
+|-----|-----|
+| **Admin only** | Admin Panel → Products → pick item → **Upload COA (PDF/photo)** → send file |
+| **Everyone** | Catalog / product → **📄 COA** → bot sends the file in Telegram |
+
+- Prefer a **PDF export or screenshot** of the COA, not a Janoshik web link (lab sites often block browsers).  
+- **Admin Panel and product edit controls are only visible to shop admins/owners.** Buyers never see price/stock edit buttons.  
+- Remove COA anytime: product → **🗑 Remove COA**.
 
 ---
 
