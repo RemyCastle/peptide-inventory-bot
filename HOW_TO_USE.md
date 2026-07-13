@@ -59,13 +59,26 @@ Tap **⚙️ Admin Panel** or send `/admin`, then do this in order:
 4. **🛒 Cart** → check items → **✅ Checkout**  
 5. Choose a **payment method**  
 6. Enter **full name**, **shipping address**, and optional **notes**  
-7. You’ll get an order number, total (items + shipping), and pay instructions  
+7. **Verify shipping** — review name/address and tap **Yes, looks correct**  
+8. You’ll get an order number, total, pay instructions, and a **payment code**  
 
 ### Pay and confirm
 1. Pay using the instructions (Cash App, Zelle, etc.)  
-2. In the bot, tap **✅ I've paid**  
-3. Wait for a shop admin to confirm  
-4. You’ll get a message when payment is confirmed  
+2. Put the **payment code** in the payment app’s **memo/notes** field  
+3. In the bot, tap **✅ I've Paid**  
+4. Upload a **screenshot** of the payment (or Skip)  
+5. Wait for a shop admin to confirm — you’ll get a **push message** when confirmed  
+6. Tracking appears in that message if the seller added it  
+
+---
+
+## Payment code & proof
+
+| Item | Purpose |
+|------|---------|
+| **Payment code** | Auto-generated (e.g. `UF12-AB3K9Z`) — put in Cash App/Zelle/Venmo notes so the seller can match your payment |
+| **Screenshot** | Optional but recommended after “I've Paid” — sent to admins with your claim |
+| **Address verify** | Checkout won’t place the order until you confirm shipping details |
 
 ### Track orders
 - **📦 My Orders** on the menu, or `/orders`  
@@ -106,15 +119,19 @@ Open **⚙️ Admin Panel** (`/admin`).
 | Delete | Products → item → **🗑 Delete** |
 
 ### Orders & payment confirmation
-1. **⏳ Needs confirm** — customers who tapped “I've paid”  
+1. **⏳ Needs confirm** — customers who tapped “I've paid” (and often attached a screenshot)  
 2. Or **📋 Orders** — full recent list  
 3. Open an order:  
-   - **✅ Confirm paid** → order marked paid **and stock is deducted**  
-   - **❌ Reject** → order closed, **stock unchanged**  
+   - **🖼 View proof** — see the payment screenshot  
+   - **✅ Confirm + tracking** → enter tracking (or `-` for none) → order marked **paid**, stock deducted, **customer is messaged**  
+   - **❌ Reject** → order closed, **stock unchanged**, customer notified  
+   - On paid orders without tracking: **📦 Add tracking** → customer gets a tracking update  
 
 Admins also get Telegram notifications when:
-- A new order is placed  
-- A customer reports payment  
+- A new order is placed (includes **payment code**)  
+- A customer reports payment (includes proof screenshot when provided)  
+
+Match payments using the **payment code** in the transfer memo.
 
 ### Payment methods
 **💳 Payments** → **➕ Add method**

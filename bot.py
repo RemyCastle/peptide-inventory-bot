@@ -95,10 +95,13 @@ def symbol_for(chat_id: int | None) -> str:
     CHECKOUT_NAME,
     CHECKOUT_ADDRESS,
     CHECKOUT_NOTES,
+    CHECKOUT_VERIFY,
+    PAYMENT_PROOF,
+    TRACKING_INPUT,
     PAY_TPL_DETAILS,
     SEARCH_QUERY,
     EDIT_COA_VALUE,
-) = range(18)
+) = range(21)
 
 # How long a pending admin/buyer prompt stays open (seconds)
 AWAITING_TTL_SEC = 600
@@ -899,21 +902,80 @@ async def checkout_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def checkout_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Store notes then require explicit address verification before order create."""
     if not await accept_prompt_message(update, context):
         return CHECKOUT_NOTES
     notes = (update.message.text or "").strip()
     if notes == "-":
         notes = ""
+    context.user_data["ship_notes"] = notes
+    return await _prompt_address_verify(update, context)
+
+
+async def _prompt_address_verify(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    ship_name = context.user_data.get("ship_name") or "—"
+    ship_address = context.user_data.get("ship_address") or "—"
+    notes = context.user_data.get("ship_notes") or "—"
+    text = (
+        "📬 *Please verify your shipping details*\n\n"
+        f"*Name:* {ship_name}\n"
+        f"*Address:*\n{ship_address}\n"
+        f"*Notes:* {notes}\n\n"
+        "Is this correct? You must confirm before we place the order."
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Yes, looks correct", callback_data="shipok")],
+            [InlineKeyboardButton("✏️ Edit name/address", callback_data="shipedit")],
+            [InlineKeyboardButton("« Cancel checkout", callback_data="cart")],
+        ]
+    )
+    if update.message:
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+        )
+    elif update.callback_query:
+        await safe_edit(update.callback_query, text, kb)
+    return CHECKOUT_VERIFY
+
+
+async def cb_ship_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "📬 *Shipping — full name*\n\nSend the recipient's full name.\n/cancel to abort.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Full name..."),
+    )
+    return CHECKOUT_NAME
+
+
+async def cb_ship_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Address confirmed — create order with payment code."""
+    query = update.callback_query
+    await query.answer()
     user = update.effective_user
     sid = shop_id(context, update)
     items = context.user_data.get("checkout_items") or []
     pay = context.user_data.get("checkout_pay")
     ship_name = context.user_data.get("ship_name") or ""
     ship_address = context.user_data.get("ship_address") or ""
+    notes = context.user_data.get("ship_notes") or ""
 
-    if not sid or not items or not pay:
-        await update.message.reply_text("Checkout expired. Start again from cart.")
+    if not sid or not items or not pay or not user:
+        await safe_edit(query, "Checkout expired. Start again from cart.", back_main_kb())
         return ConversationHandler.END
+    if not ship_name.strip() or not ship_address.strip():
+        await safe_edit(
+            query,
+            "Name and address are required. Tap Edit to fix.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("✏️ Edit", callback_data="shipedit")]]
+            ),
+        )
+        return CHECKOUT_VERIFY
 
     order = db.create_order(
         chat_id=sid,
@@ -927,26 +989,38 @@ async def checkout_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ship_notes=notes,
     )
     if not order:
-        await update.message.reply_text(
+        await safe_edit(
+            query,
             "❌ Could not create order (stock may have changed). Check cart and try again.",
-            reply_markup=back_main_kb([[InlineKeyboardButton("🛒 Cart", callback_data="cart")]]),
+            back_main_kb([[InlineKeyboardButton("🛒 Cart", callback_data="cart")]]),
         )
         return ConversationHandler.END
 
-    # Clear cart
+    # Clear cart / checkout session
     context.user_data["cart"] = {}
-    context.user_data.pop("checkout_items", None)
-    context.user_data.pop("checkout_pay", None)
+    for k in (
+        "checkout_items",
+        "checkout_pay",
+        "ship_name",
+        "ship_address",
+        "ship_notes",
+    ):
+        context.user_data.pop(k, None)
 
     items_db = db.get_order_items(order["id"])
     summary = db.format_order_summary(order, items_db, SYM)
     pay_instr = pay.get("instructions") or "(no instructions set)"
+    code = (order.get("payment_code") or "").strip()
 
     text = (
-        f"*Order #{order['id']}* — Total: *{money(order['total'])}*\n\n"
+        f"✅ *Order #{order['id']} placed*\n"
+        f"Total: *{money(order['total'])}*\n\n"
         f"{summary}\n\n"
+        f"💳 *Pay via {pay.get('name') or 'selected method'}*\n"
         f"{pay_instr}\n\n"
-        "Once you've sent payment, tap below:\n"
+        f"🔑 *Payment code (put this in the memo/notes):*\n`{code}`\n\n"
+        "⚠️ Use this code in Cash App / Zelle / Venmo notes so we can match your payment.\n\n"
+        "After you pay, tap *I've Paid* and upload a screenshot if you can.\n"
         "_Inventory is only reduced after the seller confirms payment._"
     )
     kb = InlineKeyboardMarkup(
@@ -956,9 +1030,7 @@ async def checkout_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             [InlineKeyboardButton("« Menu", callback_data="main")],
         ]
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-
-    # Notify shop admins
+    await safe_edit(query, text, kb)
     await _notify_admins_new_order(context, order, items_db)
     return ConversationHandler.END
 
@@ -966,18 +1038,22 @@ async def checkout_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def _notify_admins_new_order(context, order: dict, items: list[dict]) -> None:
     summary = db.format_order_summary(order, items, SYM)
     buyer = order.get("full_name") or order.get("username") or order["user_id"]
+    code = (order.get("payment_code") or "—").strip()
     text = (
         f"🛒 *New order — payment pending*\n"
         f"Order *#{order['id']}*\n"
         f"Buyer: {buyer}\n"
         f"Method: {order.get('payment_method_name') or '—'}\n"
+        f"Payment code: `{code}`\n"
         f"Total: *{money(order['total'])}*\n\n"
         f"{summary}"
     )
     kb = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ Confirm", callback_data=f"admconfirm:{order['id']}"),
+                InlineKeyboardButton(
+                    "✅ Confirm + tracking", callback_data=f"admconfirm:{order['id']}"
+                ),
                 InlineKeyboardButton("❌ Reject", callback_data=f"admreject:{order['id']}"),
             ],
             [InlineKeyboardButton("📋 Orders", callback_data="adm_orders")],
@@ -995,37 +1071,19 @@ async def _notify_admins_new_order(context, order: dict, items: list[dict]) -> N
             log.info("Could not notify admin %s: %s", uid, e)
 
 
-async def cb_customer_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    oid = int(query.data.split(":")[1])
-    order = db.get_order(oid)
-    user = update.effective_user
-    if not order or order["user_id"] != user.id:
-        await query.answer("Not your order", show_alert=True)
-        return
-    if order["status"] not in ("pending_payment", "awaiting_confirmation"):
-        await query.answer(f"Status: {order['status']}", show_alert=True)
-        return
-    ok = db.mark_order_awaiting_confirmation(oid)
-    if not ok and order["status"] != "awaiting_confirmation":
-        await query.answer("Could not update", show_alert=True)
-        return
-    await query.answer("Marked as paid — awaiting confirmation")
-    items = db.get_order_items(oid)
-    order = db.get_order(oid)
+async def _notify_admins_payment_claim(
+    context, order: dict, items: list[dict]
+) -> None:
+    oid = order["id"]
     summary = db.format_order_summary(order, items, SYM)
-    await safe_edit(
-        query,
-        f"✅ Got it — order *#{oid}* is awaiting confirmation.\n"
-        "The seller will confirm once payment is received.\n\n"
-        f"{summary}",
-        back_main_kb(),
-    )
     buyer = order.get("full_name") or order.get("username") or order["user_id"]
+    code = (order.get("payment_code") or "—").strip()
+    proof = "✅ screenshot attached" if order.get("payment_proof_file_id") else "no screenshot"
     text = (
-        f"💵 *New payment claim — Order #{oid}*\n\n"
+        f"💵 *Payment claim — Order #{oid}*\n\n"
         f"Buyer: {buyer}\n"
-        f"Items: see below\n"
+        f"Payment code: `{code}`\n"
+        f"Proof: {proof}\n"
         f"Total: *{money(order['total'])}*\n"
         f"Method: {order.get('payment_method_name') or '—'}\n\n"
         f"{summary}"
@@ -1033,9 +1091,12 @@ async def cb_customer_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     kb = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ Confirm", callback_data=f"admconfirm:{oid}"),
+                InlineKeyboardButton(
+                    "✅ Confirm + tracking", callback_data=f"admconfirm:{oid}"
+                ),
                 InlineKeyboardButton("❌ Reject", callback_data=f"admreject:{oid}"),
-            ]
+            ],
+            [InlineKeyboardButton(f"View #{oid}", callback_data=f"vieword:{oid}")],
         ]
     )
     recipients: set[int] = set(OWNER_IDS)
@@ -1046,8 +1107,136 @@ async def cb_customer_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await context.bot.send_message(
                 uid, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
             )
+            # Forward proof image to admin if present
+            fid = (order.get("payment_proof_file_id") or "").strip()
+            if fid:
+                ftype = (order.get("payment_proof_file_type") or "photo").lower()
+                try:
+                    if ftype == "document":
+                        await context.bot.send_document(
+                            uid,
+                            document=fid,
+                            caption=f"Payment proof — order #{oid} code {code}",
+                        )
+                    else:
+                        await context.bot.send_photo(
+                            uid,
+                            photo=fid,
+                            caption=f"Payment proof — order #{oid} code {code}",
+                        )
+                except Exception as e:
+                    log.info("Could not send proof to admin %s: %s", uid, e)
         except Exception:
             pass
+
+
+async def cb_customer_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start payment-proof step after customer claims payment."""
+    query = update.callback_query
+    oid = int(query.data.split(":")[1])
+    order = db.get_order(oid)
+    user = update.effective_user
+    if not order or order["user_id"] != user.id:
+        await query.answer("Not your order", show_alert=True)
+        return ConversationHandler.END
+    if order["status"] not in ("pending_payment", "awaiting_confirmation"):
+        await query.answer(f"Status: {order['status']}", show_alert=True)
+        return ConversationHandler.END
+    context.user_data["proof_order_id"] = oid
+    set_awaiting(context, "payment_proof")
+    code = (order.get("payment_code") or "—").strip()
+    await query.answer()
+    await query.message.reply_text(
+        f"💵 *Payment proof for order #{oid}*\n"
+        f"Payment code was: `{code}`\n\n"
+        "Please *send a screenshot* of the payment (photo).\n"
+        "Or tap *Skip* if you can't attach one right now.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("⏭ Skip screenshot", callback_data=f"skipproof:{oid}")],
+                [InlineKeyboardButton("« Cancel", callback_data="main")],
+            ]
+        ),
+    )
+    return PAYMENT_PROOF
+
+
+async def payment_proof_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return PAYMENT_PROOF
+    oid = context.user_data.get("proof_order_id")
+    user = update.effective_user
+    msg = update.message
+    if not oid or not user or not msg:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    order = db.get_order(int(oid))
+    if not order or order["user_id"] != user.id:
+        await msg.reply_text("Order not found.")
+        clear_awaiting(context)
+        return ConversationHandler.END
+
+    file_id = None
+    file_type = "photo"
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        file_type = "photo"
+    elif msg.document:
+        file_id = msg.document.file_id
+        file_type = "document"
+    else:
+        await msg.reply_text("Send a *photo* screenshot, or tap Skip.", parse_mode=ParseMode.MARKDOWN)
+        return PAYMENT_PROOF
+
+    ok = db.mark_order_awaiting_confirmation(
+        int(oid), proof_file_id=file_id, proof_file_type=file_type
+    )
+    clear_awaiting(context)
+    context.user_data.pop("proof_order_id", None)
+    if not ok:
+        await msg.reply_text("Could not update order status.")
+        return ConversationHandler.END
+
+    order = db.get_order(int(oid))
+    items = db.get_order_items(int(oid))
+    await msg.reply_text(
+        f"✅ Screenshot received for order *#{oid}*.\n"
+        "Seller has been notified and will confirm payment.\n\n"
+        f"{db.format_order_summary(order, items, SYM)}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_main_kb(),
+    )
+    await _notify_admins_payment_claim(context, order, items)
+    return ConversationHandler.END
+
+
+async def cb_skip_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    oid = int(query.data.split(":")[1])
+    user = update.effective_user
+    order = db.get_order(oid)
+    if not order or order["user_id"] != user.id:
+        await query.answer("Not your order", show_alert=True)
+        return ConversationHandler.END
+    ok = db.mark_order_awaiting_confirmation(oid)
+    clear_awaiting(context)
+    context.user_data.pop("proof_order_id", None)
+    if not ok and order["status"] != "awaiting_confirmation":
+        await query.answer("Could not update", show_alert=True)
+        return ConversationHandler.END
+    await query.answer("Marked paid — awaiting confirmation")
+    order = db.get_order(oid)
+    items = db.get_order_items(oid)
+    await safe_edit(
+        query,
+        f"✅ Got it — order *#{oid}* is awaiting confirmation.\n"
+        "The seller will confirm once payment is received.\n\n"
+        f"{db.format_order_summary(order, items, SYM)}",
+        back_main_kb(),
+    )
+    await _notify_admins_payment_claim(context, order, items)
+    return ConversationHandler.END
 
 
 async def cb_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1107,8 +1296,26 @@ async def cb_view_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if is_adm and order["status"] in ("pending_payment", "awaiting_confirmation"):
         buttons.append(
             [
-                InlineKeyboardButton("✅ Confirm paid", callback_data=f"admconfirm:{oid}"),
+                InlineKeyboardButton(
+                    "✅ Confirm + tracking", callback_data=f"admconfirm:{oid}"
+                ),
                 InlineKeyboardButton("❌ Reject", callback_data=f"admreject:{oid}"),
+            ]
+        )
+        if order.get("payment_proof_file_id"):
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        "🖼 View proof", callback_data=f"viewproof:{oid}"
+                    )
+                ]
+            )
+    if is_adm and order["status"] == "paid" and not (order.get("tracking_number") or "").strip():
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "📦 Add tracking", callback_data=f"addtrack:{oid}"
+                )
             ]
         )
     buttons.append([InlineKeyboardButton("« Back", callback_data="myorders")])
@@ -1912,7 +2119,172 @@ async def cb_adm_awaiting(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
 
 
-async def cb_adm_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cb_adm_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start confirm flow: ask for tracking, then confirm payment + notify customer."""
+    query = update.callback_query
+    user = update.effective_user
+    oid = int(query.data.split(":")[1])
+    order = db.get_order(oid)
+    if not order or not db.is_admin(order["chat_id"], user.id):
+        await query.answer("Not allowed", show_alert=True)
+        return ConversationHandler.END
+    if order["status"] not in ("pending_payment", "awaiting_confirmation"):
+        await query.answer(f"Status: {order['status']}", show_alert=True)
+        return ConversationHandler.END
+    context.user_data["confirm_order_id"] = oid
+    set_awaiting(context, "tracking_input")
+    code = (order.get("payment_code") or "—").strip()
+    await query.answer()
+    await query.message.reply_text(
+        f"✅ *Confirm payment — order #{oid}*\n"
+        f"Payment code: `{code}` · Total: {money(order['total'])}\n\n"
+        "Send *tracking number* (and optional carrier on the same line, e.g. `1Z999 USPS`).\n"
+        "Or send `-` to confirm *without* tracking (you can add tracking later).\n"
+        "/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Tracking or - ..."),
+    )
+    return TRACKING_INPUT
+
+
+async def tracking_input_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Complete payment confirm with optional tracking; push status to customer."""
+    if not await accept_prompt_message(update, context):
+        return TRACKING_INPUT
+    user = update.effective_user
+    oid = context.user_data.get("confirm_order_id")
+    raw = (update.message.text or "").strip()
+    if not oid or not user:
+        clear_awaiting(context)
+        return ConversationHandler.END
+
+    order = db.get_order(int(oid))
+    if not order or not db.is_admin(order["chat_id"], user.id):
+        await update.message.reply_text("Not allowed or order missing.")
+        clear_awaiting(context)
+        return ConversationHandler.END
+
+    tracking = None
+    carrier = None
+    if raw and raw != "-":
+        # First token = tracking; remainder optional carrier
+        parts = raw.split(None, 1)
+        tracking = parts[0]
+        carrier = parts[1] if len(parts) > 1 else None
+
+    ok, msg, low_alerts = db.confirm_order_payment(
+        int(oid),
+        user.id,
+        tracking_number=tracking,
+        tracking_carrier=carrier,
+    )
+    clear_awaiting(context)
+    context.user_data.pop("confirm_order_id", None)
+    order = db.get_order(int(oid))
+    items = db.get_order_items(int(oid))
+    await update.message.reply_text(
+        f"{'✅' if ok else '⚠️'} {msg}\n\n{db.format_order_summary(order, items, SYM)}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Orders", callback_data="adm_orders")]]
+        ),
+    )
+    if ok and order:
+        # Push confirmation (+ tracking) to customer
+        cust = (
+            f"✅ *Payment confirmed* for order *#{oid}*\n"
+            f"Total: {money(order['total'])}\n"
+            f"Ship to:\n{order.get('ship_name') or '—'}\n"
+            f"{order.get('ship_address') or '—'}\n"
+        )
+        track = (order.get("tracking_number") or "").strip()
+        if track:
+            car = (order.get("tracking_carrier") or "").strip()
+            cust += f"\n📦 *Tracking:* `{track}`"
+            if car:
+                cust += f"\nCarrier: {car}"
+            cust += "\n"
+        else:
+            cust += "\nWe'll send tracking when your package ships.\n"
+        cust += "\nThank you!"
+        try:
+            await context.bot.send_message(
+                order["user_id"], cust, parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            log.info("Could not notify customer %s: %s", order["user_id"], e)
+        if low_alerts:
+            await _notify_low_stock(context, order["chat_id"], low_alerts)
+    return ConversationHandler.END
+
+
+async def cb_add_tracking_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Add tracking to an already-paid order."""
+    query = update.callback_query
+    user = update.effective_user
+    oid = int(query.data.split(":")[1])
+    order = db.get_order(oid)
+    if not order or not db.is_admin(order["chat_id"], user.id):
+        await query.answer("Not allowed", show_alert=True)
+        return ConversationHandler.END
+    if order["status"] != "paid":
+        await query.answer("Order must be paid first", show_alert=True)
+        return ConversationHandler.END
+    context.user_data["confirm_order_id"] = oid
+    context.user_data["tracking_only"] = True
+    set_awaiting(context, "tracking_input")
+    await query.answer()
+    await query.message.reply_text(
+        f"📦 *Add tracking for order #{oid}*\n\n"
+        "Send tracking number (optional carrier after a space).\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Tracking..."),
+    )
+    return TRACKING_INPUT
+
+
+async def tracking_only_or_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Route tracking input: paid-only update vs full payment confirm."""
+    if context.user_data.get("tracking_only"):
+        if not await accept_prompt_message(update, context):
+            return TRACKING_INPUT
+        user = update.effective_user
+        oid = context.user_data.get("confirm_order_id")
+        raw = (update.message.text or "").strip()
+        context.user_data.pop("tracking_only", None)
+        if not oid or not user or not raw or raw == "-":
+            clear_awaiting(context)
+            await update.message.reply_text("Cancelled or empty tracking.")
+            return ConversationHandler.END
+        order = db.get_order(int(oid))
+        if not order or not db.is_admin(order["chat_id"], user.id):
+            clear_awaiting(context)
+            await update.message.reply_text("Not allowed.")
+            return ConversationHandler.END
+        parts = raw.split(None, 1)
+        tn, car = parts[0], (parts[1] if len(parts) > 1 else None)
+        db.set_order_tracking(int(oid), tn, car)
+        clear_awaiting(context)
+        context.user_data.pop("confirm_order_id", None)
+        order = db.get_order(int(oid))
+        await update.message.reply_text(
+            f"✅ Tracking saved for order *#{oid}*: `{tn}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        try:
+            msg = f"📦 *Tracking update — order #{oid}*\n`{tn}`"
+            if car:
+                msg += f"\nCarrier: {car}"
+            await context.bot.send_message(
+                order["user_id"], msg, parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            pass
+        return ConversationHandler.END
+    return await tracking_input_value(update, context)
+
+
+async def cb_view_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = update.effective_user
     oid = int(query.data.split(":")[1])
@@ -1920,29 +2292,24 @@ async def cb_adm_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not order or not db.is_admin(order["chat_id"], user.id):
         await query.answer("Not allowed", show_alert=True)
         return
-    ok, msg, low_alerts = db.confirm_order_payment(oid, user.id)
-    await query.answer(msg, show_alert=True)
-    order = db.get_order(oid)
-    items = db.get_order_items(oid)
-    text = f"{'✅' if ok else '⚠️'} {msg}\n\n{db.format_order_summary(order, items, SYM)}"
-    await safe_edit(
-        query,
-        text,
-        InlineKeyboardMarkup([[InlineKeyboardButton("« Orders", callback_data="adm_orders")]]),
-    )
-    if ok:
-        try:
-            await context.bot.send_message(
-                order["user_id"],
-                f"✅ Payment confirmed for order *#{oid}* — thanks!\n"
-                f"Total: {money(order['total'])}\n"
-                "We'll ship to the address you provided.",
-                parse_mode=ParseMode.MARKDOWN,
+    fid = (order.get("payment_proof_file_id") or "").strip()
+    if not fid:
+        await query.answer("No proof on file", show_alert=True)
+        return
+    await query.answer()
+    ftype = (order.get("payment_proof_file_type") or "photo").lower()
+    cap = f"Proof — order #{oid} · code {order.get('payment_code') or '—'}"
+    try:
+        if ftype == "document":
+            await context.bot.send_document(
+                query.message.chat_id, document=fid, caption=cap
             )
-        except Exception:
-            pass
-        if low_alerts:
-            await _notify_low_stock(context, order["chat_id"], low_alerts)
+        else:
+            await context.bot.send_photo(
+                query.message.chat_id, photo=fid, caption=cap
+            )
+    except Exception as e:
+        await query.answer(f"Could not send: {e}", show_alert=True)
 
 
 async def cb_adm_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2582,6 +2949,9 @@ def build_app() -> Application:
     conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(cb_checkout_start, pattern=r"^checkout$"),
+            CallbackQueryHandler(cb_customer_paid, pattern=r"^paid:\d+$"),
+            CallbackQueryHandler(cb_adm_confirm, pattern=r"^admconfirm:\d+$"),
+            CallbackQueryHandler(cb_add_tracking_start, pattern=r"^addtrack:\d+$"),
             CallbackQueryHandler(cb_add_prod_start, pattern=r"^adm_addprod$"),
             CallbackQueryHandler(cb_set_price_start, pattern=r"^setprice:\d+$"),
             CallbackQueryHandler(cb_set_stock_start, pattern=r"^setstock:\d+$"),
@@ -2605,6 +2975,18 @@ def build_app() -> Application:
             ],
             CHECKOUT_NOTES: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_notes),
+            ],
+            CHECKOUT_VERIFY: [
+                CallbackQueryHandler(cb_ship_ok, pattern=r"^shipok$"),
+                CallbackQueryHandler(cb_ship_edit, pattern=r"^shipedit$"),
+            ],
+            PAYMENT_PROOF: [
+                MessageHandler(filters.PHOTO, payment_proof_photo),
+                MessageHandler(filters.Document.ALL, payment_proof_photo),
+                CallbackQueryHandler(cb_skip_proof, pattern=r"^skipproof:\d+$"),
+            ],
+            TRACKING_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, tracking_only_or_confirm),
             ],
             ADD_PROD_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_prod_name),
@@ -2692,7 +3074,6 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_sub_cart, pattern=r"^sub:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_rm_cart, pattern=r"^rm:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_clear_cart, pattern=r"^clearcart$"))
-    app.add_handler(CallbackQueryHandler(cb_customer_paid, pattern=r"^paid:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_order, pattern=r"^cancelord:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_my_orders, pattern=r"^myorders$"))
     app.add_handler(CallbackQueryHandler(cb_view_order, pattern=r"^vieword:\d+$"))
@@ -2707,8 +3088,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_clear_coa, pattern=r"^clearcoa:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_orders, pattern=r"^adm_orders$"))
     app.add_handler(CallbackQueryHandler(cb_adm_awaiting, pattern=r"^adm_awaiting$"))
-    app.add_handler(CallbackQueryHandler(cb_adm_confirm, pattern=r"^admconfirm:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_reject, pattern=r"^admreject:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_view_proof, pattern=r"^viewproof:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_pays, pattern=r"^adm_pays$"))
     app.add_handler(CallbackQueryHandler(cb_toggle_method, pattern=r"^togglem:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_del_method, pattern=r"^delm:\d+$"))

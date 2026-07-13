@@ -221,6 +221,18 @@ def init_db() -> None:
         _ensure_column(conn, "products", "coa_file_type", "TEXT")  # document | photo
         _ensure_column(conn, "products", "coa_filename", "TEXT")
 
+        # Order payment ref code, proof screenshot, shipping tracking
+        _ensure_column(conn, "orders", "payment_code", "TEXT")
+        _ensure_column(conn, "orders", "payment_proof_file_id", "TEXT")
+        _ensure_column(conn, "orders", "payment_proof_file_type", "TEXT")
+        _ensure_column(conn, "orders", "tracking_number", "TEXT")
+        _ensure_column(conn, "orders", "tracking_carrier", "TEXT")
+        _ensure_column(conn, "orders", "shipped_at", "TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_payment_code "
+            "ON orders(payment_code) WHERE payment_code IS NOT NULL"
+        )
+
         now = _utc_now()
         row = conn.execute("SELECT version FROM schema_meta WHERE id = 1").fetchone()
         if row:
@@ -901,6 +913,23 @@ def delete_payment_method(method_id: int) -> bool:
 # ── Orders ───────────────────────────────────────────────────────────────────
 
 
+def generate_payment_code(order_id: int | None = None) -> str:
+    """
+    Short unique code for payment app notes/memos.
+    Format: UF-XXXXXX (uppercase alnum, easy to type).
+    """
+    import secrets
+    import string
+
+    alphabet = string.ascii_uppercase + string.digits
+    # Avoid ambiguous 0/O, 1/I
+    alphabet = alphabet.replace("0", "").replace("O", "").replace("1", "").replace("I", "")
+    suffix = "".join(secrets.choice(alphabet) for _ in range(6))
+    if order_id is not None:
+        return f"UF{int(order_id)}-{suffix}"
+    return f"UF-{suffix}"
+
+
 def create_order(
     chat_id: int,
     user_id: int,
@@ -916,6 +945,7 @@ def create_order(
     """
     Create an order. Does NOT deduct stock.
     Validates stock availability at creation time (snapshot check).
+    Assigns a unique payment_code for memo/notes matching.
     Returns order dict or None if stock insufficient / empty cart.
     """
     if not items:
@@ -974,6 +1004,26 @@ def create_order(
             ),
         )
         order_id = int(cur.lastrowid)
+
+        # Unique payment memo code (retry on rare collision)
+        payment_code = None
+        for _ in range(8):
+            candidate = generate_payment_code(order_id)
+            try:
+                conn.execute(
+                    "UPDATE orders SET payment_code = ? WHERE id = ?",
+                    (candidate, order_id),
+                )
+                payment_code = candidate
+                break
+            except Exception:
+                continue
+        if payment_code is None:
+            payment_code = f"UF{order_id}-{order_id:04d}"
+            conn.execute(
+                "UPDATE orders SET payment_code = ? WHERE id = ?",
+                (payment_code, order_id),
+            )
 
         for it in items:
             line = float(it["unit_price"]) * int(it["quantity"])
@@ -1052,27 +1102,85 @@ def list_user_orders(user_id: int, limit: int = 20) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def mark_order_awaiting_confirmation(order_id: int) -> bool:
+def mark_order_awaiting_confirmation(
+    order_id: int,
+    *,
+    proof_file_id: str | None = None,
+    proof_file_type: str | None = None,
+) -> bool:
+    """Move pending → awaiting_confirmation; optionally attach payment screenshot."""
+    with get_db() as conn:
+        order = conn.execute(
+            "SELECT status FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        if not order:
+            return False
+        if order["status"] not in ("pending_payment", "awaiting_confirmation"):
+            return False
+        now = _utc_now()
+        if proof_file_id:
+            ftype = (proof_file_type or "photo").strip().lower()
+            if ftype not in ("photo", "document"):
+                ftype = "photo"
+            conn.execute(
+                """
+                UPDATE orders
+                SET status = 'awaiting_confirmation',
+                    payment_proof_file_id = ?,
+                    payment_proof_file_type = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (proof_file_id.strip(), ftype, now, order_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE orders
+                SET status = 'awaiting_confirmation', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, order_id),
+            )
+        return True
+
+
+def set_order_tracking(
+    order_id: int,
+    tracking_number: str,
+    carrier: str | None = None,
+) -> bool:
+    """Set tracking on an order (usually after payment confirm)."""
+    tn = (tracking_number or "").strip()
+    if not tn or tn == "-":
+        return False
+    car = (carrier or "").strip() or None
     with get_db() as conn:
         cur = conn.execute(
             """
             UPDATE orders
-            SET status = 'awaiting_confirmation', updated_at = ?
-            WHERE id = ? AND status = 'pending_payment'
+            SET tracking_number = ?,
+                tracking_carrier = ?,
+                shipped_at = COALESCE(shipped_at, ?),
+                updated_at = ?
+            WHERE id = ?
             """,
-            (_utc_now(), order_id),
+            (tn, car, _utc_now(), _utc_now(), order_id),
         )
         return cur.rowcount > 0
 
 
 def confirm_order_payment(
-    order_id: int, admin_id: int
+    order_id: int,
+    admin_id: int,
+    *,
+    tracking_number: str | None = None,
+    tracking_carrier: str | None = None,
 ) -> tuple[bool, str, list[dict]]:
     """
     Confirm payment and deduct inventory atomically.
+    Optional tracking_number is saved with the paid order.
     Returns (ok, message, low_stock_alerts).
-    low_stock_alerts: [{product_id, name, stock, threshold, chat_id}]
-    Does NOT change the checkout state machine beyond pending/awaiting → paid.
     """
     with get_db() as conn:
         order = conn.execute(
@@ -1162,14 +1270,29 @@ def confirm_order_payment(
                 )
 
         now = _utc_now()
-        conn.execute(
-            """
-            UPDATE orders
-            SET status = 'paid', confirmed_by = ?, paid_at = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (admin_id, now, now, order_id),
-        )
+        tn = (tracking_number or "").strip()
+        if tn == "-":
+            tn = ""
+        car = (tracking_carrier or "").strip() or None
+        if tn:
+            conn.execute(
+                """
+                UPDATE orders
+                SET status = 'paid', confirmed_by = ?, paid_at = ?, updated_at = ?,
+                    tracking_number = ?, tracking_carrier = ?, shipped_at = ?
+                WHERE id = ?
+                """,
+                (admin_id, now, now, tn, car, now, order_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE orders
+                SET status = 'paid', confirmed_by = ?, paid_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (admin_id, now, now, order_id),
+            )
         return True, "Payment confirmed. Inventory updated.", low_stock_alerts
 
 
@@ -1254,12 +1377,26 @@ def format_order_summary(order: dict, items: list[dict], symbol: str = CURRENCY_
         f"Shipping: {money(float(order['shipping_fee']), symbol)}",
         f"*Total: {money(float(order['total']), symbol)}*",
         f"Payment: {order.get('payment_method_name') or '—'}",
+    ]
+    code = (order.get("payment_code") or "").strip()
+    if code:
+        lines.append(f"*Payment code (memo):* `{code}`")
+    if order.get("payment_proof_file_id"):
+        lines.append("Payment proof: ✅ screenshot on file")
+    lines += [
         "",
         f"*Ship to:* {order.get('ship_name') or '—'}",
         order.get("ship_address") or "—",
     ]
     if order.get("ship_notes"):
         lines.append(f"Notes: {order['ship_notes']}")
+    track = (order.get("tracking_number") or "").strip()
+    if track:
+        car = (order.get("tracking_carrier") or "").strip()
+        track_line = f"*Tracking:* `{track}`"
+        if car:
+            track_line += f" ({car})"
+        lines.append(track_line)
     lines.append(f"\nCreated: {order.get('created_at')}")
     if order.get("paid_at"):
         lines.append(f"Paid: {order['paid_at']}")
