@@ -26,7 +26,7 @@ Tap **⚙️ Admin Panel** or send `/admin`, then do this in order:
 | Step | What to do |
 |------|------------|
 | **1. Products** | **➕ Add product** → name → price → stock qty → description |
-| **1b. COA** | Product → **📄 Upload COA (PDF/photo)** → send PDF or image (not a Janoshik link) |
+| **1b. COA** | Product → **📄 Set COA** → send PDF/photo **or** paste an `https://` link (or both) |
 | **2. Payments** | **💳 Payments** → **➕ Add method** → e.g. Cash App / Zelle / BTC + pay instructions |
 | **3. Shipping** | **🚚 Shipping** → set flat fee + free-shipping threshold (or turn off) |
 | **4. Admins** (optional) | **👥 Admins** → **➕ Add admin** → their numeric Telegram user ID |
@@ -88,7 +88,7 @@ Tap **⚙️ Admin Panel** or send `/admin`, then do this in order:
 - **Shipping** is added automatically (or free if your cart is over the shop’s free-shipping amount)  
 - **Inventory is not removed** until an admin confirms payment  
 - If stock runs out before confirm, the admin may reject the order  
-- **📄 COA** sends a PDF/photo of the lab report **in chat** (no external website login)
+- **📄 COA** sends the lab report **file and/or link** (whatever the seller attached)
 
 ---
 
@@ -96,11 +96,12 @@ Tap **⚙️ Admin Panel** or send `/admin`, then do this in order:
 
 | Who | How |
 |-----|-----|
-| **Admin only** | Admin Panel → Products → pick item → **Upload COA (PDF/photo)** → send file |
-| **Everyone** | Catalog / product → **📄 COA** → bot sends the file in Telegram |
+| **Admin only** | Admin Panel → Products → pick item → **Set COA** → PDF/photo **and/or** `https://` link |
+| **Everyone** | Catalog / product → **📄 COA** → bot sends the file (if set) and/or the link |
 
-- Prefer a **PDF export or screenshot** of the COA, not a Janoshik web link (lab sites often block browsers).  
-- **Admin Panel and product edit controls are only visible to shop admins/owners.** Buyers never see price/stock edit buttons.  
+- You can store **both** a file and a link; 📄 COA delivers both.  
+- Lab sites (e.g. Janoshik) sometimes block Telegram’s in-app browser — file upload still works offline.  
+- **Admin Panel is admin-only.** Buyers only download COA, not edit products.  
 - Remove COA anytime: product → **🗑 Remove COA**.
 
 ---
@@ -196,8 +197,8 @@ Customers see shipping on the cart and final order total automatically.
 2. Stock products and set prices in Admin  
 3. Share the **Shop link** with buyers  
 4. When you get a payment notification → check the money in Cash App/Zelle/etc.  
-5. In the bot → **✅ Confirm paid** (or **Reject** if wrong/missing)  
-6. Ship to the address on the order  
+5. In the bot → **✅ Confirm + tracking** (enter tracking or `-`) or **Reject**  
+6. Customer gets an automatic confirmation message (with tracking if provided)
 
 ---
 

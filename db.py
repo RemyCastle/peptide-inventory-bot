@@ -508,6 +508,18 @@ def product_has_coa_file(p: dict | None) -> bool:
     return bool((p.get("coa_file_id") or "").strip())
 
 
+def product_has_coa_url(p: dict | None) -> bool:
+    """True if product has an external COA URL."""
+    if not p:
+        return False
+    return bool((p.get("coa_url") or "").strip())
+
+
+def product_has_coa(p: dict | None) -> bool:
+    """True if product has a COA file and/or external link."""
+    return product_has_coa_file(p) or product_has_coa_url(p)
+
+
 def set_product_coa_url(
     product_id: int, chat_id: int, url: str
 ) -> tuple[bool, str]:
