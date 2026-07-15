@@ -1,0 +1,72 @@
+================================================================================
+  PEPTIDE INVENTORY BOT — PROJECT GUIDE
+  Path: C:\Users\Remy\peptide_inventory_bot
+  Updated: 2026-07-14
+================================================================================
+
+WHAT YOU NEED TO KNOW
+  Multi-shop Telegram bot: each Telegram group (or personal chat) = one shop.
+  Customers browse catalog, cart, checkout, pay; admin confirms payment then
+  stock drops. Owners use OWNER_IDS in .env for global access.
+
+  Related but SEPARATE: peptide_telegram_bot = dosing calculator only.
+
+HOW TO RUN
+  cd C:\Users\Remy\peptide_inventory_bot
+  copy .env.example .env   (first time)
+  # set TELEGRAM_BOT_TOKEN and OWNER_IDS
+  start.bat
+  # or: python bot.py
+  Only ONE runner at a time (local OR cloud) or Telegram conflicts.
+
+LOGINS / IDs TO TRACK
+  Bot token:          .env → TELEGRAM_BOT_TOKEN
+  Owner Telegram IDs: .env → OWNER_IDS (comma-separated numeric IDs)
+  Shop admins:        added in-bot by owner/admin (admins table)
+  Brand:              BRAND_NAME in .env (e.g. UnicornFartzzBot)
+  No password logins — all identity is Telegram.
+
+EXISTING FEATURES
+  [x] Multi-shop isolation (chat_id)
+  [x] Catalog, cart, checkout, shipping fee
+  [x] Payment methods (Cash App, Venmo, Zelle, crypto templates)
+  [x] Payment confirm → stock deduct + audit
+  [x] Per-shop admins, COA files, low stock, reports
+  [x] Deep link: t.me/<bot>?start=shop_<chat_id>
+  [x] Setup wizard for groups
+
+*** NEW FEATURES (shop collaboration) ***
+  [NEW] Shop invite links — host shop generates special link for guest shop
+  [NEW] Guest shop accepts invite → collaboration active
+  [NEW] Host chooses which guest products to list + markup %
+  [NEW] Catalog shows host stock + guest shared items (marked up)
+  [NEW] Cart tracks owner shop per line
+  [NEW] Checkout: customer pays HOST only (full total)
+  [NEW] Order split: lines owned by each shop; guest stock deducts on confirm
+  [NEW] Settlement: host owes guest shop = guest sell lines (or base);
+        admin sees “Pay guest shop $X” and can mark settled
+  [NEW] Admin UI: Collaborations menu — invites, shares, markups, settlements
+
+HOW COLLAB WORKS (customer story)
+  1. Shop A admin: Admin → Collaborations → Create invite link
+  2. Send link to Shop B admin → they open & accept
+  3. Shop A picks products from B + markup (e.g. +15%)
+  4. Customer in Shop A sees A products + B products at marked-up prices
+  5. Customer pays Shop A payment methods for entire order
+  6. On confirm paid: stock drops in A and B for their lines
+  7. Shop A admin settles payment to Shop B for B’s portion
+
+CREATIVE EXTRAS (industry-inspired, optional later)
+  - Default markup templates per category
+  - Auto-pause share when guest stock hits 0
+  - Weekly settlement report export
+
+CLOUD
+  GitHub: https://github.com/RemyCastle/peptide-inventory-bot
+  Railway / Render — see deploy/ALWAYS_ON.md
+
+TESTS
+  cd C:\Users\Remy\peptide_inventory_bot
+  # pytest if installed; tests/ covers order payment + stock audit
+
+================================================================================

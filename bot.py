@@ -279,6 +279,51 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             except ValueError:
                 pass
+        if arg0.startswith("collab_"):
+            token = arg0.removeprefix("collab_")
+            import collab
+
+            collab.ensure_collab_tables()
+            inv = collab.get_invite(token)
+            if not inv:
+                await update.message.reply_text("Collaboration invite not found or expired.")
+                return
+            if inv["status"] != "pending":
+                await update.message.reply_text(f"Invite already {inv['status']}.")
+                return
+            host = db.get_shop(int(inv["host_chat_id"]))
+            host_title = host["title"] if host else str(inv["host_chat_id"])
+            # List shops this user admins as guest candidates
+            admin_shops = db.shops_for_admin(user.id)
+            if not admin_shops:
+                await update.message.reply_text(
+                    f"Invite from *{host_title}* to share inventory.\n"
+                    "You need to be admin of a shop to accept. Open /setup in your group first.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            buttons = [
+                [
+                    InlineKeyboardButton(
+                        f"Accept as {s['title']}",
+                        callback_data=f"collab_accept:{token}:{s['chat_id']}",
+                    )
+                ]
+                for s in admin_shops
+                if int(s["chat_id"]) != int(inv["host_chat_id"])
+            ]
+            if not buttons:
+                await update.message.reply_text("No eligible guest shop (cannot use host shop).")
+                return
+            await update.message.reply_text(
+                f"🤝 *Inventory collaboration invite*\n"
+                f"Host shop: *{host_title}*\n"
+                f"Default markup for shared items: {inv['default_markup_pct']}%\n\n"
+                f"Pick which of *your* shops will share stock with them:",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            return
         if arg0.startswith("setup_"):
             try:
                 sid = int(arg0.removeprefix("setup_"))
@@ -517,15 +562,39 @@ async def _send_catalog(
         await _reply_or_edit(update, "No shop selected. Send /start first.", edit=edit)
         return
 
-    products = db.list_products(sid, active_only=True)
     shop = db.get_shop(sid) or db.ensure_shop(sid)
+    try:
+        import collab
+
+        collab.ensure_collab_tables()
+        products = collab.catalog_for_host(sid)
+    except Exception:
+        products = db.list_products(sid, active_only=True)
+        for p in products:
+            p["sell_price"] = float(p["price"])
+            p["is_guest"] = False
 
     if not products:
         text = f"*{shop['title']}* — catalog is empty."
         await _reply_or_edit(update, text, back_main_kb(), edit=edit)
         return
 
-    text = f"🧬 *{shop['title']} — Catalog*\n\nTap a product to add to cart:"
+    # Present guest shares with sell price in list labels via name suffix
+    display_products = []
+    for p in products:
+        q = dict(p)
+        sell = float(p.get("sell_price", p.get("price", 0)))
+        if p.get("is_guest"):
+            guest = p.get("guest_title") or "partner"
+            q["name"] = f"{p['name']} · {money(sell)} (+{guest})"
+            q["price"] = sell
+        display_products.append(q)
+
+    text = (
+        f"🧬 *{shop['title']} — Catalog*\n"
+        f"_Includes partner stock when shared._\n\n"
+        f"Tap a product to add to cart:"
+    )
     footer = [
         [
             InlineKeyboardButton("🔍 Search", callback_data="search"),
@@ -533,7 +602,7 @@ async def _send_catalog(
         ],
         [InlineKeyboardButton("« Menu", callback_data="main")],
     ]
-    kb = product_list_keyboard(products, footer_rows=footer)
+    kb = product_list_keyboard(display_products, footer_rows=footer)
     await _reply_or_edit(update, text, kb, edit=edit)
 
 
@@ -819,9 +888,14 @@ async def cb_checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return ConversationHandler.END
 
-    # Build cart items & validate stock
+    # Build cart items & validate stock (host + shared guest inventory)
+    import collab
+
+    collab.ensure_collab_tables()
+    catalog = {int(x["id"]): x for x in collab.catalog_for_host(sid)}
     items = []
     for pid, qty in c.items():
+        entry = catalog.get(int(pid))
         p = db.get_product(pid)
         if not p or not p["active"] or int(p["stock"]) < qty:
             await safe_edit(
@@ -830,15 +904,27 @@ async def cb_checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 back_main_kb([[InlineKeyboardButton("🛒 Cart", callback_data="cart")]]),
             )
             return ConversationHandler.END
+        if entry is None and int(p["chat_id"]) != int(sid):
+            await safe_edit(
+                query,
+                f"{p['name']} is no longer shared to this shop. Remove it from cart.",
+                back_main_kb([[InlineKeyboardButton("🛒 Cart", callback_data="cart")]]),
+            )
+            return ConversationHandler.END
+        sell = float(entry["sell_price"]) if entry else float(p["price"])
         items.append(
             {
                 "product_id": pid,
                 "product_name": p["name"],
-                "unit_price": float(p["price"]),
+                "unit_price": sell,
                 "quantity": qty,
+                "owner_chat_id": int(entry["owner_chat_id"]) if entry else int(p["chat_id"]),
             }
         )
     context.user_data["checkout_items"] = items
+    context.user_data["checkout_multi"] = any(
+        int(it["owner_chat_id"]) != int(sid) for it in items
+    )
 
     buttons = [
         [InlineKeyboardButton(m["name"], callback_data=f"paym:{m['id']}")]
@@ -977,17 +1063,35 @@ async def cb_ship_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return CHECKOUT_VERIFY
 
-    order = db.create_order(
-        chat_id=sid,
-        user_id=user.id,
-        username=user.username,
-        full_name=user.full_name,
-        items=items,
-        payment_method=pay,
-        ship_name=ship_name,
-        ship_address=ship_address,
-        ship_notes=notes,
-    )
+    import collab
+
+    collab.ensure_collab_tables()
+    if context.user_data.get("checkout_multi") or any(
+        int(it.get("owner_chat_id") or sid) != int(sid) for it in items
+    ):
+        order = collab.create_order_multi(
+            host_chat_id=sid,
+            user_id=user.id,
+            username=user.username,
+            full_name=user.full_name,
+            items=items,
+            payment_method=pay,
+            ship_name=ship_name,
+            ship_address=ship_address,
+            ship_notes=notes,
+        )
+    else:
+        order = db.create_order(
+            chat_id=sid,
+            user_id=user.id,
+            username=user.username,
+            full_name=user.full_name,
+            items=items,
+            payment_method=pay,
+            ship_name=ship_name,
+            ship_address=ship_address,
+            ship_notes=notes,
+        )
     if not order:
         await safe_edit(
             query,
@@ -1403,6 +1507,9 @@ async def _admin_home(
                 InlineKeyboardButton("👥 Admins", callback_data="adm_admins"),
                 InlineKeyboardButton("🔗 Shop link", callback_data="adm_link"),
             ],
+            [
+                InlineKeyboardButton("🤝 Collaborations", callback_data="adm_collab"),
+            ],
             [InlineKeyboardButton("« Menu", callback_data="main")],
         ]
     )
@@ -1425,6 +1532,266 @@ async def cb_adm_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🔗 *Customer shop link*\n\n`{link}`\n\nShare this so buyers open the right catalog.",
         back_main_kb([[InlineKeyboardButton("« Admin", callback_data="admin")]]),
     )
+
+
+async def cb_adm_collab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: shop-to-shop inventory collaboration hub."""
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return
+    import collab
+
+    collab.ensure_collab_tables()
+    accepted = collab.list_collaborations(sid)
+    pending = collab.list_pending_invites(sid)
+    shares = collab.list_shares(sid, active_only=False)
+    settlements = collab.list_settlements(sid, as_host=True, status="owed")
+    lines = [
+        "🤝 *Collaborations*\n",
+        "Invite another shop to share *their* stock on *your* catalog.",
+        "You set markup %; customer pays you; you settle guest base cost.\n",
+        f"Active partners: {len(accepted)} · Pending invites: {len(pending)}",
+        f"Shared SKUs: {len([s for s in shares if s.get('active')])}",
+        f"Owed to guest shops: {len(settlements)} settlements",
+    ]
+    if settlements:
+        total_owed = sum(float(s["amount"]) for s in settlements)
+        lines.append(f"Total owed: *{money(total_owed)}*")
+    kb_rows = [
+        [InlineKeyboardButton("➕ Create invite link", callback_data="collab_invite")],
+        [InlineKeyboardButton("📦 Manage shared products", callback_data="collab_shares")],
+        [InlineKeyboardButton("💸 Settlements (pay guests)", callback_data="collab_settle")],
+        [InlineKeyboardButton("« Admin", callback_data="admin")],
+    ]
+    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(kb_rows))
+
+
+async def cb_collab_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return
+    import collab
+
+    collab.ensure_collab_tables()
+    inv = collab.create_invite(sid, update.effective_user.id, default_markup_pct=15)
+    me = await context.bot.get_me()
+    link = f"https://t.me/{me.username}?start={inv['deep_link_arg']}"
+    await safe_edit(
+        query,
+        f"🔗 *Guest shop invite*\n\n"
+        f"Send this to the other shop's admin:\n`{link}`\n\n"
+        f"Default markup when you share their items: *{inv['default_markup_pct']}%*\n"
+        f"(You can change markup per product after they accept.)",
+        InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Collaborations", callback_data="adm_collab")]]
+        ),
+    )
+
+
+async def cb_collab_accept(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    # collab_accept:TOKEN:GUEST_CHAT_ID
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        await safe_edit(query, "Bad accept payload.")
+        return
+    _, token, guest_sid = parts
+    import collab
+
+    collab.ensure_collab_tables()
+    ok, msg = collab.accept_invite(token, int(guest_sid), update.effective_user.id)
+    await safe_edit(
+        query,
+        ("✅ " if ok else "❌ ") + msg,
+        back_main_kb(),
+    )
+
+
+async def cb_collab_shares(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return
+    import collab
+
+    collab.ensure_collab_tables()
+    partners = collab.list_collaborations(sid)
+    if not partners:
+        await safe_edit(
+            query,
+            "No accepted partners yet. Create an invite and have them accept.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Collaborations", callback_data="adm_collab")]]
+            ),
+        )
+        return
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"From: {p.get('guest_title') or p['guest_chat_id']}",
+                callback_data=f"collab_guest:{p['guest_chat_id']}",
+            )
+        ]
+        for p in partners
+        if p.get("guest_chat_id")
+    ]
+    buttons.append([InlineKeyboardButton("« Collaborations", callback_data="adm_collab")])
+    await safe_edit(
+        query,
+        "Pick a guest shop to choose products + markup:",
+        InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cb_collab_guest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return
+    guest_id = int(query.data.split(":")[1])
+    import collab
+
+    collab.ensure_collab_tables()
+    prods = collab.list_guest_products_for_host(sid, guest_id)
+    if not prods:
+        await safe_edit(
+            query,
+            "Guest shop has no active products.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Back", callback_data="collab_shares")]]
+            ),
+        )
+        return
+    lines = ["📦 *Guest products* — tap to toggle share / set markup\n"]
+    buttons = []
+    for p in prods[:30]:
+        shared = bool(p.get("share_active"))
+        mk = p.get("share_markup")
+        mk_s = f"+{mk}%" if mk is not None and shared else "off"
+        sell = float(p["price"]) * (1 + float(mk or 0) / 100) if shared else float(p["price"])
+        lines.append(
+            f"• {p['name']} · base {money(p['price'])} · stock {p['stock']} · {mk_s}"
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{'✅' if shared else '➕'} {p['name'][:18]} ({mk_s})",
+                    callback_data=f"collab_tog:{guest_id}:{p['id']}",
+                )
+            ]
+        )
+        if shared:
+            buttons.append(
+                [
+                    InlineKeyboardButton("10%", callback_data=f"collab_mk:{guest_id}:{p['id']}:10"),
+                    InlineKeyboardButton("15%", callback_data=f"collab_mk:{guest_id}:{p['id']}:15"),
+                    InlineKeyboardButton("25%", callback_data=f"collab_mk:{guest_id}:{p['id']}:25"),
+                    InlineKeyboardButton("40%", callback_data=f"collab_mk:{guest_id}:{p['id']}:40"),
+                ]
+            )
+    buttons.append([InlineKeyboardButton("« Shares", callback_data="collab_shares")])
+    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+
+async def cb_collab_tog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return
+    _, guest_id, pid = query.data.split(":")
+    guest_id, pid = int(guest_id), int(pid)
+    import collab
+
+    collab.ensure_collab_tables()
+    # Toggle: if active, disable; else enable at 15%
+    shares = collab.list_shares(sid, active_only=False)
+    existing = next((s for s in shares if int(s["product_id"]) == pid), None)
+    if existing and existing.get("active"):
+        collab.set_share(sid, guest_id, pid, float(existing.get("markup_pct") or 15), active=False)
+        await query.answer("Share off", show_alert=False)
+    else:
+        collab.set_share(sid, guest_id, pid, 15.0, active=True)
+        await query.answer("Shared at +15%", show_alert=False)
+    # Re-render guest list
+    query.data = f"collab_guest:{guest_id}"
+    await cb_collab_guest(update, context)
+
+
+async def cb_collab_mk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return
+    _, guest_id, pid, mk = query.data.split(":")
+    import collab
+
+    collab.ensure_collab_tables()
+    collab.set_share(sid, int(guest_id), int(pid), float(mk), active=True)
+    await query.answer(f"Markup +{mk}%", show_alert=False)
+    query.data = f"collab_guest:{guest_id}"
+    await cb_collab_guest(update, context)
+
+
+async def cb_collab_settle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return
+    import collab
+
+    collab.ensure_collab_tables()
+    rows = collab.list_settlements(sid, as_host=True, status="owed")
+    if not rows:
+        await safe_edit(
+            query,
+            "No open settlements. When collab orders confirm paid, guest base amounts appear here.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Collaborations", callback_data="adm_collab")]]
+            ),
+        )
+        return
+    lines = ["💸 *Owed to guest shops*\n(Customer already paid you the full amount.)\n"]
+    buttons = []
+    for s in rows:
+        title = s.get("guest_title") or s["guest_chat_id"]
+        lines.append(
+            f"• Order `{s.get('payment_code') or s['order_id']}` → {title}: *{money(s['amount'])}*"
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"Mark paid {money(s['amount'])} → {str(title)[:16]}",
+                    callback_data=f"collab_paid:{s['id']}",
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton("« Collaborations", callback_data="adm_collab")])
+    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+
+async def cb_collab_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return
+    sett_id = int(query.data.split(":")[1])
+    import collab
+
+    collab.ensure_collab_tables()
+    ok2, msg = collab.mark_settlement_paid(sett_id, update.effective_user.id)
+    await query.answer(msg, show_alert=True)
+    await cb_collab_settle(update, context)
 
 
 async def cb_adm_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3161,6 +3528,16 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_rm_admin, pattern=r"^rmadmin:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_link, pattern=r"^adm_link$"))
     app.add_handler(CallbackQueryHandler(cb_adm_export, pattern=r"^adm_export$"))
+    # Shop collaboration
+    app.add_handler(CallbackQueryHandler(cb_adm_collab, pattern=r"^adm_collab$"))
+    app.add_handler(CallbackQueryHandler(cb_collab_invite, pattern=r"^collab_invite$"))
+    app.add_handler(CallbackQueryHandler(cb_collab_accept, pattern=r"^collab_accept:"))
+    app.add_handler(CallbackQueryHandler(cb_collab_shares, pattern=r"^collab_shares$"))
+    app.add_handler(CallbackQueryHandler(cb_collab_guest, pattern=r"^collab_guest:"))
+    app.add_handler(CallbackQueryHandler(cb_collab_tog, pattern=r"^collab_tog:"))
+    app.add_handler(CallbackQueryHandler(cb_collab_mk, pattern=r"^collab_mk:"))
+    app.add_handler(CallbackQueryHandler(cb_collab_settle, pattern=r"^collab_settle$"))
+    app.add_handler(CallbackQueryHandler(cb_collab_paid, pattern=r"^collab_paid:"))
     app.add_handler(CallbackQueryHandler(cb_export_report, pattern=r"^export:(inv|pending|both)$"))
 
     return app

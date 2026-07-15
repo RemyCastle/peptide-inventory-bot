@@ -246,6 +246,14 @@ def init_db() -> None:
                 (SCHEMA_VERSION, now),
             )
 
+    # Shop collaboration tables (schema v7+)
+    try:
+        from collab import ensure_collab_tables
+
+        ensure_collab_tables()
+    except Exception:
+        pass
+
 
 def shop_display(shop: dict | None) -> dict[str, Any]:
     """Resolved branding for a shop with instance-level fallbacks."""
@@ -1193,7 +1201,39 @@ def confirm_order_payment(
     Confirm payment and deduct inventory atomically.
     Optional tracking_number is saved with the paid order.
     Returns (ok, message, low_stock_alerts).
+    Multi-owner (guest collab) orders use collab.confirm_payment_multi.
     """
+    # Prefer multi-owner path when any line has a foreign owner
+    try:
+        with get_db() as conn:
+            order = conn.execute(
+                "SELECT chat_id FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if order:
+                items = conn.execute(
+                    "SELECT owner_chat_id, is_guest FROM order_items WHERE order_id = ?",
+                    (order_id,),
+                ).fetchall()
+                multi = any(
+                    (it["is_guest"] if it["is_guest"] is not None else 0)
+                    or (
+                        it["owner_chat_id"] is not None
+                        and int(it["owner_chat_id"]) != int(order["chat_id"])
+                    )
+                    for it in items
+                )
+                if multi:
+                    from collab import confirm_payment_multi
+
+                    return confirm_payment_multi(
+                        order_id,
+                        admin_id,
+                        tracking_number=tracking_number,
+                        tracking_carrier=tracking_carrier,
+                    )
+    except Exception:
+        pass
+
     with get_db() as conn:
         order = conn.execute(
             "SELECT * FROM orders WHERE id = ?", (order_id,)
