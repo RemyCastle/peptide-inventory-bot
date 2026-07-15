@@ -1177,19 +1177,43 @@ async def cb_ship_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-async def _notify_admins_new_order(context, order: dict, items: list[dict]) -> None:
-    summary = db.format_order_summary(order, items, SYM)
-    buyer = order.get("full_name") or order.get("username") or order["user_id"]
-    code = (order.get("payment_code") or "—").strip()
-    text = (
-        f"🛒 *New order — payment pending*\n"
-        f"Order *#{order['id']}*\n"
-        f"Buyer: {buyer}\n"
-        f"Method: {order.get('payment_method_name') or '—'}\n"
-        f"Payment code: `{code}`\n"
-        f"Total: *{money(order['total'])}*\n\n"
-        f"{summary}"
+def _shop_admin_recipients(chat_id: int) -> set[int]:
+    """Shop admins + global owners for sale/order alerts."""
+    recipients: set[int] = set(OWNER_IDS)
+    for a in db.list_admins(int(chat_id)):
+        recipients.add(int(a["user_id"]))
+    return recipients
+
+
+async def _notify_admins_sale_report(
+    context,
+    order: dict,
+    items: list[dict],
+    *,
+    headline: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    """
+    Push full sale details to every shop admin:
+    items, address, payment type, order #, total, franchisee, buyer username.
+    """
+    text = db.format_sale_admin_report(
+        order, items, SYM, headline=headline
     )
+    # Prefer plain-safe send (avoids Markdown break on addresses / usernames)
+    for uid in _shop_admin_recipients(order["chat_id"]):
+        try:
+            await context.bot.send_message(
+                uid,
+                text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            log.info("Could not notify admin %s of sale: %s", uid, e)
+
+
+async def _notify_admins_new_order(context, order: dict, items: list[dict]) -> None:
     kb = InlineKeyboardMarkup(
         [
             [
@@ -1201,35 +1225,21 @@ async def _notify_admins_new_order(context, order: dict, items: list[dict]) -> N
             [InlineKeyboardButton("📋 Orders", callback_data="adm_orders")],
         ]
     )
-    recipients: set[int] = set(OWNER_IDS)
-    for a in db.list_admins(order["chat_id"]):
-        recipients.add(int(a["user_id"]))
-    for uid in recipients:
-        try:
-            await context.bot.send_message(
-                uid, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
-            )
-        except Exception as e:
-            log.info("Could not notify admin %s: %s", uid, e)
+    await _notify_admins_sale_report(
+        context,
+        order,
+        items,
+        headline="NEW ORDER (payment pending)",
+        reply_markup=kb,
+    )
 
 
 async def _notify_admins_payment_claim(
     context, order: dict, items: list[dict]
 ) -> None:
     oid = order["id"]
-    summary = db.format_order_summary(order, items, SYM)
-    buyer = order.get("full_name") or order.get("username") or order["user_id"]
     code = (order.get("payment_code") or "—").strip()
-    proof = "✅ screenshot attached" if order.get("payment_proof_file_id") else "no screenshot"
-    text = (
-        f"💵 *Payment claim — Order #{oid}*\n\n"
-        f"Buyer: {buyer}\n"
-        f"Payment code: `{code}`\n"
-        f"Proof: {proof}\n"
-        f"Total: *{money(order['total'])}*\n"
-        f"Method: {order.get('payment_method_name') or '—'}\n\n"
-        f"{summary}"
-    )
+    proof = "screenshot attached" if order.get("payment_proof_file_id") else "no screenshot"
     kb = InlineKeyboardMarkup(
         [
             [
@@ -1241,15 +1251,17 @@ async def _notify_admins_payment_claim(
             [InlineKeyboardButton(f"View #{oid}", callback_data=f"vieword:{oid}")],
         ]
     )
-    recipients: set[int] = set(OWNER_IDS)
-    for a in db.list_admins(order["chat_id"]):
-        recipients.add(int(a["user_id"]))
-    for uid in recipients:
+    headline = f"PAYMENT CLAIM — buyer says paid ({proof})"
+    await _notify_admins_sale_report(
+        context,
+        order,
+        items,
+        headline=headline,
+        reply_markup=kb,
+    )
+    # Forward proof image to each admin if present
+    for uid in _shop_admin_recipients(order["chat_id"]):
         try:
-            await context.bot.send_message(
-                uid, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
-            )
-            # Forward proof image to admin if present
             fid = (order.get("payment_proof_file_id") or "").strip()
             if fid:
                 ftype = (order.get("payment_proof_file_type") or "photo").lower()
@@ -3002,6 +3014,19 @@ async def tracking_input_value(update: Update, context: ContextTypes.DEFAULT_TYP
         ),
     )
     if ok and order:
+        # Full sale report to all shop admins (items, address, payment, franchisee, username)
+        await _notify_admins_sale_report(
+            context,
+            order,
+            items,
+            headline="SALE CONFIRMED (paid)",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton(f"View #{oid}", callback_data=f"vieword:{oid}")],
+                    [InlineKeyboardButton("📋 Orders", callback_data="adm_orders")],
+                ]
+            ),
+        )
         # Push confirmation (+ tracking) to customer
         cust = (
             f"✅ *Payment confirmed* for order *#{oid}*\n"

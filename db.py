@@ -1525,3 +1525,133 @@ def format_order_summary(order: dict, items: list[dict], symbol: str = CURRENCY_
     if order.get("paid_at"):
         lines.append(f"Paid: {order['paid_at']}")
     return "\n".join(lines)
+
+
+def format_sale_admin_report(
+    order: dict,
+    items: list[dict],
+    symbol: str = CURRENCY_SYMBOL,
+    *,
+    headline: str = "SALE",
+) -> str:
+    """
+    Full admin sale/order report:
+    items, address, payment type, order number, total, franchisee, buyer username.
+    Uses plain-ish markdown safe for Telegram.
+    """
+    shop = get_shop(int(order["chat_id"])) or {}
+    shop_title = shop.get("title") or f"Shop {order['chat_id']}"
+
+    uname = (order.get("username") or "").strip()
+    uname_disp = f"@{uname}" if uname else "(no username)"
+    buyer_name = (order.get("full_name") or "").strip() or "—"
+
+    # Franchise / clone / collab association
+    franchise_bits: list[str] = []
+    franchise_bits.append(f"Shop: {shop_title} (id {order['chat_id']})")
+    master_id = shop.get("inventory_master_chat_id")
+    clone_of = shop.get("clone_of_chat_id")
+    if master_id is not None:
+        mshop = get_shop(int(master_id))
+        mtitle = (mshop or {}).get("title") or master_id
+        franchise_bits.append(f"Franchisee of inventory master: {mtitle} ({master_id})")
+    if clone_of is not None and (master_id is None or int(clone_of) != int(master_id)):
+        cshop = get_shop(int(clone_of))
+        ctitle = (cshop or {}).get("title") or clone_of
+        franchise_bits.append(f"Cloned from: {ctitle} ({clone_of})")
+    if master_id is None and clone_of is None:
+        franchise_bits.append("Franchisee: none (this is a primary/master shop)")
+
+    # Collab guest lines (other shops' inventory sold through host)
+    guest_owners: dict[int, list[str]] = {}
+    for it in items:
+        owner = it.get("owner_chat_id")
+        is_guest = it.get("is_guest")
+        if owner is not None and (
+            is_guest or int(owner) != int(order["chat_id"])
+        ):
+            oid = int(owner)
+            guest_owners.setdefault(oid, []).append(
+                f"{it.get('product_name')} x{it.get('quantity')}"
+            )
+    if guest_owners:
+        for oid, names in guest_owners.items():
+            gshop = get_shop(oid)
+            gtitle = (gshop or {}).get("title") or oid
+            franchise_bits.append(
+                f"Collab partner inventory: {gtitle} ({oid}) — {', '.join(names)}"
+            )
+
+    item_lines = []
+    for it in items:
+        unit = money(float(it.get("unit_price") or 0), symbol)
+        line = money(float(it.get("line_total") or 0), symbol)
+        extra = ""
+        if it.get("is_guest") or (
+            it.get("owner_chat_id") is not None
+            and int(it["owner_chat_id"]) != int(order["chat_id"])
+        ):
+            extra = f" [partner stock {it.get('owner_chat_id')}]"
+        item_lines.append(
+            f"  - {it.get('product_name')} x{it.get('quantity')} "
+            f"@ {unit} = {line}{extra}"
+        )
+    if not item_lines:
+        item_lines = ["  - (no line items)"]
+
+    ship_name = (order.get("ship_name") or "—").strip()
+    ship_addr = (order.get("ship_address") or "—").strip()
+    ship_notes = (order.get("ship_notes") or "").strip()
+
+    pay_name = (order.get("payment_method_name") or "—").strip()
+    code = (order.get("payment_code") or "—").strip()
+    status = order.get("status") or "—"
+
+    lines = [
+        f"*{headline}*",
+        f"Order number: #{order['id']}",
+        f"Status: {status}",
+        f"Payment code: {code}",
+        "",
+        f"Buyer username: {uname_disp}",
+        f"Buyer name: {buyer_name}",
+        f"Buyer Telegram ID: {order.get('user_id')}",
+        "",
+        "Items sold:",
+        *item_lines,
+        "",
+        f"Subtotal: {money(float(order.get('subtotal') or 0), symbol)}",
+        f"Shipping (customer total): {money(float(order.get('shipping_fee') or 0), symbol)}",
+        f"Total paid: {money(float(order.get('total') or 0), symbol)}",
+        f"Payment type: {pay_name}",
+        "",
+        "Ship / address:",
+        f"  {ship_name}",
+        f"  {ship_addr}",
+    ]
+    if ship_notes:
+        lines.append(f"  Notes: {ship_notes}")
+
+    lines.append("")
+    lines.append("Franchise / shop association:")
+    for b in franchise_bits:
+        lines.append(f"  - {b}")
+
+    # Master-only fee is still useful on admin report (admins of that shop)
+    try:
+        hidden = float(order.get("hidden_service_fee") or 0)
+        if hidden > 0:
+            lines.append(f"  - Platform service fee (hidden in shipping): {money(hidden, symbol)}")
+    except Exception:
+        pass
+
+    lines.append("")
+    lines.append(f"Created: {order.get('created_at') or '—'}")
+    if order.get("paid_at"):
+        lines.append(f"Paid at: {order['paid_at']}")
+    track = (order.get("tracking_number") or "").strip()
+    if track:
+        car = (order.get("tracking_carrier") or "").strip()
+        lines.append(f"Tracking: {track}" + (f" ({car})" if car else ""))
+
+    return "\n".join(lines)
