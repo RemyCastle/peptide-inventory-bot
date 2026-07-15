@@ -217,6 +217,13 @@ def user_label(user) -> str:
 
 
 async def safe_edit(query, text: str, reply_markup=None) -> None:
+    plain = (
+        text.replace("*", "")
+        .replace("_", "")
+        .replace("`", "")
+        .replace("[", "")
+        .replace("]", "")
+    )
     try:
         await query.edit_message_text(
             text,
@@ -224,15 +231,25 @@ async def safe_edit(query, text: str, reply_markup=None) -> None:
             reply_markup=reply_markup,
             disable_web_page_preview=True,
         )
+        return
     except Exception as e:
+        err = str(e).lower()
         # Fallback without markdown if parse fails
-        if "parse" in str(e).lower() or "entities" in str(e).lower():
-            await query.edit_message_text(
-                text.replace("*", "").replace("_", "").replace("`", ""),
-                reply_markup=reply_markup,
-            )
+        if "parse" in err or "entities" in err or "can't parse" in err:
+            try:
+                await query.edit_message_text(plain, reply_markup=reply_markup)
+                return
+            except Exception as e2:
+                log.warning("edit plain failed: %s", e2)
+        elif "not modified" in err:
+            return
         else:
             log.warning("edit failed: %s", e)
+    # Last resort: send a new message so the user always gets feedback
+    try:
+        await query.message.reply_text(plain[:3500], reply_markup=reply_markup)
+    except Exception as e3:
+        log.warning("reply fallback failed: %s", e3)
 
 
 def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
@@ -1573,39 +1590,49 @@ async def cb_adm_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
-async def cb_adm_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cb_adm_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Admin-only: create a one-time link to clone this shop into another group."""
     query = update.callback_query
     await query.answer()
-    sid, ok = _require_admin(update, context)
-    if not ok or sid is None:
-        return
-    import franchise
-
-    franchise.ensure_franchise_tables()
     try:
-        tok = franchise.create_clone_token(sid, update.effective_user.id)
-    except PermissionError:
-        await safe_edit(query, "Admin only.", back_main_kb())
-        return
-    me = await context.bot.get_me()
-    link = f"https://t.me/{me.username}?start={tok['deep_link_arg']}"
-    await safe_edit(
-        query,
-        "📋 *Clone this shop into another group*\n\n"
-        "Creates a *new* group shop with:\n"
-        "• *Separate prices* (edit freely)\n"
-        "• *Same shared inventory* as the master stock\n"
-        "• Shipping/payments copied as a starting point\n\n"
-        f"1. Add this bot to the *new group*\n"
-        f"2. Open this link *in Telegram* (you):\n`{link}`\n"
-        f"3. Then in the *new group* send:\n`/claim_clone {tok['token']}`\n\n"
-        f"Master inventory shop: `{tok['inventory_master_chat_id']}`\n"
-        "_Only the admin who created the link can claim it._",
-        InlineKeyboardMarkup(
-            [[InlineKeyboardButton("« Admin", callback_data="admin")]]
-        ),
-    )
+        sid, ok = _require_admin(update, context)
+        if not ok or sid is None:
+            await safe_edit(
+                query,
+                "Admin only, or no shop selected. Send /start and open Admin again.",
+                back_main_kb(),
+            )
+            return ConversationHandler.END
+        import franchise
+
+        franchise.ensure_franchise_tables()
+        try:
+            tok = franchise.create_clone_token(sid, update.effective_user.id)
+        except PermissionError:
+            await safe_edit(query, "Admin only.", back_main_kb())
+            return ConversationHandler.END
+        me = await context.bot.get_me()
+        link = f"https://t.me/{me.username}?start={tok['deep_link_arg']}"
+        await safe_edit(
+            query,
+            "Clone this shop into another group\n\n"
+            "Creates a new group shop with:\n"
+            "- Separate prices (edit freely)\n"
+            "- Same shared inventory as the master stock\n"
+            "- Shipping/payments copied as a starting point\n\n"
+            f"1. Add this bot to the new group\n"
+            f"2. Open this link in Telegram (you):\n{link}\n"
+            f"3. Then in the new group send:\n/claim_clone {tok['token']}\n\n"
+            f"Master inventory shop: {tok['inventory_master_chat_id']}\n"
+            "Only the admin who created the link can claim it.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Admin", callback_data="admin")]]
+            ),
+        )
+    except Exception as exc:
+        log.exception("cb_adm_clone failed")
+        await safe_edit(query, f"Clone failed: {exc}", back_main_kb())
+    return ConversationHandler.END
 
 
 async def cmd_claim_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1655,23 +1682,23 @@ async def _master_home(
     shops = franchise.list_shops_service_fees()
     open_inv = franchise.list_invoices(status="open", limit=10)
     lines = [
-        "👑 *Master control* (you only)\n",
-        "Hidden *service fee* is folded into each order's shipping total — "
-        "customers never see a separate line. Tracked for weekly invoices.\n",
+        "Master control (you only)\n",
+        "Hidden service fee is folded into each order shipping total. "
+        "Customers never see a separate line. Tracked for weekly invoices.\n",
         f"Shops: {len(shops)} · Open invoices: {len(open_inv)}\n",
     ]
     for s in shops[:15]:
         fee = float(s.get("hidden_service_fee") or 0)
-        tag = " 🔗clone" if s.get("inventory_master_chat_id") else ""
+        tag = " [clone]" if s.get("inventory_master_chat_id") else ""
         lines.append(
-            f"• `{s['chat_id']}` {s.get('title') or 'Shop'}{tag} — fee *{money(fee)}*/order"
+            f"- {s['chat_id']} {s.get('title') or 'Shop'}{tag} - fee {money(fee)}/order"
         )
     kb = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("💵 Set service fee", callback_data="master_setfee")],
-            [InlineKeyboardButton("📊 Fee ledger", callback_data="master_ledger")],
-            [InlineKeyboardButton("🧾 Generate weekly invoices", callback_data="master_geninv")],
-            [InlineKeyboardButton("📬 Open invoices", callback_data="master_invoices")],
+            [InlineKeyboardButton("Set service fee", callback_data="master_setfee")],
+            [InlineKeyboardButton("Fee ledger", callback_data="master_ledger")],
+            [InlineKeyboardButton("Generate weekly invoices", callback_data="master_geninv")],
+            [InlineKeyboardButton("Open invoices", callback_data="master_invoices")],
             [InlineKeyboardButton("« Admin", callback_data="admin")],
         ]
     )
@@ -1679,16 +1706,25 @@ async def _master_home(
     if edit and update.callback_query:
         await safe_edit(update.callback_query, text, kb)
     else:
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        await update.message.reply_text(text, reply_markup=kb)
 
 
-async def cb_master_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cb_master_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    if not update.effective_user or not db.is_owner(update.effective_user.id):
-        await safe_edit(query, "Master admin only.")
-        return
-    await _master_home(update, context, edit=True)
+    try:
+        if not update.effective_user or not db.is_owner(update.effective_user.id):
+            await safe_edit(
+                query,
+                "Master admin only. Your Telegram ID must be in OWNER_IDS on the server.",
+                back_main_kb(),
+            )
+            return ConversationHandler.END
+        await _master_home(update, context, edit=True)
+    except Exception as exc:
+        log.exception("cb_master_home failed")
+        await safe_edit(query, f"Master panel failed: {exc}", back_main_kb())
+    return ConversationHandler.END
 
 
 async def cb_master_setfee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1871,38 +1907,48 @@ async def cb_master_invpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await cb_master_invoices(update, context)
 
 
-async def cb_adm_collab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cb_adm_collab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Admin: shop-to-shop inventory collaboration hub."""
     query = update.callback_query
     await query.answer()
-    sid, ok = _require_admin(update, context)
-    if not ok:
-        return
-    import collab
+    try:
+        sid, ok = _require_admin(update, context)
+        if not ok or sid is None:
+            await safe_edit(
+                query,
+                "Admin only, or no shop selected. Send /start and open Admin again.",
+                back_main_kb(),
+            )
+            return ConversationHandler.END
+        import collab
 
-    collab.ensure_collab_tables()
-    accepted = collab.list_collaborations(sid)
-    pending = collab.list_pending_invites(sid)
-    shares = collab.list_shares(sid, active_only=False)
-    settlements = collab.list_settlements(sid, as_host=True, status="owed")
-    lines = [
-        "🤝 *Collaborations*\n",
-        "Invite another shop to share *their* stock on *your* catalog.",
-        "You set markup %; customer pays you; you settle guest base cost.\n",
-        f"Active partners: {len(accepted)} · Pending invites: {len(pending)}",
-        f"Shared SKUs: {len([s for s in shares if s.get('active')])}",
-        f"Owed to guest shops: {len(settlements)} settlements",
-    ]
-    if settlements:
-        total_owed = sum(float(s["amount"]) for s in settlements)
-        lines.append(f"Total owed: *{money(total_owed)}*")
-    kb_rows = [
-        [InlineKeyboardButton("➕ Create invite link", callback_data="collab_invite")],
-        [InlineKeyboardButton("📦 Manage shared products", callback_data="collab_shares")],
-        [InlineKeyboardButton("💸 Settlements (pay guests)", callback_data="collab_settle")],
-        [InlineKeyboardButton("« Admin", callback_data="admin")],
-    ]
-    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(kb_rows))
+        collab.ensure_collab_tables()
+        accepted = collab.list_collaborations(sid)
+        pending = collab.list_pending_invites(sid)
+        shares = collab.list_shares(sid, active_only=False)
+        settlements = collab.list_settlements(sid, as_host=True, status="owed")
+        lines = [
+            "Collaborations\n",
+            "Invite another shop to share their stock on your catalog.",
+            "You set markup %; customer pays you; you settle guest base cost.\n",
+            f"Active partners: {len(accepted)} · Pending invites: {len(pending)}",
+            f"Shared SKUs: {len([s for s in shares if s.get('active')])}",
+            f"Owed to guest shops: {len(settlements)} settlements",
+        ]
+        if settlements:
+            total_owed = sum(float(s["amount"]) for s in settlements)
+            lines.append(f"Total owed: {money(total_owed)}")
+        kb_rows = [
+            [InlineKeyboardButton("➕ Create invite link", callback_data="collab_invite")],
+            [InlineKeyboardButton("📦 Manage shared products", callback_data="collab_shares")],
+            [InlineKeyboardButton("💸 Settlements (pay guests)", callback_data="collab_settle")],
+            [InlineKeyboardButton("« Admin", callback_data="admin")],
+        ]
+        await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(kb_rows))
+    except Exception as exc:
+        log.exception("cb_adm_collab failed")
+        await safe_edit(query, f"Collaborations failed: {exc}", back_main_kb())
+    return ConversationHandler.END
 
 
 async def cb_collab_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3814,6 +3860,21 @@ def build_app() -> Application:
             CallbackQueryHandler(cb_main, pattern=r"^main$"),
             CallbackQueryHandler(cb_catalog, pattern=r"^cat$"),
             CallbackQueryHandler(cb_admin, pattern=r"^admin$"),
+            # Admin nav must work even if a prior prompt left the user mid-conversation
+            CallbackQueryHandler(cb_adm_collab, pattern=r"^adm_collab$"),
+            CallbackQueryHandler(cb_adm_clone, pattern=r"^adm_clone$"),
+            CallbackQueryHandler(cb_master_home, pattern=r"^master_home$"),
+            CallbackQueryHandler(cb_master_setfee, pattern=r"^master_setfee$"),
+            CallbackQueryHandler(cb_master_ledger, pattern=r"^master_ledger$"),
+            CallbackQueryHandler(cb_master_geninv, pattern=r"^master_geninv$"),
+            CallbackQueryHandler(cb_master_invoices, pattern=r"^master_invoices$"),
+            CallbackQueryHandler(cb_adm_prods, pattern=r"^adm_prods$"),
+            CallbackQueryHandler(cb_adm_orders, pattern=r"^adm_orders$"),
+            CallbackQueryHandler(cb_adm_link, pattern=r"^adm_link$"),
+            CallbackQueryHandler(cb_adm_export, pattern=r"^adm_export$"),
+            CallbackQueryHandler(cb_collab_invite, pattern=r"^collab_invite$"),
+            CallbackQueryHandler(cb_collab_shares, pattern=r"^collab_shares$"),
+            CallbackQueryHandler(cb_collab_settle, pattern=r"^collab_settle$"),
         ],
         allow_reentry=True,
         name="main_conv",
@@ -3827,7 +3888,28 @@ def build_app() -> Application:
         ChatMemberHandler(setup_wizard.on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER)
     )
 
-    app.add_handler(conv)
+    # Admin / collab / master navigation FIRST (group 0) so ConversationHandler
+    # never swallows these clicks when a user is mid-prompt.
+    NAV = 0
+    CONV = 1
+    app.add_handler(CallbackQueryHandler(cb_adm_collab, pattern=r"^adm_collab$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_adm_clone, pattern=r"^adm_clone$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_master_home, pattern=r"^master_home$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_master_setfee, pattern=r"^master_setfee$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_master_ledger, pattern=r"^master_ledger$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_master_geninv, pattern=r"^master_geninv$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_master_invoices, pattern=r"^master_invoices$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_master_invpaid, pattern=r"^master_invpaid:\d+$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_collab_invite, pattern=r"^collab_invite$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_collab_accept, pattern=r"^collab_accept:"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_collab_shares, pattern=r"^collab_shares$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_collab_guest, pattern=r"^collab_guest:"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_collab_tog, pattern=r"^collab_tog:"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_collab_mk, pattern=r"^collab_mk:"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_collab_settle, pattern=r"^collab_settle$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_collab_paid, pattern=r"^collab_paid:"), group=NAV)
+
+    app.add_handler(conv, group=CONV)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -3873,24 +3955,6 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_rm_admin, pattern=r"^rmadmin:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_link, pattern=r"^adm_link$"))
     app.add_handler(CallbackQueryHandler(cb_adm_export, pattern=r"^adm_export$"))
-    app.add_handler(CallbackQueryHandler(cb_adm_clone, pattern=r"^adm_clone$"))
-    # Master (OWNER_IDS only)
-    app.add_handler(CallbackQueryHandler(cb_master_home, pattern=r"^master_home$"))
-    app.add_handler(CallbackQueryHandler(cb_master_setfee, pattern=r"^master_setfee$"))
-    app.add_handler(CallbackQueryHandler(cb_master_ledger, pattern=r"^master_ledger$"))
-    app.add_handler(CallbackQueryHandler(cb_master_geninv, pattern=r"^master_geninv$"))
-    app.add_handler(CallbackQueryHandler(cb_master_invoices, pattern=r"^master_invoices$"))
-    app.add_handler(CallbackQueryHandler(cb_master_invpaid, pattern=r"^master_invpaid:\d+$"))
-    # Shop collaboration
-    app.add_handler(CallbackQueryHandler(cb_adm_collab, pattern=r"^adm_collab$"))
-    app.add_handler(CallbackQueryHandler(cb_collab_invite, pattern=r"^collab_invite$"))
-    app.add_handler(CallbackQueryHandler(cb_collab_accept, pattern=r"^collab_accept:"))
-    app.add_handler(CallbackQueryHandler(cb_collab_shares, pattern=r"^collab_shares$"))
-    app.add_handler(CallbackQueryHandler(cb_collab_guest, pattern=r"^collab_guest:"))
-    app.add_handler(CallbackQueryHandler(cb_collab_tog, pattern=r"^collab_tog:"))
-    app.add_handler(CallbackQueryHandler(cb_collab_mk, pattern=r"^collab_mk:"))
-    app.add_handler(CallbackQueryHandler(cb_collab_settle, pattern=r"^collab_settle$"))
-    app.add_handler(CallbackQueryHandler(cb_collab_paid, pattern=r"^collab_paid:"))
     app.add_handler(CallbackQueryHandler(cb_export_report, pattern=r"^export:(inv|pending|both)$"))
 
     return app
