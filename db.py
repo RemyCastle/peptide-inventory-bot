@@ -254,6 +254,14 @@ def init_db() -> None:
     except Exception:
         pass
 
+    # Clones + master service fees (schema v8+)
+    try:
+        from franchise import ensure_franchise_tables
+
+        ensure_franchise_tables()
+    except Exception:
+        pass
+
 
 def shop_display(shop: dict | None) -> dict[str, Any]:
     """Resolved branding for a shop with instance-level fallbacks."""
@@ -327,6 +335,9 @@ def update_shop(chat_id: int, **fields: Any) -> None:
         "currency_symbol",
         "low_stock_threshold",
         "setup_complete",
+        "inventory_master_chat_id",
+        "hidden_service_fee",
+        "clone_of_chat_id",
     }
     cols = []
     vals: list[Any] = []
@@ -660,7 +671,22 @@ def adjust_stock(
     reason: str = "manual_adjust",
     order_id: int | None = None,
 ) -> Optional[int]:
-    """Adjust stock by delta. Returns new stock or None if product missing."""
+    """Adjust stock by delta. Linked clone products deduct master inventory."""
+    try:
+        from franchise import adjust_stock_effective, ensure_franchise_tables
+
+        ensure_franchise_tables()
+        p = get_product(product_id)
+        if p and p.get("linked_product_id"):
+            return adjust_stock_effective(
+                product_id,
+                delta,
+                actor_id=actor_id,
+                reason=reason,
+                order_id=order_id,
+            )
+    except Exception:
+        pass
     with get_db() as conn:
         row = conn.execute(
             "SELECT id, chat_id, name, stock FROM products WHERE id = ?",
@@ -749,7 +775,17 @@ def list_products(chat_id: int, active_only: bool = False) -> list[dict]:
                 """,
                 (chat_id,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        products = [dict(r) for r in rows]
+    # Overlay shared inventory stock for clone shop products
+    try:
+        from franchise import enrich_product_stock, ensure_franchise_tables
+
+        ensure_franchise_tables()
+        if any(p.get("linked_product_id") for p in products):
+            products = [enrich_product_stock(p) for p in products]
+    except Exception:
+        pass
+    return products
 
 
 def search_products(
@@ -973,23 +1009,45 @@ def create_order(
 
     shop = ensure_shop(chat_id)
     with get_db() as conn:
-        # Re-check live stock
+        # Re-check live stock (clone products use linked master stock)
         for it in items:
             pid = it["product_id"]
             qty = int(it["quantity"])
             row = conn.execute(
-                "SELECT id, name, price, stock, active FROM products WHERE id = ? AND chat_id = ?",
+                """
+                SELECT id, name, price, stock, active, linked_product_id
+                FROM products WHERE id = ? AND chat_id = ?
+                """,
                 (pid, chat_id),
             ).fetchone()
             if not row or not row["active"]:
                 return None
-            if int(row["stock"]) < qty:
+            stock_id = int(row["linked_product_id"] or row["id"])
+            stock_row = conn.execute(
+                "SELECT stock FROM products WHERE id = ?", (stock_id,)
+            ).fetchone()
+            have = int(stock_row["stock"]) if stock_row else 0
+            if have < qty:
                 return None
             it["product_name"] = row["name"]
             it["unit_price"] = float(row["price"])
 
         subtotal = sum(float(it["unit_price"]) * int(it["quantity"]) for it in items)
-        shipping = calc_shipping(shop, subtotal)
+        # Hidden master service fee folded into shipping (customer sees one shipping total)
+        try:
+            from franchise import customer_shipping_total, ensure_franchise_tables
+
+            ensure_franchise_tables()
+            shop_live = dict(
+                conn.execute(
+                    "SELECT * FROM shops WHERE chat_id = ?", (chat_id,)
+                ).fetchone()
+                or shop
+            )
+            shipping, hidden_fee = customer_shipping_total(shop_live, subtotal)
+        except Exception:
+            shipping = calc_shipping(shop, subtotal)
+            hidden_fee = 0.0
         total = subtotal + shipping
         now = _utc_now()
 
@@ -1003,8 +1061,8 @@ def create_order(
                 subtotal, shipping_fee, total,
                 payment_method_id, payment_method_name,
                 ship_name, ship_address, ship_notes,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'pending_payment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, updated_at, hidden_service_fee
+            ) VALUES (?, ?, ?, ?, 'pending_payment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chat_id,
@@ -1021,6 +1079,7 @@ def create_order(
                 ship_notes,
                 now,
                 now,
+                float(hidden_fee),
             ),
         )
         order_id = int(cur.lastrowid)
@@ -1251,21 +1310,27 @@ def confirm_order_payment(
             "SELECT * FROM order_items WHERE order_id = ?", (order_id,)
         ).fetchall()
 
-        # Verify stock still available
+        # Verify stock still available (resolve clone → master inventory)
         for it in items:
             if it["product_id"] is None:
                 continue
             prod = conn.execute(
-                "SELECT stock, name FROM products WHERE id = ?",
+                "SELECT id, name, stock, linked_product_id FROM products WHERE id = ?",
                 (it["product_id"],),
             ).fetchone()
             if not prod:
                 return False, f"Product missing for line: {it['product_name']}", []
-            if int(prod["stock"]) < int(it["quantity"]):
+            stock_id = int(prod["linked_product_id"] or prod["id"])
+            stock_row = conn.execute(
+                "SELECT stock, name FROM products WHERE id = ?", (stock_id,)
+            ).fetchone()
+            if not stock_row:
+                return False, f"Inventory missing for: {prod['name']}", []
+            if int(stock_row["stock"]) < int(it["quantity"]):
                 return (
                     False,
-                    f"Insufficient stock for {prod['name']}: "
-                    f"need {it['quantity']}, have {prod['stock']}.",
+                    f"Insufficient stock for {stock_row['name']}: "
+                    f"need {it['quantity']}, have {stock_row['stock']}.",
                     [],
                 )
 
@@ -1277,18 +1342,25 @@ def confirm_order_payment(
 
         low_stock_alerts: list[dict] = []
 
-        # Deduct stock + audit
+        # Deduct stock + audit on root inventory product
         for it in items:
             if it["product_id"] is None:
                 continue
             prod = conn.execute(
-                "SELECT id, chat_id, name, stock FROM products WHERE id = ?",
+                "SELECT id, chat_id, name, stock, linked_product_id FROM products WHERE id = ?",
                 (it["product_id"],),
             ).fetchone()
             if not prod:
                 continue
+            stock_id = int(prod["linked_product_id"] or prod["id"])
+            root = conn.execute(
+                "SELECT id, chat_id, name, stock FROM products WHERE id = ?",
+                (stock_id,),
+            ).fetchone()
+            if not root:
+                continue
             qty = int(it["quantity"])
-            before = int(prod["stock"])
+            before = int(root["stock"])
             after = before - qty
             conn.execute(
                 """
@@ -1296,13 +1368,13 @@ def confirm_order_payment(
                 SET stock = stock - ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (qty, _utc_now(), it["product_id"]),
+                (qty, _utc_now(), stock_id),
             )
             _insert_audit(
                 conn,
-                chat_id=int(prod["chat_id"]),
-                product_id=int(prod["id"]),
-                product_name=prod["name"],
+                chat_id=int(root["chat_id"]),
+                product_id=int(root["id"]),
+                product_name=root["name"],
                 delta=-qty,
                 stock_before=before,
                 stock_after=after,
@@ -1313,11 +1385,11 @@ def confirm_order_payment(
             if after <= threshold:
                 low_stock_alerts.append(
                     {
-                        "product_id": int(prod["id"]),
-                        "name": prod["name"],
+                        "product_id": int(root["id"]),
+                        "name": root["name"],
                         "stock": after,
                         "threshold": threshold,
-                        "chat_id": int(prod["chat_id"]),
+                        "chat_id": int(root["chat_id"]),
                     }
                 )
 

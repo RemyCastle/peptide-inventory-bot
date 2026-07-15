@@ -391,7 +391,14 @@ def create_order_multi(
             )
 
         subtotal = sum(p["line_total"] for p in prepared)
-        shipping = calc_shipping(shop, subtotal)
+        try:
+            from franchise import customer_shipping_total, ensure_franchise_tables
+
+            ensure_franchise_tables()
+            shipping, hidden_fee = customer_shipping_total(shop, subtotal)
+        except Exception:
+            shipping = calc_shipping(shop, subtotal)
+            hidden_fee = 0.0
         total = subtotal + shipping
         now = _utc_now()
         pm_id = payment_method["id"] if payment_method else None
@@ -404,8 +411,8 @@ def create_order_multi(
                 subtotal, shipping_fee, total,
                 payment_method_id, payment_method_name,
                 ship_name, ship_address, ship_notes,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'pending_payment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, updated_at, hidden_service_fee
+            ) VALUES (?, ?, ?, ?, 'pending_payment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 host_chat_id,
@@ -422,6 +429,7 @@ def create_order_multi(
                 ship_notes,
                 now,
                 now,
+                float(hidden_fee),
             ),
         )
         order_id = int(cur.lastrowid)

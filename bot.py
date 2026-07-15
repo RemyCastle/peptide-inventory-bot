@@ -101,7 +101,8 @@ def symbol_for(chat_id: int | None) -> str:
     PAY_TPL_DETAILS,
     SEARCH_QUERY,
     EDIT_COA_VALUE,
-) = range(21)
+    MASTER_FEE_INPUT,
+) = range(22)
 
 # How long a pending admin/buyer prompt stays open (seconds)
 AWAITING_TTL_SEC = 600
@@ -345,6 +346,26 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             except ValueError:
                 pass
+        if arg0.startswith("clone_"):
+            token = arg0.removeprefix("clone_")
+            import franchise
+
+            franchise.ensure_franchise_tables()
+            inv = franchise.get_clone_token(token)
+            if not inv or inv["status"] != "pending":
+                await update.message.reply_text("Clone link not found or already used.")
+                return
+            context.user_data["pending_clone_token"] = token
+            await update.message.reply_text(
+                "📋 *Clone shop ready*\n\n"
+                f"Source shop: `{inv['source_chat_id']}`\n\n"
+                "1. Open the *new Telegram group* (bot must be a member)\n"
+                f"2. Send this command *in that group*:\n"
+                f"`/claim_clone {token}`\n\n"
+                "That group gets separate prices + shared inventory with the master stock.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
 
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         shop = db.ensure_shop(chat.id, title=chat.title or "Shop")
@@ -1510,9 +1531,27 @@ async def _admin_home(
             [
                 InlineKeyboardButton("🤝 Collaborations", callback_data="adm_collab"),
             ],
+            [
+                InlineKeyboardButton("📋 Clone shop", callback_data="adm_clone"),
+            ],
             [InlineKeyboardButton("« Menu", callback_data="main")],
         ]
     )
+    # Master admin (OWNER_IDS) only — never show to shop staff
+    if update.effective_user and db.is_owner(update.effective_user.id):
+        rows = list(kb.inline_keyboard)
+        rows.insert(
+            -1,
+            [InlineKeyboardButton("👑 Master fees / invoices", callback_data="master_home")],
+        )
+        kb = InlineKeyboardMarkup(rows)
+    # Note shared inventory on clone shops
+    shop_full = shop
+    if shop_full.get("inventory_master_chat_id"):
+        text += (
+            f"\n\n_Shared inventory from master_ `{shop_full['inventory_master_chat_id']}` "
+            f"— prices are unique to this group."
+        )
     if edit and update.callback_query:
         await safe_edit(update.callback_query, text, kb)
     elif update.message:
@@ -1532,6 +1571,304 @@ async def cb_adm_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🔗 *Customer shop link*\n\n`{link}`\n\nShare this so buyers open the right catalog.",
         back_main_kb([[InlineKeyboardButton("« Admin", callback_data="admin")]]),
     )
+
+
+async def cb_adm_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: create a one-time link to clone this shop into another group."""
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return
+    import franchise
+
+    franchise.ensure_franchise_tables()
+    try:
+        tok = franchise.create_clone_token(sid, update.effective_user.id)
+    except PermissionError:
+        await safe_edit(query, "Admin only.", back_main_kb())
+        return
+    me = await context.bot.get_me()
+    link = f"https://t.me/{me.username}?start={tok['deep_link_arg']}"
+    await safe_edit(
+        query,
+        "📋 *Clone this shop into another group*\n\n"
+        "Creates a *new* group shop with:\n"
+        "• *Separate prices* (edit freely)\n"
+        "• *Same shared inventory* as the master stock\n"
+        "• Shipping/payments copied as a starting point\n\n"
+        f"1. Add this bot to the *new group*\n"
+        f"2. Open this link *in Telegram* (you):\n`{link}`\n"
+        f"3. Then in the *new group* send:\n`/claim_clone {tok['token']}`\n\n"
+        f"Master inventory shop: `{tok['inventory_master_chat_id']}`\n"
+        "_Only the admin who created the link can claim it._",
+        InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Admin", callback_data="admin")]]
+        ),
+    )
+
+
+async def cmd_claim_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """In target group: /claim_clone <token> — attach clone (admin of source)."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text(
+            "Run /claim_clone *inside the new group* where you want the cloned shop.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/claim_clone <token>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    token = context.args[0].strip()
+    import franchise
+
+    franchise.ensure_franchise_tables()
+    title = chat.title or "Shop"
+    ok, msg = franchise.attach_clone(token, chat.id, user.id, title=title)
+    await update.message.reply_text(
+        ("✅ " if ok else "❌ ") + msg,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    if ok:
+        set_shop(context, chat.id)
+
+
+async def cmd_master(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """OWNER_IDS only: service fees + weekly invoices."""
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await update.message.reply_text("Master admin only.")
+        return
+    await _master_home(update, context, edit=False)
+
+
+async def _master_home(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool
+) -> None:
+    import franchise
+
+    franchise.ensure_franchise_tables()
+    shops = franchise.list_shops_service_fees()
+    open_inv = franchise.list_invoices(status="open", limit=10)
+    lines = [
+        "👑 *Master control* (you only)\n",
+        "Hidden *service fee* is folded into each order's shipping total — "
+        "customers never see a separate line. Tracked for weekly invoices.\n",
+        f"Shops: {len(shops)} · Open invoices: {len(open_inv)}\n",
+    ]
+    for s in shops[:15]:
+        fee = float(s.get("hidden_service_fee") or 0)
+        tag = " 🔗clone" if s.get("inventory_master_chat_id") else ""
+        lines.append(
+            f"• `{s['chat_id']}` {s.get('title') or 'Shop'}{tag} — fee *{money(fee)}*/order"
+        )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💵 Set service fee", callback_data="master_setfee")],
+            [InlineKeyboardButton("📊 Fee ledger", callback_data="master_ledger")],
+            [InlineKeyboardButton("🧾 Generate weekly invoices", callback_data="master_geninv")],
+            [InlineKeyboardButton("📬 Open invoices", callback_data="master_invoices")],
+            [InlineKeyboardButton("« Admin", callback_data="admin")],
+        ]
+    )
+    text = "\n".join(lines)
+    if edit and update.callback_query:
+        await safe_edit(update.callback_query, text, kb)
+    else:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+
+async def cb_master_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not update.effective_user or not db.is_owner(update.effective_user.id):
+        await safe_edit(query, "Master admin only.")
+        return
+    await _master_home(update, context, edit=True)
+
+
+async def cb_master_setfee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not update.effective_user or not db.is_owner(update.effective_user.id):
+        await safe_edit(query, "Master admin only.")
+        return
+    import franchise
+
+    shops = franchise.list_shops_service_fees()
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"{(s.get('title') or 'Shop')[:20]} `{s['chat_id']}`",
+                callback_data=f"master_feeshop:{s['chat_id']}",
+            )
+        ]
+        for s in shops[:30]
+    ]
+    buttons.append([InlineKeyboardButton("« Master", callback_data="master_home")])
+    await safe_edit(
+        query,
+        "Pick a group/shop to set its *hidden service fee* (added into every order's shipping):",
+        InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cb_master_feeshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if not update.effective_user or not db.is_owner(update.effective_user.id):
+        await safe_edit(query, "Master admin only.")
+        return ConversationHandler.END
+    chat_id = int(query.data.split(":")[1])
+    context.user_data["master_fee_shop"] = chat_id
+    import franchise
+
+    fee = franchise.get_hidden_service_fee(chat_id)
+    await query.message.reply_text(
+        f"Send the new hidden service fee in dollars for shop `{chat_id}` "
+        f"(current *{money(fee)}*).\nExample: `2.50`\n/cancel to abort.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("e.g. 2.50"),
+    )
+    return MASTER_FEE_INPUT
+
+
+async def master_fee_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_user or not db.is_owner(update.effective_user.id):
+        await update.message.reply_text("Master admin only.")
+        return ConversationHandler.END
+    raw = (update.message.text or "").strip().replace("$", "")
+    try:
+        fee = float(raw)
+    except ValueError:
+        await update.message.reply_text("Send a number like `3` or `2.50`.", parse_mode=ParseMode.MARKDOWN)
+        return MASTER_FEE_INPUT
+    chat_id = context.user_data.get("master_fee_shop")
+    if not chat_id:
+        await update.message.reply_text("Session expired. Open Master again.")
+        return ConversationHandler.END
+    import franchise
+
+    ok, msg = franchise.set_hidden_service_fee(int(chat_id), fee, update.effective_user.id)
+    context.user_data.pop("master_fee_shop", None)
+    await update.message.reply_text(
+        ("✅ " if ok else "❌ ") + msg,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Master", callback_data="master_home")]]
+        ),
+    )
+    return ConversationHandler.END
+
+
+async def cb_master_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not update.effective_user or not db.is_owner(update.effective_user.id):
+        await safe_edit(query, "Master admin only.")
+        return
+    import franchise
+
+    rows = franchise.service_fee_ledger(limit=25)
+    if not rows:
+        text = "No orders with service fees yet."
+    else:
+        lines = ["📊 *Service fee ledger* (recent)\n"]
+        for r in rows:
+            lines.append(
+                f"• `{r.get('payment_code') or r['id']}` shop `{r['chat_id']}` "
+                f"fee *{money(r['hidden_service_fee'])}* · {r['status']} · "
+                f"{r.get('paid_at') or r.get('created_at')}"
+            )
+        text = "\n".join(lines)
+    await safe_edit(
+        query,
+        text,
+        InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Master", callback_data="master_home")]]
+        ),
+    )
+
+
+async def cb_master_geninv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not update.effective_user or not db.is_owner(update.effective_user.id):
+        await safe_edit(query, "Master admin only.")
+        return
+    import franchise
+
+    ok, msg, invs = franchise.generate_weekly_invoices(update.effective_user.id)
+    lines = [("✅ " if ok else "❌ ") + msg, ""]
+    if not invs:
+        lines.append("_No billable fees this week (or all zero)._")
+    for i in invs:
+        lines.append(
+            f"• Invoice #{i['id']} `{i['chat_id']}` {i.get('title') or ''} — "
+            f"*{money(i['total_fees'])}* across {i['order_count']} orders ({i['status']})"
+        )
+    await safe_edit(
+        query,
+        "\n".join(lines),
+        InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📬 Open invoices", callback_data="master_invoices")],
+                [InlineKeyboardButton("« Master", callback_data="master_home")],
+            ]
+        ),
+    )
+
+
+async def cb_master_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not update.effective_user or not db.is_owner(update.effective_user.id):
+        await safe_edit(query, "Master admin only.")
+        return
+    import franchise
+
+    invs = franchise.list_invoices(status="open", limit=20)
+    if not invs:
+        text = "No open invoices. Generate weekly invoices first."
+        buttons = [[InlineKeyboardButton("« Master", callback_data="master_home")]]
+    else:
+        lines = ["📬 *Open service-fee invoices*\n"]
+        buttons = []
+        for i in invs:
+            lines.append(
+                f"• #{i['id']} shop `{i['chat_id']}` {i.get('title') or ''} — "
+                f"*{money(i['total_fees'])}* ({i['order_count']} orders)\n"
+                f"  Week `{i['week_start']}` → `{i['week_end']}`"
+            )
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"Mark paid #{i['id']} ({money(i['total_fees'])})",
+                        callback_data=f"master_invpaid:{i['id']}",
+                    )
+                ]
+            )
+        buttons.append([InlineKeyboardButton("« Master", callback_data="master_home")])
+        text = "\n".join(lines)
+    await safe_edit(query, text, InlineKeyboardMarkup(buttons))
+
+
+async def cb_master_invpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not update.effective_user or not db.is_owner(update.effective_user.id):
+        await safe_edit(query, "Master admin only.")
+        return
+    inv_id = int(query.data.split(":")[1])
+    import franchise
+
+    ok, msg = franchise.mark_invoice_paid(inv_id, update.effective_user.id)
+    await query.answer(msg, show_alert=True)
+    await cb_master_invoices(update, context)
 
 
 async def cb_adm_collab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3348,6 +3685,8 @@ async def post_init(app: Application) -> None:
             BotCommand("orders", "Orders (admin shop / your orders)"),
             BotCommand("admin", "Admin panel"),
             BotCommand("setup", "Guided shop setup (group admins)"),
+            BotCommand("claim_clone", "Attach cloned shop to this group"),
+            BotCommand("master", "Master fees/invoices (owner only)"),
             BotCommand("help", "Help"),
             BotCommand("cancel", "Cancel current step"),
         ]
@@ -3392,9 +3731,13 @@ def build_app() -> Application:
             CallbackQueryHandler(cb_ship_free_start, pattern=r"^ship_free$"),
             CallbackQueryHandler(cb_add_admin_start, pattern=r"^adm_addadmin$"),
             CallbackQueryHandler(cb_search, pattern=r"^search$"),
+            CallbackQueryHandler(cb_master_feeshop, pattern=r"^master_feeshop:-?\d+$"),
             CommandHandler("search", cmd_search),
         ],
         states={
+            MASTER_FEE_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, master_fee_input),
+            ],
             CHECKOUT_NAME: [
                 CallbackQueryHandler(cb_pay_method, pattern=r"^paym:\d+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_name),
@@ -3493,6 +3836,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("myorders", cmd_myorders))
     app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("claim_clone", cmd_claim_clone))
+    app.add_handler(CommandHandler("master", cmd_master))
 
     app.add_handler(CallbackQueryHandler(cb_pickshop, pattern=r"^pickshop:-?\d+$"))
     app.add_handler(CallbackQueryHandler(cb_main, pattern=r"^main$"))
@@ -3528,6 +3873,14 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_rm_admin, pattern=r"^rmadmin:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_link, pattern=r"^adm_link$"))
     app.add_handler(CallbackQueryHandler(cb_adm_export, pattern=r"^adm_export$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_clone, pattern=r"^adm_clone$"))
+    # Master (OWNER_IDS only)
+    app.add_handler(CallbackQueryHandler(cb_master_home, pattern=r"^master_home$"))
+    app.add_handler(CallbackQueryHandler(cb_master_setfee, pattern=r"^master_setfee$"))
+    app.add_handler(CallbackQueryHandler(cb_master_ledger, pattern=r"^master_ledger$"))
+    app.add_handler(CallbackQueryHandler(cb_master_geninv, pattern=r"^master_geninv$"))
+    app.add_handler(CallbackQueryHandler(cb_master_invoices, pattern=r"^master_invoices$"))
+    app.add_handler(CallbackQueryHandler(cb_master_invpaid, pattern=r"^master_invpaid:\d+$"))
     # Shop collaboration
     app.add_handler(CallbackQueryHandler(cb_adm_collab, pattern=r"^adm_collab$"))
     app.add_handler(CallbackQueryHandler(cb_collab_invite, pattern=r"^collab_invite$"))
