@@ -102,7 +102,8 @@ def symbol_for(chat_id: int | None) -> str:
     SEARCH_QUERY,
     EDIT_COA_VALUE,
     MASTER_FEE_INPUT,
-) = range(22)
+    FRANCHISE_PROOF,
+) = range(23)
 
 # How long a pending admin/buyer prompt stays open (seconds)
 AWAITING_TTL_SEC = 600
@@ -1177,12 +1178,48 @@ async def cb_ship_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-def _shop_admin_recipients(chat_id: int) -> set[int]:
-    """Shop admins + global owners for sale/order alerts."""
-    recipients: set[int] = set(OWNER_IDS)
+def _shop_admin_recipients(
+    chat_id: int,
+    *,
+    local_only: bool = False,
+) -> set[int]:
+    """
+    Recipients for order/sale alerts.
+    local_only=True → only this shop's admins table (no global OWNER_IDS fan-out).
+    Used for franchisee shops so the main shop is not notified early.
+    """
+    recipients: set[int] = set()
     for a in db.list_admins(int(chat_id)):
         recipients.add(int(a["user_id"]))
+    if not local_only:
+        recipients |= set(OWNER_IDS)
+    # If somehow no local admins, owners still get primary-shop alerts
+    if not recipients and not local_only:
+        recipients |= set(OWNER_IDS)
     return recipients
+
+
+def _master_shop_recipients(franchisee_chat_id: int) -> set[int]:
+    """Main shop admins + owners — for remittance proof after franchisee confirms sale."""
+    import franchise
+
+    franchise.ensure_franchise_tables()
+    recipients: set[int] = set(OWNER_IDS)
+    mid = franchise.master_chat_id_for(int(franchisee_chat_id))
+    if mid is not None:
+        for a in db.list_admins(int(mid)):
+            recipients.add(int(a["user_id"]))
+    return recipients
+
+
+def _is_franchisee_order(order: dict) -> bool:
+    try:
+        import franchise
+
+        franchise.ensure_franchise_tables()
+        return franchise.is_franchisee_shop(int(order["chat_id"]))
+    except Exception:
+        return False
 
 
 async def _notify_admins_sale_report(
@@ -1192,16 +1229,34 @@ async def _notify_admins_sale_report(
     *,
     headline: str,
     reply_markup: InlineKeyboardMarkup | None = None,
+    audience: str = "auto",
 ) -> None:
     """
-    Push full sale details to every shop admin:
-    items, address, payment type, order #, total, franchisee, buyer username.
+    Push full sale details.
+    audience:
+      auto   — franchisee shop → local franchisee admins only;
+               primary shop → local admins + owners
+      local  — shop admins only
+      master — main shop (owners + master admins) for franchisee remittance
+      all    — local + owners
     """
     text = db.format_sale_admin_report(
         order, items, SYM, headline=headline
     )
-    # Prefer plain-safe send (avoids Markdown break on addresses / usernames)
-    for uid in _shop_admin_recipients(order["chat_id"]):
+    if audience == "master":
+        recipients = _master_shop_recipients(int(order["chat_id"]))
+    elif audience == "local":
+        recipients = _shop_admin_recipients(int(order["chat_id"]), local_only=True)
+    elif audience == "all":
+        recipients = _shop_admin_recipients(int(order["chat_id"]), local_only=False)
+    else:
+        # auto
+        if _is_franchisee_order(order):
+            recipients = _shop_admin_recipients(int(order["chat_id"]), local_only=True)
+        else:
+            recipients = _shop_admin_recipients(int(order["chat_id"]), local_only=False)
+
+    for uid in recipients:
         try:
             await context.bot.send_message(
                 uid,
@@ -1225,12 +1280,16 @@ async def _notify_admins_new_order(context, order: dict, items: list[dict]) -> N
             [InlineKeyboardButton("📋 Orders", callback_data="adm_orders")],
         ]
     )
+    note = ""
+    if _is_franchisee_order(order):
+        note = " (franchisee — main shop not notified yet)"
     await _notify_admins_sale_report(
         context,
         order,
         items,
-        headline="NEW ORDER (payment pending)",
+        headline=f"NEW ORDER (payment pending){note}",
         reply_markup=kb,
+        audience="auto",
     )
 
 
@@ -1251,16 +1310,22 @@ async def _notify_admins_payment_claim(
             [InlineKeyboardButton(f"View #{oid}", callback_data=f"vieword:{oid}")],
         ]
     )
-    headline = f"PAYMENT CLAIM — buyer says paid ({proof})"
+    note = ""
+    if _is_franchisee_order(order):
+        note = " — main shop not notified yet"
+    headline = f"PAYMENT CLAIM — buyer says paid ({proof}){note}"
     await _notify_admins_sale_report(
         context,
         order,
         items,
         headline=headline,
         reply_markup=kb,
+        audience="auto",
     )
-    # Forward proof image to each admin if present
-    for uid in _shop_admin_recipients(order["chat_id"]):
+    # Customer payment proof → franchisee admins only (not main) until remittance step
+    for uid in _shop_admin_recipients(
+        order["chat_id"], local_only=_is_franchisee_order(order)
+    ):
         try:
             fid = (order.get("payment_proof_file_id") or "").strip()
             if fid:
@@ -1270,18 +1335,155 @@ async def _notify_admins_payment_claim(
                         await context.bot.send_document(
                             uid,
                             document=fid,
-                            caption=f"Payment proof — order #{oid} code {code}",
+                            caption=f"Customer payment proof — order #{oid} code {code}",
                         )
                     else:
                         await context.bot.send_photo(
                             uid,
                             photo=fid,
-                            caption=f"Payment proof — order #{oid} code {code}",
+                            caption=f"Customer payment proof — order #{oid} code {code}",
                         )
                 except Exception as e:
                     log.info("Could not send proof to admin %s: %s", uid, e)
         except Exception:
             pass
+
+
+async def _forward_franchise_sale_to_master(
+    context,
+    order: dict,
+    items: list[dict],
+) -> None:
+    """Notify main shop only after franchisee confirmed pay + submitted remittance proof."""
+    import franchise
+
+    franchise.ensure_franchise_tables()
+    order = db.get_order(int(order["id"])) or order
+    if not franchise.is_franchisee_shop(int(order["chat_id"])):
+        return
+    if order.get("status") != "paid":
+        return
+    if not franchise.franchise_forwarded(order):
+        return
+    mid = franchise.master_chat_id_for(int(order["chat_id"]))
+    headline = (
+        f"FRANCHISEE REMITTANCE — sale forwarded to main shop "
+        f"(franchisee shop {order['chat_id']}"
+        + (f" / master {mid}" if mid else "")
+        + ")"
+    )
+    await _notify_admins_sale_report(
+        context,
+        order,
+        items,
+        headline=headline,
+        audience="master",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(f"View #{order['id']}", callback_data=f"vieword:{order['id']}")]]
+        ),
+    )
+    # Remittance proof media to main
+    fid = (order.get("franchise_master_proof_file_id") or "").strip()
+    if not fid:
+        return
+    ftype = (order.get("franchise_master_proof_file_type") or "photo").lower()
+    caption = (
+        f"Franchisee proof of payment to main — order #{order['id']} "
+        f"code {order.get('payment_code') or '—'}"
+    )
+    for uid in _master_shop_recipients(int(order["chat_id"])):
+        try:
+            if ftype == "document":
+                await context.bot.send_document(uid, document=fid, caption=caption)
+            else:
+                await context.bot.send_photo(uid, photo=fid, caption=caption)
+        except Exception as e:
+            log.info("Could not send franchise proof to master admin %s: %s", uid, e)
+
+
+async def cb_franchise_proof_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Franchisee admin: send remittance proof so main shop gets the sale."""
+    query = update.callback_query
+    user = update.effective_user
+    oid = int(query.data.split(":")[1])
+    order = db.get_order(oid)
+    if not order or not user or not db.is_admin(order["chat_id"], user.id):
+        await query.answer("Not allowed", show_alert=True)
+        return ConversationHandler.END
+    if not _is_franchisee_order(order):
+        await query.answer("Not a franchisee order", show_alert=True)
+        return ConversationHandler.END
+    if order["status"] != "paid":
+        await query.answer("Confirm customer payment first", show_alert=True)
+        return ConversationHandler.END
+    import franchise
+
+    if franchise.franchise_forwarded(order):
+        await query.answer("Already sent to main shop", show_alert=True)
+        return ConversationHandler.END
+    context.user_data["franchise_proof_order_id"] = oid
+    set_awaiting(context, "franchise_proof")
+    await query.answer()
+    await query.message.reply_text(
+        f"Send *proof of payment to the main shop* for order #{oid}.\n"
+        "Photo or PDF of your remittance / transfer to main.\n"
+        "Main shop is *not* notified until you send this.\n"
+        "/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Proof photo or PDF..."),
+    )
+    return FRANCHISE_PROOF
+
+
+async def franchise_proof_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await accept_prompt_message(update, context):
+        return FRANCHISE_PROOF
+    user = update.effective_user
+    oid = context.user_data.get("franchise_proof_order_id")
+    if not oid or not user:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    order = db.get_order(int(oid))
+    if not order or not db.is_admin(order["chat_id"], user.id):
+        await update.message.reply_text("Not allowed.")
+        clear_awaiting(context)
+        return ConversationHandler.END
+
+    file_id = None
+    file_type = "photo"
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        file_type = "photo"
+    elif update.message.document:
+        file_id = update.message.document.file_id
+        file_type = "document"
+    else:
+        await update.message.reply_text(
+            "Send a *photo* or *PDF document* as proof, or /cancel.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return FRANCHISE_PROOF
+
+    import franchise
+
+    ok, msg = franchise.set_franchise_master_proof(int(oid), file_id, file_type)
+    clear_awaiting(context)
+    context.user_data.pop("franchise_proof_order_id", None)
+    if not ok:
+        await update.message.reply_text(f"Could not save proof: {msg}")
+        return ConversationHandler.END
+
+    order = db.get_order(int(oid))
+    items = db.get_order_items(int(oid))
+    await update.message.reply_text(
+        f"✅ {msg}\nMain shop has been notified of order #{oid}."
+    )
+    await _forward_franchise_sale_to_master(context, order, items)
+    return ConversationHandler.END
 
 
 async def cb_customer_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3014,19 +3216,56 @@ async def tracking_input_value(update: Update, context: ContextTypes.DEFAULT_TYP
         ),
     )
     if ok and order:
-        # Full sale report to all shop admins (items, address, payment, franchisee, username)
+        # Franchisee: local admins only until remittance proof is sent to main
+        is_fr = _is_franchisee_order(order)
+        sale_buttons = [
+            [InlineKeyboardButton(f"View #{oid}", callback_data=f"vieword:{oid}")],
+            [InlineKeyboardButton("📋 Orders", callback_data="adm_orders")],
+        ]
+        if is_fr:
+            sale_buttons.insert(
+                0,
+                [
+                    InlineKeyboardButton(
+                        "📤 Send proof to main shop",
+                        callback_data=f"frproof:{oid}",
+                    )
+                ],
+            )
+            headline = (
+                "SALE CONFIRMED (paid) — franchisee only\n"
+                "Main shop has NOT been notified yet.\n"
+                "After you transfer/remit, tap Send proof to main shop."
+            )
+        else:
+            headline = "SALE CONFIRMED (paid)"
         await _notify_admins_sale_report(
             context,
             order,
             items,
-            headline="SALE CONFIRMED (paid)",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton(f"View #{oid}", callback_data=f"vieword:{oid}")],
-                    [InlineKeyboardButton("📋 Orders", callback_data="adm_orders")],
-                ]
-            ),
+            headline=headline,
+            reply_markup=InlineKeyboardMarkup(sale_buttons),
+            audience="local" if is_fr else "auto",
         )
+        if is_fr:
+            await update.message.reply_text(
+                "This is a *franchisee* sale.\n"
+                "Main shop will *not* see it until you:\n"
+                "1) Confirmed customer payment (done)\n"
+                "2) Send *proof of payment to main shop* "
+                f"(button below or /admin → order #{oid})\n",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "📤 Send proof to main shop",
+                                callback_data=f"frproof:{oid}",
+                            )
+                        ]
+                    ]
+                ),
+            )
         # Push confirmation (+ tracking) to customer
         cust = (
             f"✅ *Payment confirmed* for order *#{oid}*\n"
@@ -3803,11 +4042,17 @@ def build_app() -> Application:
             CallbackQueryHandler(cb_add_admin_start, pattern=r"^adm_addadmin$"),
             CallbackQueryHandler(cb_search, pattern=r"^search$"),
             CallbackQueryHandler(cb_master_feeshop, pattern=r"^master_feeshop:-?\d+$"),
+            CallbackQueryHandler(cb_franchise_proof_start, pattern=r"^frproof:\d+$"),
             CommandHandler("search", cmd_search),
         ],
         states={
             MASTER_FEE_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, master_fee_input),
+            ],
+            FRANCHISE_PROOF: [
+                MessageHandler(filters.PHOTO, franchise_proof_message),
+                MessageHandler(filters.Document.ALL, franchise_proof_message),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, franchise_proof_message),
             ],
             CHECKOUT_NAME: [
                 CallbackQueryHandler(cb_pay_method, pattern=r"^paym:\d+$"),
@@ -3919,6 +4164,7 @@ def build_app() -> Application:
     CONV = 1
     app.add_handler(CallbackQueryHandler(cb_adm_collab, pattern=r"^adm_collab$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_adm_clone, pattern=r"^adm_clone$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_franchise_proof_start, pattern=r"^frproof:\d+$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_master_home, pattern=r"^master_home$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_master_setfee, pattern=r"^master_setfee$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_master_ledger, pattern=r"^master_ledger$"), group=NAV)

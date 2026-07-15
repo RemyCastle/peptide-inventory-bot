@@ -52,6 +52,19 @@ def ensure_franchise_tables() -> None:
             conn.execute(
                 "ALTER TABLE orders ADD COLUMN hidden_service_fee REAL NOT NULL DEFAULT 0"
             )
+        # Franchisee → main shop remittance proof (do not forward sale until set)
+        if "franchise_master_proof_file_id" not in ocols:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN franchise_master_proof_file_id TEXT"
+            )
+        if "franchise_master_proof_file_type" not in ocols:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN franchise_master_proof_file_type TEXT"
+            )
+        if "franchise_forwarded_to_master_at" not in ocols:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN franchise_forwarded_to_master_at TEXT"
+            )
 
         conn.executescript(
             """
@@ -89,6 +102,66 @@ def ensure_franchise_tables() -> None:
                 ON service_fee_invoices(status, chat_id);
             """
         )
+
+
+def is_franchisee_shop(chat_id: int) -> bool:
+    """True if this shop pulls inventory from a master (clone / franchise group)."""
+    ensure_franchise_tables()
+    shop = get_shop(int(chat_id))
+    if not shop:
+        return False
+    return shop.get("inventory_master_chat_id") is not None
+
+
+def master_chat_id_for(chat_id: int) -> Optional[int]:
+    ensure_franchise_tables()
+    shop = get_shop(int(chat_id))
+    if not shop:
+        return None
+    mid = shop.get("inventory_master_chat_id")
+    return int(mid) if mid is not None else None
+
+
+def set_franchise_master_proof(
+    order_id: int,
+    file_id: str,
+    file_type: str,
+) -> tuple[bool, str]:
+    """Attach franchisee→main remittance proof. Order must already be paid."""
+    ensure_franchise_tables()
+    fid = (file_id or "").strip()
+    ftype = (file_type or "photo").strip().lower()
+    if not fid:
+        return False, "Missing proof file."
+    if ftype not in ("photo", "document"):
+        ftype = "photo"
+    with get_db() as conn:
+        order = conn.execute(
+            "SELECT * FROM orders WHERE id = ?", (int(order_id),)
+        ).fetchone()
+        if not order:
+            return False, "Order not found."
+        if order["status"] != "paid":
+            return False, "Confirm customer payment first, then send proof to main shop."
+        if not is_franchisee_shop(int(order["chat_id"])):
+            return False, "This shop is not a franchisee clone."
+        now = _utc_now()
+        conn.execute(
+            """
+            UPDATE orders
+            SET franchise_master_proof_file_id = ?,
+                franchise_master_proof_file_type = ?,
+                franchise_forwarded_to_master_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (fid, ftype, now, now, int(order_id)),
+        )
+    return True, "Proof saved. Main shop will be notified."
+
+
+def franchise_forwarded(order: dict) -> bool:
+    return bool((order.get("franchise_forwarded_to_master_at") or "").strip())
 
 
 def resolve_inventory_master(chat_id: int) -> int:
