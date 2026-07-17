@@ -89,6 +89,12 @@ try:
 except ValueError:
     KIT_SIZE = 10
 
+# Buyer catalog open view: only top N by paid sales; rest via search
+try:
+    CATALOG_TOP_N = max(1, int(os.getenv("CATALOG_TOP_N", "10")))
+except ValueError:
+    CATALOG_TOP_N = 10
+
 # Schema version expected by this code release
 SCHEMA_VERSION = 10
 

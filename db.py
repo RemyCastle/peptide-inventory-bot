@@ -1427,6 +1427,63 @@ def list_products(chat_id: int, active_only: bool = False) -> list[dict]:
     return products
 
 
+def product_sales_counts(chat_id: int) -> dict[int, int]:
+    """
+    Paid sales volume per product_id for this shop (sum of order_items.quantity).
+    Counts orders in paid / shipped / complete only.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT oi.product_id AS product_id, SUM(oi.quantity) AS sold
+            FROM order_items oi
+            JOIN orders o ON o.id = oi.order_id
+            WHERE o.chat_id = ?
+              AND o.status IN ('paid', 'shipped', 'complete')
+              AND oi.product_id IS NOT NULL
+            GROUP BY oi.product_id
+            """,
+            (int(chat_id),),
+        ).fetchall()
+    out: dict[int, int] = {}
+    for r in rows:
+        pid = r["product_id"]
+        if pid is None:
+            continue
+        out[int(pid)] = int(r["sold"] or 0)
+    return out
+
+
+def rank_products_by_popularity(
+    products: list[dict],
+    sales: dict[int, int] | None = None,
+    *,
+    chat_id: int | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    """
+    Sort products by paid sales (desc), then sort_order, then name.
+    If limit is set, return only the top N.
+    """
+    if sales is None:
+        if chat_id is None and products:
+            chat_id = int(products[0].get("chat_id") or 0) or None
+        sales = product_sales_counts(int(chat_id)) if chat_id is not None else {}
+
+    def sort_key(p: dict) -> tuple:
+        pid = int(p.get("id") or 0)
+        sold = int(sales.get(pid, 0))
+        so = int(p.get("sort_order") or 0)
+        name = (p.get("name") or "").casefold()
+        # Higher sales first → negate sold
+        return (-sold, so, name)
+
+    ranked = sorted(products, key=sort_key)
+    if limit is not None:
+        return ranked[: max(0, int(limit))]
+    return ranked
+
+
 def search_products(
     chat_id: int,
     query: str,

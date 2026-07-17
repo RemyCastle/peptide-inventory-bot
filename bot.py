@@ -50,6 +50,7 @@ from config import (
     BACKUP_PASSPHRASE,
     BACKUP_RETENTION_DAYS,
     BRAND_NAME,
+    CATALOG_TOP_N,
     CURRENCY_SYMBOL,
     DB_PATH,
     KIT_SIZE,
@@ -300,7 +301,7 @@ def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton("🧬 Catalog", callback_data="cat"),
-            InlineKeyboardButton("🔍 Search", callback_data="search"),
+            InlineKeyboardButton("🔍 Search entire catalog", callback_data="search"),
         ],
         [
             InlineKeyboardButton("🛒 Cart", callback_data="cart"),
@@ -700,6 +701,14 @@ async def _send_catalog(
         await _reply_or_edit(update, text, back_main_kb(), edit=edit)
         return
 
+    total_n = len(products)
+    top_n = int(CATALOG_TOP_N)
+    # Rank by paid sales; show only top N on open (rest via search)
+    sales = db.product_sales_counts(int(sid))
+    products = db.rank_products_by_popularity(
+        products, sales, chat_id=int(sid), limit=top_n
+    )
+
     # Present guest shares with sell price in list labels via name suffix
     display_products = []
     for p in products:
@@ -711,14 +720,27 @@ async def _send_catalog(
             q["price"] = sell
         display_products.append(q)
 
+    showing = len(display_products)
+    more_note = ""
+    if total_n > showing:
+        more_note = (
+            f"\n_Showing top {showing} by popularity · "
+            f"{total_n - showing} more via search_"
+        )
     text = (
-        f"🧬 *{shop['title']} — Catalog*\n"
-        f"_Includes partner stock when shared._\n\n"
+        f"🧬 *{shop['title']} — Popular picks*\n"
+        f"_Top {showing} most ordered"
+        + (f" of {total_n}" if total_n > showing else "")
+        + "._\n"
+        f"Use *Search entire catalog* for everything else.\n"
+        f"{more_note}\n\n"
         f"Tap a product to add to cart:"
     )
     footer = [
         [
-            InlineKeyboardButton("🔍 Search", callback_data="search"),
+            InlineKeyboardButton(
+                "🔍 Search entire catalog", callback_data="search"
+            ),
             InlineKeyboardButton("🛒 Cart", callback_data="cart"),
         ],
         [InlineKeyboardButton("« Menu", callback_data="main")],
@@ -744,12 +766,15 @@ async def _send_search_results(
     if not q:
         await _reply_or_edit(
             update,
-            "Type what you're looking for, or use `/search tren`.",
+            "🔍 *Search entire catalog*\n\n"
+            "Type a product name (or use `/search tren`).",
             back_main_kb(
                 [
                     [
-                        InlineKeyboardButton("🧬 Catalog", callback_data="cat"),
-                        InlineKeyboardButton("🔍 Search", callback_data="search"),
+                        InlineKeyboardButton("🧬 Popular catalog", callback_data="cat"),
+                        InlineKeyboardButton(
+                            "🔍 Search entire catalog", callback_data="search"
+                        ),
                     ]
                 ]
             ),
@@ -757,16 +782,21 @@ async def _send_search_results(
         )
         return
 
-    products = db.search_products(sid, q, active_only=True, limit=20)
+    # Full catalog search (not limited to popular top-N)
+    products = db.search_products(sid, q, active_only=True, limit=50)
     if not products:
         text = (
             f"No products matched `{q}`.\n"
-            "Try browsing the full catalog:"
+            "Try another term or browse popular picks:"
         )
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("🧬 Browse catalog", callback_data="cat")],
-                [InlineKeyboardButton("🔍 Search again", callback_data="search")],
+                [InlineKeyboardButton("🧬 Popular catalog", callback_data="cat")],
+                [
+                    InlineKeyboardButton(
+                        "🔍 Search entire catalog", callback_data="search"
+                    )
+                ],
                 [InlineKeyboardButton("« Menu", callback_data="main")],
             ]
         )
@@ -774,14 +804,16 @@ async def _send_search_results(
         return
 
     text = (
-        f"🔍 *{shop['title']} — Search*\n"
+        f"🔍 *{shop['title']} — Entire catalog*\n"
         f"Results for `{q}` ({len(products)}):\n\n"
         "Tap a product to view / add to cart:"
     )
     footer = [
         [
-            InlineKeyboardButton("🧬 Catalog", callback_data="cat"),
-            InlineKeyboardButton("🔍 New search", callback_data="search"),
+            InlineKeyboardButton("🧬 Popular catalog", callback_data="cat"),
+            InlineKeyboardButton(
+                "🔍 Search entire catalog", callback_data="search"
+            ),
         ],
         [
             InlineKeyboardButton("🛒 Cart", callback_data="cart"),
@@ -793,7 +825,7 @@ async def _send_search_results(
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """ /search <term> — per-shop product search. """
+    """ /search <term> — full-catalog product search (not just popular top-N). """
     context.user_data.pop("awaiting_search", None)
     if context.args:
         clear_awaiting(context)
@@ -804,9 +836,11 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     set_awaiting(context, "search")
     await update.message.reply_text(
-        "🔍 *Search*\nType what you're looking for:\n(/cancel to abort)",
+        "🔍 *Search entire catalog*\n"
+        "Type a product name — searches all products, not just popular picks.\n"
+        "(/cancel to abort)",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=force_reply("Search products..."),
+        reply_markup=force_reply("Search entire catalog..."),
     )
     return SEARCH_QUERY
 
@@ -821,9 +855,11 @@ async def cb_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     set_awaiting(context, "search")
     # New message with ForceReply (edit can't always focus keyboard reliably)
     await query.message.reply_text(
-        "🔍 *Search*\nType what you're looking for:\n(/cancel to abort)",
+        "🔍 *Search entire catalog*\n"
+        "Type a product name — searches all products, not just popular picks.\n"
+        "(/cancel to abort)",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=force_reply("Search products..."),
+        reply_markup=force_reply("Search entire catalog..."),
     )
     return SEARCH_QUERY
 

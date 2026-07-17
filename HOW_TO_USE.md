@@ -55,13 +55,14 @@ Tap **⚙️ Admin Panel** or send `/admin`, then do this in order:
 
 ### Browse and order
 1. Open the bot (or use the shop link someone sent you)  
-2. `/start` → **🧬 Catalog**  
-3. Tap a product → **＋1 / ＋2 / ＋5** to add to cart  
-4. **🛒 Cart** → check items → **✅ Checkout**  
-5. Choose a **payment method**  
-6. Enter **full name**, **shipping address**, and optional **notes**  
-7. **Verify shipping** — review name/address and tap **Yes, looks correct**  
-8. You’ll get an order number, total, pay instructions, and a **payment code**  
+2. `/start` → **🧬 Catalog** — shows the **top 10 most popular** items (by paid sales)  
+3. **🔍 Search entire catalog** — type a name to find anything not in the top 10  
+4. Tap a product → **＋1 / ＋2 / ＋5** to add to cart  
+5. **🛒 Cart** → check items → **✅ Checkout**  
+6. Choose a **payment method**  
+7. Enter **full name**, **shipping address**, and optional **notes**  
+8. **Verify shipping** — review name/address and tap **Yes, looks correct**  
+9. You’ll get an order number, total, pay instructions, and a **payment code**  
 
 ### Pay and confirm
 1. Pay using the instructions (Cash App, Zelle, etc.)  
