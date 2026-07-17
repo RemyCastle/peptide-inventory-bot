@@ -29,6 +29,7 @@ Tap **⚙️ Admin Panel** or send `/admin`, then do this in order:
 | **1b. COA** | Product → **📄 Set COA** → send PDF/photo **or** paste an `https://` link (or both) |
 | **2. Payments** | **💳 Payments** → **➕ Add method** → e.g. Cash App / Zelle / BTC + pay instructions |
 | **3. Shipping** | **🚚 Shipping** → set flat fee + free-shipping threshold (or turn off) |
+| **3b. Min order** | **📦 Min order (vial/kit)** → pick unit (vial/kit) + qty (e.g. 2). `0` = off |
 | **4. Admins** (optional) | **👥 Admins** → **➕ Add admin** → their numeric Telegram user ID |
 | **5. Share link** | **🔗 Shop link** → copy and send to customers |
 
@@ -129,6 +130,18 @@ Test E | 30 | 5
 ```
 - **Add-only**: creates new products; existing names are **skipped** (price/stock not changed).
 - Nothing is deleted. Re-uploading the same file is safe.
+
+### Minimum order (vial / kit)
+| Action | How |
+|--------|-----|
+| Open | Admin → **📦 Min order (vial/kit)** |
+| Unit type | Tap **Unit: vial** or **Unit: kit** |
+| Quantity | Quick buttons **2 / 3 / 5**, or **Custom quantity…** |
+| Disable | **Turn OFF** (or set qty `0`) |
+
+- Counts **total cart quantity** (1× Sema + 1× BPC = 2), not dollar amount.
+- Shown on the shop home screen and cart. Checkout is blocked until met.
+- Cloned shops inherit the parent shop’s minimum.
 
 ### Orders & payment confirmation
 1. **⏳ Needs confirm** — customers who tapped “I've paid” (and often attached a screenshot)  

@@ -123,7 +123,8 @@ def symbol_for(chat_id: int | None) -> str:
     FRANCHISE_PROOF,
     EDIT_SHOP_TITLE,
     IMPORT_INVENTORY_FILE,
-) = range(25)
+    MIN_ORDER_QTY,
+) = range(26)
 
 # How long a pending admin/buyer prompt stays open (seconds)
 AWAITING_TTL_SEC = 600
@@ -528,7 +529,11 @@ async def _show_main(
         ship = f"\n🚚 Shipping: {fee}"
         if free > 0:
             ship += f" (free over {money(free)})"
-    text = f"*{BRAND_NAME}*\n🏪 *{shop['title']}*\n\n{welcome}{ship}"
+    display = db.shop_display(shop)
+    min_line = ""
+    if int(display["min_order_qty"]) > 0:
+        min_line = f"\n📦 {db.format_min_order_rule(display['min_order_qty'], display['min_order_label'])}"
+    text = f"*{BRAND_NAME}*\n🏪 *{shop['title']}*\n\n{welcome}{ship}{min_line}"
     kb = main_menu_kb(is_adm)
     if edit and update.callback_query:
         await safe_edit(update.callback_query, text, kb)
@@ -896,8 +901,10 @@ async def _render_cart(
 
     shipping = db.calc_shipping(shop, subtotal) if shop else 0.0
     total = subtotal + shipping
+    qty_total = db.cart_quantity_total(c)
     lines += [
         "",
+        f"Items: {qty_total}",
         f"Subtotal: {money(subtotal)}",
         f"Shipping: {money(shipping)}",
         f"*Total: {money(total)}*",
@@ -906,8 +913,23 @@ async def _render_cart(
         free_at = float(shop["free_shipping_above"])
         if subtotal < free_at:
             lines.append(f"_Free shipping over {money(free_at)}_")
+    min_ok = True
+    if shop:
+        min_ok, min_msg = db.check_min_order(shop, qty_total)
+        if not min_ok:
+            # Strip markdown stars for cart note lines
+            rule = db.format_min_order_rule(
+                int(db.shop_display(shop)["min_order_qty"]),
+                str(db.shop_display(shop)["min_order_label"]),
+            )
+            lines.append(f"⚠️ _{rule} — add more to checkout_")
 
-    buttons.append([InlineKeyboardButton("✅ Checkout", callback_data="checkout")])
+    if min_ok:
+        buttons.append([InlineKeyboardButton("✅ Checkout", callback_data="checkout")])
+    else:
+        buttons.append(
+            [InlineKeyboardButton("⚠️ Min order not met", callback_data="checkout")]
+        )
     buttons.append(
         [
             InlineKeyboardButton("🧬 Catalog", callback_data="cat"),
@@ -960,6 +982,21 @@ async def cb_checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     c = cart(context)
     if not sid or not c:
         await safe_edit(query, "Cart is empty or no shop selected.")
+        return ConversationHandler.END
+
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    ok_min, min_msg = db.check_min_order(shop, db.cart_quantity_total(c))
+    if not ok_min:
+        await safe_edit(
+            query,
+            min_msg,
+            back_main_kb(
+                [
+                    [InlineKeyboardButton("🧬 Catalog", callback_data="cat")],
+                    [InlineKeyboardButton("🛒 Cart", callback_data="cart")],
+                ]
+            ),
+        )
         return ConversationHandler.END
 
     methods = db.list_payment_methods(sid, active_only=True)
@@ -1782,6 +1819,13 @@ async def _admin_home(
         f"Shipping: {'ON' if shop.get('shipping_enabled') else 'OFF'} · "
         f"{money(shop['shipping_fee'])} · free over {money(shop['free_shipping_above'])}"
     )
+    disp = db.shop_display(shop)
+    if int(disp["min_order_qty"]) > 0:
+        text += (
+            f"\nMin order: {db.format_min_order_rule(disp['min_order_qty'], disp['min_order_label'])}"
+        )
+    else:
+        text += "\nMin order: OFF"
     kb = InlineKeyboardMarkup(
         [
             [
@@ -1798,6 +1842,9 @@ async def _admin_home(
             [
                 InlineKeyboardButton("💳 Payments", callback_data="adm_pays"),
                 InlineKeyboardButton("🚚 Shipping", callback_data="adm_ship"),
+            ],
+            [
+                InlineKeyboardButton("📦 Min order (vial/kit)", callback_data="adm_minorder"),
             ],
             [
                 InlineKeyboardButton("📤 Export Reports", callback_data="adm_export"),
@@ -3938,6 +3985,149 @@ async def add_pay_instr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 # Shipping admin
 
 
+async def cb_adm_minorder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: vial/kit minimum order rule."""
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    disp = db.shop_display(shop)
+    qty = int(disp["min_order_qty"])
+    label = str(disp["min_order_label"])
+    if qty > 0:
+        status = db.format_min_order_rule(qty, label)
+    else:
+        status = "OFF (no minimum)"
+    text = (
+        "📦 *Minimum order rule*\n\n"
+        f"Current: *{status}*\n\n"
+        "Counts *total quantity* across all products in the cart "
+        "(e.g. 1× Sema + 1× BPC = 2).\n"
+        "Buyers cannot checkout until the minimum is met.\n\n"
+        "Pick a unit type, set the number, or turn the rule off."
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Unit: vial{' ✓' if label == 'vial' else ''}",
+                    callback_data="minord_lab:vial",
+                ),
+                InlineKeyboardButton(
+                    f"Unit: kit{' ✓' if label == 'kit' else ''}",
+                    callback_data="minord_lab:kit",
+                ),
+            ],
+            [
+                InlineKeyboardButton("Set qty: 2", callback_data="minord_q:2"),
+                InlineKeyboardButton("Set qty: 3", callback_data="minord_q:3"),
+                InlineKeyboardButton("Set qty: 5", callback_data="minord_q:5"),
+            ],
+            [InlineKeyboardButton("Custom quantity…", callback_data="minord_custom")],
+            [InlineKeyboardButton("Turn OFF", callback_data="minord_q:0")],
+            [InlineKeyboardButton("« Admin", callback_data="admin")],
+        ]
+    )
+    await safe_edit(query, text, kb)
+
+
+async def cb_minord_label(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await query.answer("Denied", show_alert=True)
+        return
+    lab = query.data.split(":")[1].strip().casefold()
+    if lab not in ("vial", "kit"):
+        await query.answer("Invalid", show_alert=True)
+        return
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    qty = int(db.shop_display(shop)["min_order_qty"])
+    ok_set, msg = db.set_min_order(sid, qty if qty > 0 else 0, label=lab)
+    # If rule was off, only update label for next enable
+    if qty <= 0:
+        db.update_shop(sid, min_order_label=lab)
+        await query.answer(f"Unit → {lab}")
+    else:
+        await query.answer(msg if ok_set else "Failed", show_alert=not ok_set)
+    await cb_adm_minorder(update, context)
+
+
+async def cb_minord_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await query.answer("Denied", show_alert=True)
+        return
+    try:
+        qty = int(query.data.split(":")[1])
+    except (IndexError, ValueError):
+        await query.answer("Invalid", show_alert=True)
+        return
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    label = str(db.shop_display(shop)["min_order_label"])
+    ok_set, msg = db.set_min_order(sid, qty, label=label)
+    await query.answer(msg if ok_set else "Failed", show_alert=not ok_set)
+    await cb_adm_minorder(update, context)
+
+
+async def cb_minord_custom_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    set_awaiting(context, "min_order_qty")
+    await query.message.reply_text(
+        "Send minimum order quantity as a whole number "
+        "(e.g. `2` for 2 vials/kits). Use `0` to disable.\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Min qty e.g. 2"),
+    )
+    return MIN_ORDER_QTY
+
+
+async def min_order_qty_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return MIN_ORDER_QTY
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    raw = (update.message.text or "").strip()
+    try:
+        qty = int(raw)
+    except ValueError:
+        await update.message.reply_text(
+            "Send a whole number (e.g. 2) or /cancel",
+            reply_markup=force_reply("Min qty e.g. 2"),
+        )
+        return MIN_ORDER_QTY
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    label = str(db.shop_display(shop)["min_order_label"])
+    ok_set, msg = db.set_min_order(sid, qty, label=label)
+    clear_awaiting(context)
+    if not ok_set:
+        await update.message.reply_text(
+            f"❌ {msg}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Min order", callback_data="adm_minorder")]]
+            ),
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(
+        f"✅ {msg}",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Min order", callback_data="adm_minorder")]]
+        ),
+    )
+    return ConversationHandler.END
+
+
 async def cb_adm_ship(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -4185,12 +4375,13 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Browse Catalog → add items → Cart → Checkout\n"
         "• Choose payment method, enter shipping details\n"
         "• Shipping fee is auto-added (free over threshold if set)\n"
+        "• Some shops require a *vial/kit minimum* (shown on home & cart)\n"
         "• Pay using the instructions, then tap *I've paid*\n"
         "• Inventory only drops after an admin confirms payment\n\n"
         "*Admins* (`/admin`)\n"
         "• Products: add, price, stock\n"
         "• Orders: confirm/reject payments\n"
-        "• Payment methods & shipping settings\n"
+        "• Payment methods, shipping, and *min order (vial/kit)*\n"
         "• Add other admins per shop\n\n"
         "*Commands*\n"
         "/start /catalog /cart /orders /admin /cancel /help"
@@ -4458,6 +4649,7 @@ def build_app(token: str | None = None) -> Application:
             CallbackQueryHandler(cb_pay_template_start, pattern=r"^paytpl:(cashapp|venmo|crypto|zelle|custom)$"),
             CallbackQueryHandler(cb_ship_fee_start, pattern=r"^ship_fee$"),
             CallbackQueryHandler(cb_ship_free_start, pattern=r"^ship_free$"),
+            CallbackQueryHandler(cb_minord_custom_start, pattern=r"^minord_custom$"),
             CallbackQueryHandler(cb_add_admin_start, pattern=r"^adm_addadmin$"),
             CallbackQueryHandler(cb_search, pattern=r"^search$"),
             CallbackQueryHandler(cb_master_feeshop, pattern=r"^master_feeshop:-?\d+$"),
@@ -4546,6 +4738,9 @@ def build_app(token: str | None = None) -> Application:
             SHIP_FREE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ship_free_value),
             ],
+            MIN_ORDER_QTY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, min_order_qty_value),
+            ],
             ADD_ADMIN_ID: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_admin_id),
             ],
@@ -4574,6 +4769,7 @@ def build_app(token: str | None = None) -> Application:
             CallbackQueryHandler(cb_adm_orders, pattern=r"^adm_orders$"),
             CallbackQueryHandler(cb_adm_link, pattern=r"^adm_link$"),
             CallbackQueryHandler(cb_adm_export, pattern=r"^adm_export$"),
+            CallbackQueryHandler(cb_adm_minorder, pattern=r"^adm_minorder$"),
             CallbackQueryHandler(cb_collab_invite, pattern=r"^collab_invite$"),
             CallbackQueryHandler(cb_collab_shares, pattern=r"^collab_shares$"),
             CallbackQueryHandler(cb_collab_settle, pattern=r"^collab_settle$"),
@@ -4658,6 +4854,9 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_del_method, pattern=r"^delm:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_ship, pattern=r"^adm_ship$"))
     app.add_handler(CallbackQueryHandler(cb_ship_toggle, pattern=r"^ship_toggle$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_minorder, pattern=r"^adm_minorder$"))
+    app.add_handler(CallbackQueryHandler(cb_minord_label, pattern=r"^minord_lab:(vial|kit)$"))
+    app.add_handler(CallbackQueryHandler(cb_minord_qty, pattern=r"^minord_q:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_admins, pattern=r"^adm_admins$"))
     app.add_handler(CallbackQueryHandler(cb_rm_admin, pattern=r"^rmadmin:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_link, pattern=r"^adm_link$"))

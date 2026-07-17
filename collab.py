@@ -342,9 +342,13 @@ def create_order_multi(
     if not items:
         return None
 
-    from db import calc_shipping, generate_payment_code
+    from db import calc_shipping, cart_quantity_total, check_min_order, generate_payment_code
 
     shop = ensure_shop(host_chat_id)
+    ok_min, _min_msg = check_min_order(shop, cart_quantity_total(items))
+    if not ok_min:
+        return None
+
     share_map = {s["product_id"]: s for s in list_shares(host_chat_id, active_only=True)}
 
     with get_db() as conn:

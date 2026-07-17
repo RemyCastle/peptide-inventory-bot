@@ -78,6 +78,13 @@ EXISTING FEATURES
         Add-only (skip existing names); template download in bot
         Module: inventory_import.py
 
+*** NEW FEATURES (min order vial/kit) ***
+  [NEW] Admin → Min order (vial/kit)
+        Per-shop minimum total cart quantity (e.g. 2 vials)
+        Unit label: vial or kit; 0 / Turn OFF disables
+        Enforced at cart checkout + create_order / multi-order
+        Schema v9: shops.min_order_qty, shops.min_order_label
+
 HOW COLLAB WORKS (customer story)
   1. Shop A admin: Admin → Collaborations → Create invite link
   2. Send link to Shop B admin → they open & accept

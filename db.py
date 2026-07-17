@@ -18,6 +18,8 @@ from config import (
     DB_PATH,
     DEFAULT_FREE_SHIPPING_ABOVE,
     DEFAULT_LOW_STOCK_THRESHOLD,
+    DEFAULT_MIN_ORDER_LABEL,
+    DEFAULT_MIN_ORDER_QTY,
     DEFAULT_SHIPPING_FEE,
     OWNER_IDS,
     SCHEMA_VERSION,
@@ -206,6 +208,9 @@ def init_db() -> None:
         _ensure_column(conn, "shops", "currency_symbol", "TEXT")
         _ensure_column(conn, "shops", "low_stock_threshold", "INTEGER")
         _ensure_column(conn, "shops", "setup_complete", "INTEGER NOT NULL DEFAULT 0")
+        # Min total cart qty (vials/kits). 0 = no minimum.
+        _ensure_column(conn, "shops", "min_order_qty", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "shops", "min_order_label", "TEXT")
 
         # Structured payment method fields (name/instructions remain buyer-facing)
         _ensure_column(conn, "payment_methods", "method_type", "TEXT")
@@ -275,6 +280,10 @@ def shop_display(shop: dict | None) -> dict[str, Any]:
     threshold = shop.get("low_stock_threshold")
     if threshold is None:
         threshold = DEFAULT_LOW_STOCK_THRESHOLD
+    min_qty = shop.get("min_order_qty")
+    if min_qty is None:
+        min_qty = DEFAULT_MIN_ORDER_QTY
+    label = (shop.get("min_order_label") or DEFAULT_MIN_ORDER_LABEL or "vial").strip()
     return {
         "brand_name": (shop.get("brand_name") or BRAND_NAME).strip() or BRAND_NAME,
         "currency": (shop.get("currency") or CURRENCY).strip() or CURRENCY,
@@ -282,8 +291,70 @@ def shop_display(shop: dict | None) -> dict[str, Any]:
         or CURRENCY_SYMBOL,
         "welcome_text": (shop.get("welcome_text") or WELCOME_TEXT).strip() or WELCOME_TEXT,
         "low_stock_threshold": int(threshold),
+        "min_order_qty": max(0, int(min_qty or 0)),
+        "min_order_label": label or "vial",
         "title": shop.get("title") or "Shop",
     }
+
+
+def format_min_order_rule(qty: int, label: str = "vial") -> str:
+    """Human line e.g. '2 vial minimum' / '1 kit minimum'."""
+    q = max(0, int(qty or 0))
+    unit = (label or "vial").strip() or "vial"
+    if q <= 0:
+        return "No minimum"
+    if q == 1:
+        return f"1 {unit} minimum"
+    # Simple plural: vial→vials, kit→kits (don't double-s)
+    if unit.endswith("s"):
+        plural = unit
+    else:
+        plural = f"{unit}s"
+    return f"{q} {plural} minimum"
+
+
+def cart_quantity_total(items: Iterable[dict] | dict[int, int]) -> int:
+    """Sum of line quantities from cart dict {pid: qty} or item list with quantity."""
+    if isinstance(items, dict):
+        return sum(max(0, int(q or 0)) for q in items.values())
+    total = 0
+    for it in items:
+        if isinstance(it, dict):
+            total += max(0, int(it.get("quantity") or 0))
+        else:
+            total += max(0, int(it or 0))
+    return total
+
+
+def check_min_order(
+    shop: dict | None, qty_total: int
+) -> tuple[bool, str]:
+    """
+    Enforce per-shop vial/kit minimum (sum of cart quantities).
+
+    Returns (ok, message). ok=True when allowed. message is empty when ok,
+    otherwise a buyer-facing explanation.
+    """
+    display = shop_display(shop)
+    need = int(display["min_order_qty"])
+    if need <= 0:
+        return True, ""
+    have = max(0, int(qty_total or 0))
+    if have >= need:
+        return True, ""
+    label = str(display["min_order_label"])
+    rule = format_min_order_rule(need, label)
+    short = need - have
+    unit = label if short == 1 else (
+        label if label.endswith("s") else f"{label}s"
+    )
+    return (
+        False,
+        (
+            f"⚠️ *{rule} required*\n\n"
+            f"Your cart has *{have}* item(s). Add *{short}* more {unit} to checkout."
+        ),
+    )
 
 
 # ── Shops ────────────────────────────────────────────────────────────────────
@@ -299,9 +370,10 @@ def ensure_shop(chat_id: int, title: str = "Shop") -> dict:
             """
             INSERT INTO shops (
                 chat_id, title, currency, shipping_fee, free_shipping_above,
-                welcome_text, brand_name, currency_symbol, low_stock_threshold, created_at
+                welcome_text, brand_name, currency_symbol, low_stock_threshold,
+                min_order_qty, min_order_label, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chat_id,
@@ -313,6 +385,8 @@ def ensure_shop(chat_id: int, title: str = "Shop") -> dict:
                 BRAND_NAME,
                 CURRENCY_SYMBOL,
                 DEFAULT_LOW_STOCK_THRESHOLD,
+                max(0, int(DEFAULT_MIN_ORDER_QTY)),
+                (DEFAULT_MIN_ORDER_LABEL or "vial").strip() or "vial",
                 now,
             ),
         )
@@ -340,6 +414,8 @@ def update_shop(chat_id: int, **fields: Any) -> None:
         "currency",
         "currency_symbol",
         "low_stock_threshold",
+        "min_order_qty",
+        "min_order_label",
         "setup_complete",
         "inventory_master_chat_id",
         "hidden_service_fee",
@@ -738,6 +814,41 @@ def calc_shipping(shop: dict, subtotal: float) -> float:
     if free_above > 0 and subtotal >= free_above:
         return 0.0
     return max(0.0, fee)
+
+
+def set_min_order(
+    chat_id: int,
+    qty: int,
+    label: str | None = None,
+) -> tuple[bool, str]:
+    """
+    Set shop minimum order quantity (total cart units) and optional unit label.
+    qty 0 disables the rule. label typically 'vial' or 'kit'.
+    """
+    shop = get_shop(chat_id)
+    if not shop:
+        return False, "Shop not found."
+    try:
+        q = int(qty)
+    except (TypeError, ValueError):
+        return False, "Quantity must be a whole number."
+    if q < 0:
+        return False, "Quantity cannot be negative."
+    if q > 100:
+        return False, "Quantity too high (max 100)."
+    fields: dict[str, Any] = {"min_order_qty": q}
+    if label is not None:
+        lab = " ".join(str(label).strip().split())
+        if not lab:
+            return False, "Label cannot be empty."
+        if len(lab) > 20:
+            return False, "Label too long (max 20 characters)."
+        fields["min_order_label"] = lab.casefold()
+    update_shop(chat_id, **fields)
+    if q <= 0:
+        return True, "Minimum order disabled."
+    lab_show = fields.get("min_order_label") or shop.get("min_order_label") or "vial"
+    return True, format_min_order_rule(q, str(lab_show))
 
 
 # ── Admins ───────────────────────────────────────────────────────────────────
@@ -1386,6 +1497,10 @@ def create_order(
         return None
 
     shop = ensure_shop(chat_id)
+    ok_min, _min_msg = check_min_order(shop, cart_quantity_total(items))
+    if not ok_min:
+        return None
+
     with get_db() as conn:
         # Re-check live stock (clone products use linked master stock)
         for it in items:

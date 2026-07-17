@@ -310,6 +310,8 @@ def attach_clone(
               currency = ?,
               currency_symbol = ?,
               low_stock_threshold = ?,
+              min_order_qty = ?,
+              min_order_label = ?,
               setup_complete = 1
             WHERE chat_id = ?
             """,
@@ -326,6 +328,8 @@ def attach_clone(
                 src_shop.get("currency"),
                 src_shop.get("currency_symbol"),
                 src_shop.get("low_stock_threshold"),
+                int(src_shop.get("min_order_qty") or 0),
+                src_shop.get("min_order_label") or "vial",
                 int(target_chat_id),
             ),
         )

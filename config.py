@@ -79,8 +79,12 @@ DEFAULT_FREE_SHIPPING_ABOVE = float(os.getenv("DEFAULT_FREE_SHIPPING_ABOVE", "15
 # Alert admins when stock falls to this level or below after a confirm
 DEFAULT_LOW_STOCK_THRESHOLD = int(os.getenv("DEFAULT_LOW_STOCK_THRESHOLD", "2"))
 
+# Order minimum (sum of cart quantities). 0 = disabled. Label is "vial" or "kit".
+DEFAULT_MIN_ORDER_QTY = int(os.getenv("DEFAULT_MIN_ORDER_QTY", "0"))
+DEFAULT_MIN_ORDER_LABEL = os.getenv("DEFAULT_MIN_ORDER_LABEL", "vial").strip() or "vial"
+
 # Schema version expected by this code release
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def resolve_bot_tokens() -> list[str]:
