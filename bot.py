@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from telegram import (
     BotCommand,
@@ -1111,9 +1113,13 @@ async def cb_checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     methods = db.list_payment_methods(sid, active_only=True)
     if not methods:
+        log.warning("Checkout blocked: shop %s has no payment methods", sid)
         await safe_edit(
             query,
-            "⚠️ No payment methods configured yet. Please contact the shop admin.",
+            "⚠️ *Checkout unavailable*\n\n"
+            "This shop has *no payment methods* set up yet.\n"
+            "Shop owner: open *Admin → 💳 Payments* and add Cash App / Venmo / etc., "
+            "then the buyer can checkout.",
             back_main_kb(),
         )
         return ConversationHandler.END
@@ -1356,9 +1362,35 @@ async def cb_ship_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             ship_notes=notes,
         )
     if not order:
+        # Log why so dual-instance / min-order / stock failures are visible in bot.log
+        try:
+            shop_now = db.get_shop(sid) or {}
+            qty = db.cart_quantity_total(items)
+            ok_min, min_msg = db.check_min_order(shop_now, qty)
+            log.warning(
+                "Order create failed shop=%s user=%s items=%s qty=%s min_ok=%s multi=%s",
+                sid,
+                user.id,
+                [(it.get("product_id"), it.get("quantity"), it.get("is_kit")) for it in items],
+                qty,
+                ok_min,
+                bool(context.user_data.get("checkout_multi")),
+            )
+            if not ok_min:
+                await safe_edit(
+                    query,
+                    min_msg or "Minimum order not met.",
+                    back_main_kb(
+                        [[InlineKeyboardButton("🛒 Cart", callback_data="cart")]]
+                    ),
+                )
+                return ConversationHandler.END
+        except Exception:
+            log.exception("Order create failed (extra diagnostics error)")
         await safe_edit(
             query,
-            "❌ Could not create order (stock may have changed). Check cart and try again.",
+            "❌ Could not create order (stock may have changed, or kit pricing "
+            "became unavailable). Check cart and try again.",
             back_main_kb([[InlineKeyboardButton("🛒 Cart", callback_data="cart")]]),
         )
         return ConversationHandler.END
@@ -5126,6 +5158,88 @@ def build_app(token: str | None = None) -> Application:
     return app
 
 
+def _acquire_single_instance_lock() -> object | None:
+    """
+    Prevent two local bot.py processes from polling the same token.
+    Dual getUpdates causes Telegram 409 Conflict and dropped orders.
+    Returns a lock handle that must stay open for the process lifetime.
+    """
+    import atexit
+
+    lock_path = Path(DB_PATH).resolve().parent / ".bot_polling.lock"
+    try:
+        fh = open(lock_path, "a+", encoding="utf-8")
+    except OSError as exc:
+        log.warning("Could not open instance lock %s: %s", lock_path, exc)
+        return None
+
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            fh.seek(0)
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                fh.seek(0)
+                other = (fh.read() or "").strip() or "unknown"
+                fh.close()
+                print(
+                    "ERROR: Another inventory bot is already running "
+                    f"(lock held by pid {other}).\n"
+                    "Stop the other window/process first — two bots "
+                    "cause Telegram Conflict and missed orders.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                fh.seek(0)
+                other = (fh.read() or "").strip() or "unknown"
+                fh.close()
+                print(
+                    "ERROR: Another inventory bot is already running "
+                    f"(lock held by pid {other}).",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+
+        def _release() -> None:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                fh.close()
+            except Exception:
+                pass
+
+        atexit.register(_release)
+        log.info("Single-instance lock acquired pid=%s path=%s", os.getpid(), lock_path)
+        return fh
+    except Exception as exc:
+        log.warning("Instance lock failed (continuing): %s", exc)
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return None
+
+
 def main() -> None:
     setup_logging()
     # Python 3.12+ / 3.14: ensure a main-thread event loop exists for PTB
@@ -5133,6 +5247,9 @@ def main() -> None:
         asyncio.get_event_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
+
+    # Keep handle alive for process lifetime
+    _instance_lock = _acquire_single_instance_lock()  # noqa: F841
 
     tokens = resolve_bot_tokens()
     if not tokens:
