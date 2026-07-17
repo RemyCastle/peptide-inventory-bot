@@ -342,7 +342,15 @@ def create_order_multi(
     if not items:
         return None
 
-    from db import calc_shipping, cart_quantity_total, check_min_order, generate_payment_code
+    from db import (
+        KIT_SIZE,
+        calc_shipping,
+        cart_quantity_total,
+        check_min_order,
+        generate_payment_code,
+        kit_option_available,
+        product_kit_price,
+    )
 
     shop = ensure_shop(host_chat_id)
     ok_min, _min_msg = check_min_order(shop, cart_quantity_total(items))
@@ -353,37 +361,57 @@ def create_order_multi(
 
     with get_db() as conn:
         prepared: list[dict[str, Any]] = []
+        need_by_pid: dict[int, int] = {}
         for it in items:
             pid = int(it["product_id"])
             qty = int(it["quantity"])
+            is_kit = bool(it.get("is_kit"))
             row = conn.execute(
-                "SELECT id, chat_id, name, price, stock, active FROM products WHERE id = ?",
+                "SELECT id, chat_id, name, price, stock, active, kit_price FROM products WHERE id = ?",
                 (pid,),
             ).fetchone()
             if not row or not row["active"]:
                 return None
-            if int(row["stock"]) < qty:
-                return None
 
             owner = int(row["chat_id"])
+            pdata = dict(row)
+            if is_kit:
+                kp = product_kit_price(pdata)
+                if kp is None or not kit_option_available(pdata, stock=int(row["stock"])):
+                    return None
+                if qty % int(KIT_SIZE) != 0 or qty < int(KIT_SIZE):
+                    return None
+            need_by_pid[pid] = need_by_pid.get(pid, 0) + qty
+
             if owner == int(host_chat_id):
-                base = float(row["price"])
-                sell = base
+                if is_kit:
+                    base = float(product_kit_price(pdata)) / float(KIT_SIZE)
+                    sell = base
+                    name = f"{row['name']} (kit of {KIT_SIZE})"
+                else:
+                    base = float(row["price"])
+                    sell = base
+                    name = row["name"]
                 mk = 0.0
                 is_guest = 0
             else:
                 sh = share_map.get(pid)
                 if not sh or int(sh["guest_chat_id"]) != owner:
                     return None  # not shared to this host
-                base = float(row["price"])
                 mk = float(sh["markup_pct"])
+                if is_kit:
+                    base = float(product_kit_price(pdata)) / float(KIT_SIZE)
+                    name = f"{row['name']} (kit of {KIT_SIZE})"
+                else:
+                    base = float(row["price"])
+                    name = row["name"]
                 sell = round(base * (1 + mk / 100.0), 2)
                 is_guest = 1
 
             prepared.append(
                 {
                     "product_id": pid,
-                    "product_name": row["name"],
+                    "product_name": name,
                     "unit_price": sell,
                     "base_unit_price": base,
                     "markup_pct": mk,
@@ -393,6 +421,14 @@ def create_order_multi(
                     "line_total": round(sell * qty, 2),
                 }
             )
+
+        for pid, need in need_by_pid.items():
+            row = conn.execute(
+                "SELECT stock FROM products WHERE id = ?", (pid,)
+            ).fetchone()
+            have = int(row["stock"]) if row else 0
+            if have < need:
+                return None
 
         subtotal = sum(p["line_total"] for p in prepared)
         try:

@@ -21,6 +21,7 @@ from config import (
     DEFAULT_MIN_ORDER_LABEL,
     DEFAULT_MIN_ORDER_QTY,
     DEFAULT_SHIPPING_FEE,
+    KIT_SIZE,
     OWNER_IDS,
     SCHEMA_VERSION,
     WELCOME_TEXT,
@@ -226,6 +227,9 @@ def init_db() -> None:
         _ensure_column(conn, "products", "coa_file_type", "TEXT")  # document | photo
         _ensure_column(conn, "products", "coa_filename", "TEXT")
 
+        # Kit price = price for KIT_SIZE vials (NULL / 0 = no kit option)
+        _ensure_column(conn, "products", "kit_price", "REAL")
+
         # Order payment ref code, proof screenshot, shipping tracking
         _ensure_column(conn, "orders", "payment_code", "TEXT")
         _ensure_column(conn, "orders", "payment_proof_file_id", "TEXT")
@@ -313,10 +317,34 @@ def format_min_order_rule(qty: int, label: str = "vial") -> str:
     return f"{q} {plural} minimum"
 
 
-def cart_quantity_total(items: Iterable[dict] | dict[int, int]) -> int:
-    """Sum of line quantities from cart dict {pid: qty} or item list with quantity."""
+def normalize_cart_entry(entry: Any) -> dict[str, int]:
+    """
+    Cart line shape: {"singles": int, "kits": int}.
+    Legacy int entries are treated as singles only.
+    """
+    if entry is None:
+        return {"singles": 0, "kits": 0}
+    if isinstance(entry, dict):
+        return {
+            "singles": max(0, int(entry.get("singles") or 0)),
+            "kits": max(0, int(entry.get("kits") or 0)),
+        }
+    try:
+        return {"singles": max(0, int(entry)), "kits": 0}
+    except (TypeError, ValueError):
+        return {"singles": 0, "kits": 0}
+
+
+def cart_entry_vials(entry: Any) -> int:
+    """Total vial units represented by a cart entry (singles + kits×KIT_SIZE)."""
+    e = normalize_cart_entry(entry)
+    return e["singles"] + e["kits"] * int(KIT_SIZE)
+
+
+def cart_quantity_total(items: Iterable[dict] | dict) -> int:
+    """Sum of vial quantities from cart dict or order-item list with quantity."""
     if isinstance(items, dict):
-        return sum(max(0, int(q or 0)) for q in items.values())
+        return sum(cart_entry_vials(q) for q in items.values())
     total = 0
     for it in items:
         if isinstance(it, dict):
@@ -324,6 +352,99 @@ def cart_quantity_total(items: Iterable[dict] | dict[int, int]) -> int:
         else:
             total += max(0, int(it or 0))
     return total
+
+
+def product_kit_price(p: dict | None) -> float | None:
+    """Configured kit price, or None if kits are not offered on this product."""
+    if not p:
+        return None
+    raw = p.get("kit_price")
+    if raw is None:
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+    return val
+
+
+def kit_option_available(p: dict | None, stock: int | None = None) -> bool:
+    """
+    True when product has kit pricing AND live stock can fulfill one kit (KIT_SIZE vials).
+    Below KIT_SIZE vials the kit option is hidden / refused.
+    """
+    if product_kit_price(p) is None:
+        return False
+    if stock is None:
+        stock = int((p or {}).get("stock") or 0)
+    return int(stock) >= int(KIT_SIZE)
+
+
+def cart_entry_line_total(
+    p: dict,
+    entry: Any,
+    *,
+    vial_unit_price: float | None = None,
+    kit_unit_price: float | None = None,
+) -> float:
+    """Money total for one cart entry (singles + kits)."""
+    e = normalize_cart_entry(entry)
+    vial = float(vial_unit_price if vial_unit_price is not None else p.get("price") or 0)
+    kit_p = kit_unit_price
+    if kit_p is None:
+        kit_p = product_kit_price(p)
+    total = e["singles"] * vial
+    if e["kits"] > 0 and kit_p is not None:
+        total += e["kits"] * float(kit_p)
+    elif e["kits"] > 0:
+        # Kit price gone — fall back to vial rate
+        total += e["kits"] * int(KIT_SIZE) * vial
+    return float(total)
+
+
+def sanitize_cart_kits(
+    cart: dict, products_by_id: dict[int, dict]
+) -> list[str]:
+    """
+    Drop kit batches that can no longer be fulfilled (stock < KIT_SIZE or no kit_price).
+    Converts invalid kits into singles at vial pricing.
+    Mutates cart in place. Returns human notes for the buyer.
+    """
+    notes: list[str] = []
+    for pid in list(cart.keys()):
+        e = normalize_cart_entry(cart.get(pid))
+        if e["kits"] <= 0 and e["singles"] <= 0:
+            cart.pop(pid, None)
+            continue
+        p = products_by_id.get(int(pid))
+        if not p or not p.get("active"):
+            cart.pop(pid, None)
+            continue
+        stock = int(p.get("stock") or 0)
+        if e["kits"] > 0 and not kit_option_available(p, stock=stock):
+            # Convert kits → singles (lose kit deal) so stock accounting stays correct
+            converted = e["kits"] * int(KIT_SIZE)
+            e["singles"] += converted
+            e["kits"] = 0
+            notes.append(
+                f"{p.get('name') or 'Item'}: kit pricing unavailable "
+                f"(need {KIT_SIZE}+ in stock) — converted to {converted} singles"
+            )
+        # Cap total vials to stock
+        need = cart_entry_vials(e)
+        if need > stock:
+            # Prefer keeping kits that still fit, then singles
+            max_kits = min(e["kits"], stock // int(KIT_SIZE)) if kit_option_available(p, stock=stock) else 0
+            rem = stock - max_kits * int(KIT_SIZE)
+            e = {"singles": min(e["singles"], rem), "kits": max_kits}
+            notes.append(f"{p.get('name') or 'Item'}: cart reduced to available stock ({stock})")
+        if cart_entry_vials(e) <= 0:
+            cart.pop(pid, None)
+        else:
+            cart[pid] = e
+    return notes
 
 
 def check_min_order(
@@ -958,7 +1079,16 @@ def add_product(
 
 
 def update_product(product_id: int, **fields: Any) -> bool:
-    allowed = {"name", "description", "price", "stock", "unit", "active", "sort_order"}
+    allowed = {
+        "name",
+        "description",
+        "price",
+        "stock",
+        "unit",
+        "active",
+        "sort_order",
+        "kit_price",
+    }
     cols = ["updated_at = ?"]
     vals: list[Any] = [_utc_now()]
     for k, v in fields.items():
@@ -972,6 +1102,26 @@ def update_product(product_id: int, **fields: Any) -> bool:
             vals,
         )
         return cur.rowcount > 0
+
+
+def set_product_kit_price(
+    product_id: int, chat_id: int, kit_price: float | None
+) -> tuple[bool, str]:
+    """
+    Set or clear kit pricing for a product (price for KIT_SIZE vials).
+    Pass None or 0 to disable kit option.
+    """
+    p = get_product(product_id)
+    if not p or int(p["chat_id"]) != int(chat_id):
+        return False, "Product not found in this shop."
+    if kit_price is None or float(kit_price) <= 0:
+        update_product(product_id, kit_price=None)
+        return True, "Kit pricing removed."
+    price = float(kit_price)
+    if price > 1_000_000:
+        return False, "Kit price too high."
+    update_product(product_id, kit_price=price)
+    return True, f"Kit of {KIT_SIZE} = {money(price)}"
 
 
 def rename_product(
@@ -1502,13 +1652,15 @@ def create_order(
         return None
 
     with get_db() as conn:
-        # Re-check live stock (clone products use linked master stock)
+        # Resolve each line, then aggregate stock need per product
+        need_by_stock_id: dict[int, int] = {}
         for it in items:
             pid = it["product_id"]
             qty = int(it["quantity"])
+            is_kit = bool(it.get("is_kit"))
             row = conn.execute(
                 """
-                SELECT id, name, price, stock, active, linked_product_id
+                SELECT id, name, price, stock, active, linked_product_id, kit_price
                 FROM products WHERE id = ? AND chat_id = ?
                 """,
                 (pid, chat_id),
@@ -1520,10 +1672,31 @@ def create_order(
                 "SELECT stock FROM products WHERE id = ?", (stock_id,)
             ).fetchone()
             have = int(stock_row["stock"]) if stock_row else 0
-            if have < qty:
+
+            if is_kit:
+                kp = product_kit_price(dict(row))
+                if kp is None:
+                    return None
+                if qty % int(KIT_SIZE) != 0 or qty < int(KIT_SIZE):
+                    return None
+                # Kit option requires live stock >= KIT_SIZE for the batch
+                if have < int(KIT_SIZE):
+                    return None
+                it["product_name"] = f"{row['name']} (kit of {KIT_SIZE})"
+                it["unit_price"] = float(kp) / float(KIT_SIZE)
+            else:
+                it["product_name"] = row["name"]
+                it["unit_price"] = float(row["price"])
+
+            need_by_stock_id[stock_id] = need_by_stock_id.get(stock_id, 0) + qty
+
+        for stock_id, need in need_by_stock_id.items():
+            stock_row = conn.execute(
+                "SELECT stock FROM products WHERE id = ?", (stock_id,)
+            ).fetchone()
+            have = int(stock_row["stock"]) if stock_row else 0
+            if have < need:
                 return None
-            it["product_name"] = row["name"]
-            it["unit_price"] = float(row["price"])
 
         subtotal = sum(float(it["unit_price"]) * int(it["quantity"]) for it in items)
         # Hidden master service fee folded into shipping (customer sees one shipping total)

@@ -50,6 +50,7 @@ from config import (
     BRAND_NAME,
     CURRENCY_SYMBOL,
     DB_PATH,
+    KIT_SIZE,
     LOG_PATH,
     OWNER_IDS,
     PUBLIC_BOT_USERNAME,
@@ -124,7 +125,8 @@ def symbol_for(chat_id: int | None) -> str:
     EDIT_SHOP_TITLE,
     IMPORT_INVENTORY_FILE,
     MIN_ORDER_QTY,
-) = range(26)
+    EDIT_KIT_PRICE,
+) = range(27)
 
 # How long a pending admin/buyer prompt stays open (seconds)
 AWAITING_TTL_SEC = 600
@@ -149,11 +151,26 @@ def money(n: float) -> str:
     return db.money(float(n), SYM)
 
 
-def cart(context: ContextTypes.DEFAULT_TYPE) -> dict[int, int]:
-    """product_id -> qty stored on user_data."""
+def cart(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """product_id -> {"singles": int, "kits": int} (legacy int = singles)."""
     if "cart" not in context.user_data:
         context.user_data["cart"] = {}
     return context.user_data["cart"]
+
+
+def cart_get_entry(context: ContextTypes.DEFAULT_TYPE, pid: int) -> dict[str, int]:
+    return db.normalize_cart_entry(cart(context).get(int(pid)))
+
+
+def cart_set_entry(
+    context: ContextTypes.DEFAULT_TYPE, pid: int, singles: int, kits: int
+) -> None:
+    c = cart(context)
+    s, k = max(0, int(singles)), max(0, int(kits))
+    if s <= 0 and k <= 0:
+        c.pop(int(pid), None)
+    else:
+        c[int(pid)] = {"singles": s, "kits": k}
 
 
 def shop_id(context: ContextTypes.DEFAULT_TYPE, update: Update | None = None) -> int | None:
@@ -591,7 +608,7 @@ def product_list_keyboard(
 
 
 def product_detail_keyboard(p: dict, *, stock: int) -> InlineKeyboardMarkup:
-    """Buyer product detail: add-to-cart + optional COA file button."""
+    """Buyer product detail: add-to-cart + optional kit + COA file button."""
     buttons: list[list] = []
     if stock > 0:
         add_row = [
@@ -600,6 +617,17 @@ def product_detail_keyboard(p: dict, *, stock: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("＋5", callback_data=f"add:{p['id']}:5"),
         ]
         buttons.append(add_row)
+        # Kit option only when kit_price set AND stock can cover a full kit
+        if db.kit_option_available(p, stock=stock):
+            kp = db.product_kit_price(p)
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"📦 Kit of {KIT_SIZE} · {money(kp)}",
+                        callback_data=f"addkit:{p['id']}",
+                    )
+                ]
+            )
     if db.product_has_coa(p):
         buttons.append(
             [InlineKeyboardButton("📄 COA", callback_data=f"viewcoa:{p['id']}")]
@@ -805,11 +833,25 @@ async def on_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
+def _product_with_stock(pid: int) -> dict | None:
+    """Product dict with clone-aware effective stock for buyer cart checks."""
+    p = db.get_product(pid)
+    if not p:
+        return None
+    try:
+        from franchise import enrich_product_stock, ensure_franchise_tables
+
+        ensure_franchise_tables()
+        return enrich_product_stock(p)
+    except Exception:
+        return dict(p)
+
+
 async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     pid = int(query.data.split(":")[1])
-    p = db.get_product(pid)
+    p = _product_with_stock(pid)
     if not p or not p["active"]:
         await query.answer("Product unavailable", show_alert=True)
         return
@@ -819,6 +861,11 @@ async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Price: *{money(p['price'])}* / {p.get('unit') or 'vial'}\n"
         f"Stock: {stock}\n"
     )
+    if db.kit_option_available(p, stock=stock):
+        kp = db.product_kit_price(p)
+        text += f"Kit of {KIT_SIZE}: *{money(kp)}*\n"
+    elif db.product_kit_price(p) is not None and stock < KIT_SIZE:
+        text += f"_Kit of {KIT_SIZE} unavailable (need {KIT_SIZE}+ in stock)_\n"
     if p.get("description"):
         text += f"\n{p['description']}\n"
     if stock <= 0:
@@ -832,18 +879,47 @@ async def cb_add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     _, pid_s, qty_s = query.data.split(":")
     pid, qty = int(pid_s), int(qty_s)
-    p = db.get_product(pid)
+    p = _product_with_stock(pid)
     if not p or not p["active"]:
         await query.answer("Unavailable", show_alert=True)
         return
     stock = int(p["stock"])
-    c = cart(context)
-    new_qty = c.get(pid, 0) + qty
-    if new_qty > stock:
+    e = cart_get_entry(context, pid)
+    new_vials = db.cart_entry_vials(e) + qty
+    if new_vials > stock:
         await query.answer(f"Only {stock} available", show_alert=True)
         return
-    c[pid] = new_qty
-    await query.answer(f"Added {qty}× {p['name']} (cart: {new_qty})")
+    cart_set_entry(context, pid, e["singles"] + qty, e["kits"])
+    await query.answer(
+        f"Added {qty}× {p['name']} (cart: {new_vials} vials)"
+    )
+
+
+async def cb_add_kit_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add one kit (KIT_SIZE vials) at kit_price when stock allows."""
+    query = update.callback_query
+    pid = int(query.data.split(":")[1])
+    p = _product_with_stock(pid)
+    if not p or not p["active"]:
+        await query.answer("Unavailable", show_alert=True)
+        return
+    stock = int(p["stock"])
+    if not db.kit_option_available(p, stock=stock):
+        await query.answer(
+            f"Kit unavailable (need {KIT_SIZE}+ in stock)",
+            show_alert=True,
+        )
+        return
+    e = cart_get_entry(context, pid)
+    new_vials = db.cart_entry_vials(e) + int(KIT_SIZE)
+    if new_vials > stock:
+        await query.answer(f"Only {stock} available", show_alert=True)
+        return
+    cart_set_entry(context, pid, e["singles"], e["kits"] + 1)
+    kp = db.product_kit_price(p)
+    await query.answer(
+        f"Added kit of {KIT_SIZE} · {money(kp)} (cart: {new_vials} vials)"
+    )
 
 
 async def cb_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -871,26 +947,41 @@ async def _render_cart(
         return
 
     shop = db.get_shop(sid) if sid else None
+    # Refresh products and drop/convert kits when stock < KIT_SIZE
+    prod_map: dict[int, dict] = {}
+    for pid in list(c.keys()):
+        p = _product_with_stock(int(pid))
+        if p:
+            prod_map[int(pid)] = p
+    kit_notes = db.sanitize_cart_kits(c, prod_map)
+
     lines = ["🛒 *Your cart*\n"]
     subtotal = 0.0
     buttons = []
-    stale = []
-    for pid, qty in list(c.items()):
-        p = db.get_product(pid)
+    for pid, entry in list(c.items()):
+        p = prod_map.get(int(pid)) or db.get_product(pid)
         if not p or not p["active"]:
-            stale.append(pid)
+            c.pop(pid, None)
             continue
-        line = float(p["price"]) * qty
+        e = db.normalize_cart_entry(entry)
+        line = db.cart_entry_line_total(p, e)
         subtotal += line
-        lines.append(f"• {p['name']} × {qty} = {money(line)}")
+        bits = []
+        if e["kits"] > 0:
+            kp = db.product_kit_price(p) or 0
+            bits.append(f"{e['kits']} kit(s) @ {money(kp)}")
+        if e["singles"] > 0:
+            bits.append(f"{e['singles']} vial(s) @ {money(p['price'])}")
+        bits_s = " + ".join(bits) if bits else f"{db.cart_entry_vials(e)} vials"
+        lines.append(f"• {p['name']}: {bits_s} = {money(line)}")
         buttons.append(
             [
                 InlineKeyboardButton(f"− {p['name'][:18]}", callback_data=f"sub:{pid}"),
                 InlineKeyboardButton("🗑", callback_data=f"rm:{pid}"),
             ]
         )
-    for pid in stale:
-        del c[pid]
+    for note in kit_notes:
+        lines.append(f"_{note}_")
 
     if not c:
         text = "🛒 Your cart is empty."
@@ -948,11 +1039,14 @@ async def _render_cart(
 async def cb_sub_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     pid = int(query.data.split(":")[1])
-    c = cart(context)
-    if pid in c:
-        c[pid] -= 1
-        if c[pid] <= 0:
-            del c[pid]
+    e = cart_get_entry(context, pid)
+    if e["singles"] > 0:
+        e["singles"] -= 1
+    elif e["kits"] > 0:
+        # Break one kit into (KIT_SIZE - 1) singles
+        e["kits"] -= 1
+        e["singles"] += int(KIT_SIZE) - 1
+    cart_set_entry(context, pid, e["singles"], e["kits"])
     await query.answer("Updated")
     await _render_cart(update, context, edit=True)
 
@@ -985,6 +1079,22 @@ async def cb_checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
     shop = db.get_shop(sid) or db.ensure_shop(sid)
+
+    # Drop kit deals if stock fell below KIT_SIZE
+    prod_map = {}
+    for pid in list(c.keys()):
+        p = _product_with_stock(int(pid))
+        if p:
+            prod_map[int(pid)] = p
+    db.sanitize_cart_kits(c, prod_map)
+    if not c:
+        await safe_edit(
+            query,
+            "Cart is empty or items became unavailable.",
+            back_main_kb([[InlineKeyboardButton("🧬 Catalog", callback_data="cat")]]),
+        )
+        return ConversationHandler.END
+
     ok_min, min_msg = db.check_min_order(shop, db.cart_quantity_total(c))
     if not ok_min:
         await safe_edit(
@@ -1014,10 +1124,12 @@ async def cb_checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     collab.ensure_collab_tables()
     catalog = {int(x["id"]): x for x in collab.catalog_for_host(sid)}
     items = []
-    for pid, qty in c.items():
+    for pid, raw_entry in list(c.items()):
+        e = db.normalize_cart_entry(raw_entry)
         entry = catalog.get(int(pid))
-        p = db.get_product(pid)
-        if not p or not p["active"] or int(p["stock"]) < qty:
+        p = _product_with_stock(int(pid))
+        need = db.cart_entry_vials(e)
+        if not p or not p["active"] or int(p["stock"]) < need:
             await safe_edit(
                 query,
                 f"Stock issue with product id {pid}. Adjust cart and try again.",
@@ -1032,15 +1144,46 @@ async def cb_checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return ConversationHandler.END
         sell = float(entry["sell_price"]) if entry else float(p["price"])
-        items.append(
-            {
-                "product_id": pid,
-                "product_name": p["name"],
-                "unit_price": sell,
-                "quantity": qty,
-                "owner_chat_id": int(entry["owner_chat_id"]) if entry else int(p["chat_id"]),
-            }
+        owner = int(entry["owner_chat_id"]) if entry else int(p["chat_id"])
+        if e["kits"] > 0:
+            if not db.kit_option_available(p, stock=int(p["stock"])):
+                await safe_edit(
+                    query,
+                    f"Kit pricing for {p['name']} is no longer available "
+                    f"(need {KIT_SIZE}+ in stock). Adjust cart.",
+                    back_main_kb(
+                        [[InlineKeyboardButton("🛒 Cart", callback_data="cart")]]
+                    ),
+                )
+                return ConversationHandler.END
+            items.append(
+                {
+                    "product_id": pid,
+                    "product_name": f"{p['name']} (kit of {KIT_SIZE})",
+                    "unit_price": sell,  # overwritten at create for host; collab uses is_kit
+                    "quantity": e["kits"] * int(KIT_SIZE),
+                    "owner_chat_id": owner,
+                    "is_kit": True,
+                }
+            )
+        if e["singles"] > 0:
+            items.append(
+                {
+                    "product_id": pid,
+                    "product_name": p["name"],
+                    "unit_price": sell,
+                    "quantity": e["singles"],
+                    "owner_chat_id": owner,
+                    "is_kit": False,
+                }
+            )
+    if not items:
+        await safe_edit(
+            query,
+            "Cart is empty. Adjust cart and try again.",
+            back_main_kb([[InlineKeyboardButton("🛒 Cart", callback_data="cart")]]),
         )
+        return ConversationHandler.END
     context.user_data["checkout_items"] = items
     context.user_data["checkout_multi"] = any(
         int(it["owner_chat_id"]) != int(sid) for it in items
@@ -2893,9 +3036,18 @@ async def cb_adm_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         coa_line = "COA: ✅ " + " · ".join(coa_bits) + "\n"
     else:
         coa_line = "COA: _not set — upload PDF/photo or paste a link_\n"
+    kp = db.product_kit_price(p)
+    if kp is not None:
+        kit_line = f"Kit of {KIT_SIZE}: {money(kp)}"
+        if int(p.get("stock") or 0) < KIT_SIZE:
+            kit_line += f" _(hidden from buyers until stock ≥ {KIT_SIZE})_"
+        kit_line += "\n"
+    else:
+        kit_line = f"Kit of {KIT_SIZE}: _not set_\n"
     text = (
         f"*{p['name']}* (#{p['id']})\n"
         f"Price: {money(p['price'])} / {p.get('unit')}\n"
+        f"{kit_line}"
         f"Stock: {p['stock']}\n"
         f"Active: {'yes' if p['active'] else 'no'}\n"
         f"{coa_line}"
@@ -2906,6 +3058,10 @@ async def cb_adm_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         [
             InlineKeyboardButton("💲 Price", callback_data=f"setprice:{pid}"),
             InlineKeyboardButton("📊 Stock", callback_data=f"setstock:{pid}"),
+        ],
+        [
+            InlineKeyboardButton("📦 Kit price", callback_data=f"setkit:{pid}"),
+            InlineKeyboardButton("🗑 Clear kit", callback_data=f"clearkit:{pid}"),
         ],
         [InlineKeyboardButton("📄 Set COA (file or link)", callback_data=f"setcoa:{pid}")],
     ]
@@ -3246,6 +3402,85 @@ async def cb_set_price_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=force_reply("Price e.g. 45.00"),
     )
     return EDIT_PRICE_VALUE
+
+
+async def cb_set_kit_price_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    pid = int(query.data.split(":")[1])
+    p = db.get_product(pid)
+    if not p or (sid is not None and int(p["chat_id"]) != int(sid)):
+        await query.answer("Product not in this shop", show_alert=True)
+        return ConversationHandler.END
+    context.user_data["edit_pid"] = pid
+    set_awaiting(context, "edit_kit_price")
+    cur = db.product_kit_price(p)
+    cur_s = money(cur) if cur is not None else "not set"
+    await query.message.reply_text(
+        f"📦 *Kit price for {p['name']}*\n\n"
+        f"One kit = *{KIT_SIZE}* vials/stock units.\n"
+        f"Current: {cur_s}\n\n"
+        f"Send the price for a full kit of {KIT_SIZE} "
+        f"(e.g. `90.00`).\n"
+        f"Kit option is *hidden* from buyers when stock is below {KIT_SIZE}.\n"
+        f"Send `0` to remove kit pricing.\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply(f"Kit of {KIT_SIZE} price e.g. 90"),
+    )
+    return EDIT_KIT_PRICE
+
+
+async def edit_kit_price_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return EDIT_KIT_PRICE
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    pid = context.user_data.get("edit_pid")
+    p = db.get_product(int(pid)) if pid else None
+    if not p or int(p["chat_id"]) != int(sid):
+        clear_awaiting(context)
+        await update.message.reply_text("Product not found in this shop.")
+        return ConversationHandler.END
+    raw = (update.message.text or "").replace("$", "").strip()
+    try:
+        price = float(raw)
+        if price < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "Invalid. Send a price (e.g. 90) or 0 to clear.\n/cancel",
+            reply_markup=force_reply(f"Kit of {KIT_SIZE} price e.g. 90"),
+        )
+        return EDIT_KIT_PRICE
+    ok_set, msg = db.set_product_kit_price(int(pid), int(sid), None if price == 0 else price)
+    clear_awaiting(context)
+    await update.message.reply_text(
+        f"{'✅' if ok_set else '❌'} {msg}",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Product", callback_data=f"admp:{pid}")]]
+        ),
+    )
+    return ConversationHandler.END
+
+
+async def cb_clear_kit_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await query.answer("Denied", show_alert=True)
+        return
+    pid = int(query.data.split(":")[1])
+    ok_set, msg = db.set_product_kit_price(pid, sid, None)
+    await query.answer(msg if ok_set else "Failed", show_alert=not ok_set)
+    query.data = f"admp:{pid}"
+    await cb_adm_product(update, context)
 
 
 async def edit_price_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4376,10 +4611,11 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Choose payment method, enter shipping details\n"
         "• Shipping fee is auto-added (free over threshold if set)\n"
         "• Some shops require a *vial/kit minimum* (shown on home & cart)\n"
+        "• Products may offer a *kit of 10* at kit price (hidden if stock < 10)\n"
         "• Pay using the instructions, then tap *I've paid*\n"
         "• Inventory only drops after an admin confirms payment\n\n"
         "*Admins* (`/admin`)\n"
-        "• Products: add, price, stock\n"
+        "• Products: add, vial price, kit price, stock\n"
         "• Orders: confirm/reject payments\n"
         "• Payment methods, shipping, and *min order (vial/kit)*\n"
         "• Add other admins per shop\n\n"
@@ -4642,6 +4878,7 @@ def build_app(token: str | None = None) -> Application:
             CallbackQueryHandler(cb_add_tracking_start, pattern=r"^addtrack:\d+$"),
             CallbackQueryHandler(cb_add_prod_start, pattern=r"^adm_addprod$"),
             CallbackQueryHandler(cb_set_price_start, pattern=r"^setprice:\d+$"),
+            CallbackQueryHandler(cb_set_kit_price_start, pattern=r"^setkit:\d+$"),
             CallbackQueryHandler(cb_set_stock_start, pattern=r"^setstock:\d+$"),
             CallbackQueryHandler(cb_set_name_start, pattern=r"^setname:\d+$"),
             CallbackQueryHandler(cb_set_coa_start, pattern=r"^setcoa:\d+$"),
@@ -4711,6 +4948,9 @@ def build_app(token: str | None = None) -> Application:
             ],
             EDIT_PRICE_VALUE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_price_value),
+            ],
+            EDIT_KIT_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_kit_price_value),
             ],
             EDIT_STOCK_VALUE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_stock_value),
@@ -4829,7 +5069,9 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_catalog, pattern=r"^cat$"))
     app.add_handler(CallbackQueryHandler(cb_product, pattern=r"^prod:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_add_to_cart, pattern=r"^add:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_add_kit_to_cart, pattern=r"^addkit:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_cart, pattern=r"^cart$"))
+    app.add_handler(CallbackQueryHandler(cb_clear_kit_price, pattern=r"^clearkit:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_sub_cart, pattern=r"^sub:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_rm_cart, pattern=r"^rm:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_clear_cart, pattern=r"^clearcart$"))

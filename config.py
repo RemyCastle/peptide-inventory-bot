@@ -83,8 +83,14 @@ DEFAULT_LOW_STOCK_THRESHOLD = int(os.getenv("DEFAULT_LOW_STOCK_THRESHOLD", "2"))
 DEFAULT_MIN_ORDER_QTY = int(os.getenv("DEFAULT_MIN_ORDER_QTY", "0"))
 DEFAULT_MIN_ORDER_LABEL = os.getenv("DEFAULT_MIN_ORDER_LABEL", "vial").strip() or "vial"
 
+# Kit pricing: one kit = this many vials (stock units)
+try:
+    KIT_SIZE = max(2, int(os.getenv("KIT_SIZE", "10")))
+except ValueError:
+    KIT_SIZE = 10
+
 # Schema version expected by this code release
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def resolve_bot_tokens() -> list[str]:

@@ -367,13 +367,21 @@ def attach_clone(
             if already:
                 continue
 
+            kit_price = None
+            if "kit_price" in sp.keys() and sp["kit_price"] is not None:
+                try:
+                    kit_price = float(sp["kit_price"])
+                    if kit_price <= 0:
+                        kit_price = None
+                except (TypeError, ValueError):
+                    kit_price = None
             conn.execute(
                 """
                 INSERT INTO products (
                     chat_id, name, description, price, stock, unit, active, sort_order,
                     created_at, updated_at, linked_product_id,
-                    coa_url, coa_file_id, coa_file_type, coa_filename
-                ) VALUES (?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                    coa_url, coa_file_id, coa_file_type, coa_filename, kit_price
+                ) VALUES (?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(target_chat_id),
@@ -389,6 +397,7 @@ def attach_clone(
                     sp["coa_file_id"] if "coa_file_id" in sp.keys() else None,
                     sp["coa_file_type"] if "coa_file_type" in sp.keys() else None,
                     sp["coa_filename"] if "coa_filename" in sp.keys() else None,
+                    kit_price,
                 ),
             )
 

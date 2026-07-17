@@ -143,6 +143,17 @@ Test E | 30 | 5
 - Shown on the shop home screen and cart. Checkout is blocked until met.
 - Cloned shops inherit the parent shop’s minimum.
 
+### Kit pricing (10 vials)
+| Action | How |
+|--------|-----|
+| Set | Admin → Products → item → **📦 Kit price** → price for a pack of **10** vials |
+| Clear | Product → **🗑 Clear kit** (or send `0` as kit price) |
+
+- Buyers see **📦 Kit of 10 · $X** only when that product has a kit price **and stock ≥ 10**.
+- If stock drops below 10, the kit button is removed automatically.
+- Kits already in a cart convert to singles (vial price) when kit pricing is no longer available.
+- One kit deducts **10** from stock when payment is confirmed.
+
 ### Orders & payment confirmation
 1. **⏳ Needs confirm** — customers who tapped “I've paid” (and often attached a screenshot)  
 2. Or **📋 Orders** — full recent list  
