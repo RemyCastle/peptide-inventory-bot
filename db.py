@@ -1482,6 +1482,71 @@ def delete_product(product_id: int) -> bool:
         return cur.rowcount > 0
 
 
+def clear_shop_inventory(
+    chat_id: int, by_user: int
+) -> tuple[bool, str, int]:
+    """
+    Delete ALL products for a shop. OWNER_IDS only (bot owner).
+
+    Keeps orders, payments, shipping, admins, and shop settings.
+    Cleans collab share rows that pointed at removed products.
+    Returns (ok, message, deleted_count).
+    """
+    if not is_owner(by_user):
+        return False, "Bot owner only (OWNER_IDS).", 0
+    shop = get_shop(int(chat_id))
+    if not shop:
+        return False, "Shop not found.", 0
+
+    products = list_products(int(chat_id), active_only=False)
+    if not products:
+        return True, "Shop catalog was already empty.", 0
+
+    with get_db() as conn:
+        for p in products:
+            stock = int(p.get("stock") or 0)
+            _insert_audit(
+                conn,
+                chat_id=int(chat_id),
+                product_id=int(p["id"]),
+                product_name=p.get("name") or "",
+                delta=-stock,
+                stock_before=stock,
+                stock_after=0,
+                reason="owner_clear_inventory",
+                actor_id=int(by_user),
+            )
+        cur = conn.execute(
+            "DELETE FROM products WHERE chat_id = ?",
+            (int(chat_id),),
+        )
+        deleted = int(cur.rowcount or 0)
+
+        # Drop collab shares for products that no longer exist (host or guest side)
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "shop_shares" in tables:
+            conn.execute(
+                """
+                DELETE FROM shop_shares
+                WHERE host_chat_id = ?
+                   OR product_id NOT IN (SELECT id FROM products)
+                """,
+                (int(chat_id),),
+            )
+
+    title = shop.get("title") or str(chat_id)
+    return (
+        True,
+        f"Cleared *{deleted}* product(s) from *{title}*. Orders and settings kept.",
+        deleted,
+    )
+
+
 # ── Payment methods ──────────────────────────────────────────────────────────
 
 

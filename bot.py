@@ -852,13 +852,48 @@ def _product_with_stock(pid: int) -> dict | None:
         return dict(p)
 
 
+def _catalog_entry_for_shop(sid: int | None, pid: int) -> dict | None:
+    """
+    Product only if it belongs in this shop's buyer catalog:
+    own inventory, or an active collab share into this host.
+    Prevents cross-shop product id leakage via crafted callbacks.
+    """
+    if sid is None:
+        return None
+    try:
+        import collab
+
+        collab.ensure_collab_tables()
+        for item in collab.catalog_for_host(int(sid)):
+            if int(item["id"]) == int(pid):
+                # Overlay clone-aware stock on the catalog row
+                live = _product_with_stock(int(pid))
+                if not live or not live.get("active"):
+                    return None
+                out = dict(item)
+                out["stock"] = int(live.get("stock") or 0)
+                out["active"] = live.get("active", 1)
+                out["kit_price"] = live.get("kit_price")
+                out["description"] = live.get("description") or item.get("description") or ""
+                out["unit"] = live.get("unit") or item.get("unit") or "vial"
+                # Buyer-facing price = sell price (includes collab markup)
+                out["price"] = float(item.get("sell_price", live.get("price") or 0))
+                return out
+    except Exception:
+        p = _product_with_stock(int(pid))
+        if p and p.get("active") and int(p.get("chat_id") or 0) == int(sid):
+            return dict(p)
+    return None
+
+
 async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     pid = int(query.data.split(":")[1])
-    p = _product_with_stock(pid)
+    sid = shop_id(context, update)
+    p = _catalog_entry_for_shop(sid, pid)
     if not p or not p["active"]:
-        await query.answer("Product unavailable", show_alert=True)
+        await query.answer("Product unavailable in this shop", show_alert=True)
         return
     stock = int(p["stock"])
     text = (
@@ -866,6 +901,9 @@ async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Price: *{money(p['price'])}* / {p.get('unit') or 'vial'}\n"
         f"Stock: {stock}\n"
     )
+    if p.get("is_guest"):
+        guest = p.get("guest_title") or "partner"
+        text += f"_Partner stock ({guest})_\n"
     if db.kit_option_available(p, stock=stock):
         kp = db.product_kit_price(p)
         text += f"Kit of {KIT_SIZE}: *{money(kp)}*\n"
@@ -884,9 +922,10 @@ async def cb_add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     _, pid_s, qty_s = query.data.split(":")
     pid, qty = int(pid_s), int(qty_s)
-    p = _product_with_stock(pid)
+    sid = shop_id(context, update)
+    p = _catalog_entry_for_shop(sid, pid)
     if not p or not p["active"]:
-        await query.answer("Unavailable", show_alert=True)
+        await query.answer("Unavailable in this shop", show_alert=True)
         return
     stock = int(p["stock"])
     e = cart_get_entry(context, pid)
@@ -904,9 +943,10 @@ async def cb_add_kit_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Add one kit (KIT_SIZE vials) at kit_price when stock allows."""
     query = update.callback_query
     pid = int(query.data.split(":")[1])
-    p = _product_with_stock(pid)
+    sid = shop_id(context, update)
+    p = _catalog_entry_for_shop(sid, pid)
     if not p or not p["active"]:
-        await query.answer("Unavailable", show_alert=True)
+        await query.answer("Unavailable in this shop", show_alert=True)
         return
     stock = int(p["stock"])
     if not db.kit_option_available(p, stock=stock):
@@ -952,19 +992,21 @@ async def _render_cart(
         return
 
     shop = db.get_shop(sid) if sid else None
-    # Refresh products and drop/convert kits when stock < KIT_SIZE
+    # Refresh products and drop items not in this shop's catalog (isolation)
     prod_map: dict[int, dict] = {}
     for pid in list(c.keys()):
-        p = _product_with_stock(int(pid))
+        p = _catalog_entry_for_shop(sid, int(pid))
         if p:
             prod_map[int(pid)] = p
+        else:
+            c.pop(pid, None)
     kit_notes = db.sanitize_cart_kits(c, prod_map)
 
     lines = ["🛒 *Your cart*\n"]
     subtotal = 0.0
     buttons = []
     for pid, entry in list(c.items()):
-        p = prod_map.get(int(pid)) or db.get_product(pid)
+        p = prod_map.get(int(pid))
         if not p or not p["active"]:
             c.pop(pid, None)
             continue
@@ -2052,6 +2094,15 @@ async def _admin_home(
             -1,
             [InlineKeyboardButton("👑 Master fees / invoices", callback_data="master_home")],
         )
+        rows.insert(
+            -1,
+            [
+                InlineKeyboardButton(
+                    "🗑 Clear inventory (owner)",
+                    callback_data="owner_clear_inv",
+                )
+            ],
+        )
         kb = InlineKeyboardMarkup(rows)
     # Note shared inventory on clone shops
     shop_full = shop
@@ -2078,6 +2129,88 @@ async def cb_adm_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         query,
         f"🔗 *Customer shop link*\n\n`{link}`\n\nShare this so buyers open the right catalog.",
         back_main_kb([[InlineKeyboardButton("« Admin", callback_data="admin")]]),
+    )
+
+
+async def cb_owner_clear_inv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """OWNER_IDS only: confirm screen before wiping shop catalog."""
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await safe_edit(
+            query,
+            "Bot owner only. Your Telegram ID must be in `OWNER_IDS`.",
+            back_main_kb([[InlineKeyboardButton("« Admin", callback_data="admin")]]),
+        )
+        return
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await safe_edit(query, "No shop selected. /start then Admin.", back_main_kb())
+        return
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    products = db.list_products(sid, active_only=False)
+    n = len(products)
+    await safe_edit(
+        query,
+        f"🗑 *Clear shop inventory* (owner only)\n\n"
+        f"Shop: *{shop.get('title') or sid}* (`{sid}`)\n"
+        f"Products to delete: *{n}*\n\n"
+        "This *permanently deletes* all catalog products for this shop.\n"
+        "• Orders history, payments, shipping, admins — *kept*\n"
+        "• Product stock rows — *removed*\n"
+        "• Collab shares for this catalog — cleaned\n\n"
+        "_This cannot be undone (except restore from backup)._",
+        InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"✅ Yes, delete all {n} products",
+                        callback_data="owner_clear_inv_yes",
+                    )
+                ],
+                [InlineKeyboardButton("❌ Cancel", callback_data="admin")],
+            ]
+        ),
+    )
+
+
+async def cb_owner_clear_inv_yes(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """OWNER_IDS only: perform clear after confirmation."""
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await safe_edit(
+            query,
+            "Bot owner only.",
+            back_main_kb([[InlineKeyboardButton("« Admin", callback_data="admin")]]),
+        )
+        return
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await safe_edit(query, "No shop selected.", back_main_kb())
+        return
+    success, msg, deleted = db.clear_shop_inventory(int(sid), user.id)
+    log.info(
+        "owner_clear_inventory shop=%s by=%s ok=%s deleted=%s",
+        sid,
+        user.id,
+        success,
+        deleted,
+    )
+    prefix = "✅ " if success else "❌ "
+    await safe_edit(
+        query,
+        prefix + msg,
+        InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📦 Products", callback_data="adm_prods")],
+                [InlineKeyboardButton("« Admin", callback_data="admin")],
+            ]
+        ),
     )
 
 
@@ -3450,9 +3583,18 @@ async def cb_view_coa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not p:
         await query.answer("Product not found", show_alert=True)
         return
-    # Buyers only see active products; admins of that shop can open any
+    sid = shop_id(context, update)
     is_adm = db.is_admin(int(p["chat_id"]), user.id)
-    if not p.get("active") and not is_adm:
+    # Buyers: product must be in current shop catalog (own or collab share).
+    # Shop admin of the product's shop may open even if inactive.
+    if not is_adm:
+        if _catalog_entry_for_shop(sid, pid) is None:
+            await query.answer("COA not available in this shop", show_alert=True)
+            return
+        if not p.get("active"):
+            await query.answer("Product unavailable", show_alert=True)
+            return
+    elif not p.get("active") and not is_adm:
         await query.answer("Product unavailable", show_alert=True)
         return
 
@@ -5322,6 +5464,8 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_adm_transfer, pattern=r"^adm_transfer$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_franchise_proof_start, pattern=r"^frproof:\d+$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_master_home, pattern=r"^master_home$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_owner_clear_inv, pattern=r"^owner_clear_inv$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_owner_clear_inv_yes, pattern=r"^owner_clear_inv_yes$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_master_setfee, pattern=r"^master_setfee$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_master_ledger, pattern=r"^master_ledger$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_master_geninv, pattern=r"^master_geninv$"), group=NAV)
@@ -5368,6 +5512,8 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^help$"))
 
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^admin$"))
+    app.add_handler(CallbackQueryHandler(cb_owner_clear_inv, pattern=r"^owner_clear_inv$"))
+    app.add_handler(CallbackQueryHandler(cb_owner_clear_inv_yes, pattern=r"^owner_clear_inv_yes$"))
     app.add_handler(CallbackQueryHandler(cb_adm_prods, pattern=r"^adm_prods$"))
     app.add_handler(CallbackQueryHandler(cb_adm_product, pattern=r"^admp:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_toggle_product, pattern=r"^togglep:\d+$"))

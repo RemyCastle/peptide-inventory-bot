@@ -116,6 +116,7 @@ Open **⚙️ Admin Panel** (`/admin`).
 |--------|-----|
 | Add | **➕ Add product** — name, price, stock, **unit** (vial/bottle/…), description |
 | **Import from file** | Admin → **📥 Import inventory** → add *new* products only |
+| **Clear inventory** | **Owner only** (`OWNER_IDS`): Admin → **🗑 Clear inventory (owner)** → confirm. Deletes all products; keeps orders/settings |
 | **Mass edit** | Admin → **📝 Mass edit** → download `.txt`, edit, re-upload |
 | Change price | Products → pick item → **💲 Price** → send number (e.g. `45.00`) |
 | Change stock | Products → pick item → **📊 Stock** → absolute number (`10`) or adjust (`+5`, `-2`) |
