@@ -140,12 +140,14 @@ AWAITING_TTL_SEC = 600
 
 def force_reply(placeholder: str = "Type your answer...") -> ForceReply:
     """
-    Open the user's keyboard and focus the input field.
-    selective=True → only the prompted user in groups.
+    Focus the input field after a prompt.
+
+    selective=False so clients do not force a quote-Reply to the prompt —
+    any next message from this user in the conversation is enough.
     Placeholder max length is 64 (Telegram limit).
     """
     ph = (placeholder or "Type your answer...").strip() or "Type your answer..."
-    return ForceReply(selective=True, input_field_placeholder=ph[:64])
+    return ForceReply(selective=False, input_field_placeholder=ph[:64])
 
 SYM = CURRENCY_SYMBOL
 
@@ -220,8 +222,11 @@ async def accept_prompt_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
     """
-    DMs: any plain text answers the open prompt (no Telegram 'Reply' required).
-    Groups: must reply-to the bot's prompt so unrelated chat is ignored.
+    Accept the next message as the answer to an open prompt.
+
+    No Telegram quote-Reply required in DMs or groups — just type the answer.
+    ConversationHandler is already per-user, so only the person mid-flow is
+    routed here. Expired prompts are rejected; /cancel still aborts.
     """
     if awaiting_expired(context):
         if update.message:
@@ -235,23 +240,9 @@ async def accept_prompt_message(
     if not chat or not msg:
         return False
 
-    if chat.type == ChatType.PRIVATE:
-        return True
-
-    # Group / supergroup: require reply to a bot message
-    reply = msg.reply_to_message
-    bot_id = context.bot.id
-    if (
-        not reply
-        or not reply.from_user
-        or reply.from_user.id != bot_id
-    ):
-        await msg.reply_text(
-            "In *groups*, please *reply* to my prompt message "
-            "(long-press → Reply). That way I don't grab normal chat.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return False
+    # Private or group: free-text is enough (no reply_to required).
+    # If awaiting was never set, still allow when ConversationHandler put us
+    # in a prompt state (callers always set_awaiting for text steps).
     return True
 
 

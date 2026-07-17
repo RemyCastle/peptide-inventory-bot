@@ -24,8 +24,9 @@ log = logging.getLogger("inventory_bot.setup")
 
 
 def _force_reply(placeholder: str = "Type your answer...") -> ForceReply:
+    """Focus composer; selective=False so a quote-Reply is not required."""
     ph = (placeholder or "Type your answer...").strip() or "Type your answer..."
-    return ForceReply(selective=True, input_field_placeholder=ph[:64])
+    return ForceReply(selective=False, input_field_placeholder=ph[:64])
 
 
 # Conversation states (offset to avoid collision with main bot states 0-13)
