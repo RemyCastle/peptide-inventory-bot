@@ -1,4 +1,4 @@
-"""Inventory layout text import (parse + add-only create)."""
+"""Inventory layout text import / mass edit (parse + modes + unit)."""
 
 from __future__ import annotations
 
@@ -31,7 +31,25 @@ HCG 5000 | 55 | 0 | fridge
         self.assertEqual(p.rows[0].price, 45.0)
         self.assertEqual(p.rows[0].stock, 10)
         self.assertEqual(p.rows[0].description, "acetate blend")
+        self.assertEqual(p.rows[0].unit, "vial")  # legacy 4-field
+        self.assertFalse(p.rows[0].unit_explicit)
         self.assertEqual(p.rows[1].description, "")
+
+    def test_five_field_with_unit(self) -> None:
+        text = "Test E | 30 | 5 | bottle | oil base\n"
+        p = inv.parse_inventory_text(text)
+        self.assertEqual(len(p.errors), 0)
+        self.assertEqual(len(p.rows), 1)
+        self.assertEqual(p.rows[0].unit, "bottle")
+        self.assertEqual(p.rows[0].description, "oil base")
+        self.assertTrue(p.rows[0].unit_explicit)
+
+    def test_header_with_unit_skipped(self) -> None:
+        text = "name | price | stock | unit | description\nAlpha | 10 | 1 | pack |\n"
+        p = inv.parse_inventory_text(text)
+        self.assertEqual(len(p.rows), 1)
+        self.assertEqual(p.rows[0].name, "Alpha")
+        self.assertEqual(p.rows[0].unit, "pack")
 
     def test_header_skipped(self) -> None:
         text = "name | price | stock\nAlpha | 10 | 1\n"
@@ -59,6 +77,12 @@ HCG 5000 | 55 | 0 | fridge
         p = inv.parse_inventory_text("# only comments\n\n")
         self.assertEqual(len(p.rows), 0)
         self.assertTrue(p.errors)
+
+    def test_normalize_unit(self) -> None:
+        self.assertEqual(inv.normalize_unit(""), "vial")
+        self.assertEqual(inv.normalize_unit("-"), "vial")
+        self.assertEqual(inv.normalize_unit("  Bottle  "), "Bottle")
+        self.assertEqual(inv.normalize_unit("x" * 50), "x" * inv.MAX_UNIT_LEN)
 
 
 class ImportProductsTests(unittest.TestCase):
@@ -91,10 +115,45 @@ class ImportProductsTests(unittest.TestCase):
         self.assertEqual(imported.created_count, 1)
         self.assertEqual(imported.skipped_count, 1)
         self.assertIn("tren ace", [s.casefold() for s in imported.skipped])
-        # existing price/stock unchanged
         tren = [p for p in db.list_products(self.shop_a) if p["name"] == "Tren Ace"][0]
         self.assertEqual(float(tren["price"]), 40.0)
         self.assertEqual(int(tren["stock"]), 1)
+
+    def test_update_only(self) -> None:
+        db.add_product(self.shop_a, "Tren Ace", 40.0, 1, unit="vial")
+        text = "Tren Ace | 99 | 50 | bottle | new desc\nUnknown | 10 | 1 | vial |\n"
+        parsed, imported = inv.import_from_text(
+            self.shop_a, text, mode="update_only"
+        )
+        self.assertEqual(len(parsed.errors), 0)
+        self.assertEqual(imported.updated_count, 1)
+        self.assertEqual(imported.created_count, 0)
+        self.assertEqual(imported.skipped_count, 1)
+        tren = [p for p in db.list_products(self.shop_a) if p["name"] == "Tren Ace"][0]
+        self.assertEqual(float(tren["price"]), 99.0)
+        self.assertEqual(int(tren["stock"]), 50)
+        self.assertEqual(tren["unit"], "bottle")
+        self.assertEqual(tren["description"], "new desc")
+        self.assertEqual(len(db.list_products(self.shop_a)), 1)
+
+    def test_upsert(self) -> None:
+        db.add_product(self.shop_a, "Old", 10.0, 2)
+        text = "Old | 20 | 9 | pack |\nBrand New | 15 | 3 | bottle | hi\n"
+        _, imported = inv.import_from_text(self.shop_a, text, mode="upsert")
+        self.assertEqual(imported.updated_count, 1)
+        self.assertEqual(imported.created_count, 1)
+        old = [p for p in db.list_products(self.shop_a) if p["name"] == "Old"][0]
+        self.assertEqual(float(old["price"]), 20.0)
+        self.assertEqual(old["unit"], "pack")
+        neu = [p for p in db.list_products(self.shop_a) if p["name"] == "Brand New"][0]
+        self.assertEqual(neu["unit"], "bottle")
+        self.assertEqual(neu["description"], "hi")
+
+    def test_add_product_with_unit(self) -> None:
+        text = "Serum | 12 | 4 | bottle | face\n"
+        inv.import_from_text(self.shop_a, text, mode="add_only")
+        p = db.list_products(self.shop_a)[0]
+        self.assertEqual(p["unit"], "bottle")
 
     def test_duplicate_lines_in_file(self) -> None:
         text = "Same | 10 | 1\nSame | 20 | 5\n"
@@ -121,6 +180,22 @@ class ImportProductsTests(unittest.TestCase):
         s = inv.format_import_summary(parsed, imported)
         self.assertIn("Created", s)
         self.assertIn("1", s)
+
+    def test_export_roundtrip_parse(self) -> None:
+        db.add_product(
+            self.shop_a, "Reta 10mg", 12.0, 7, description="peptide", unit="vial"
+        )
+        db.add_product(
+            self.shop_a, "Oil", 20.0, 3, description="topical", unit="bottle"
+        )
+        text = inv.export_inventory_text(self.shop_a, shop_title="Test Shop")
+        self.assertIn("name | price | stock | unit | description", text)
+        parsed = inv.parse_inventory_text(text)
+        self.assertEqual(len(parsed.errors), 0)
+        self.assertEqual(len(parsed.rows), 2)
+        by_name = {r.name: r for r in parsed.rows}
+        self.assertEqual(by_name["Oil"].unit, "bottle")
+        self.assertEqual(by_name["Reta 10mg"].stock, 7)
 
 
 if __name__ == "__main__":

@@ -114,22 +114,31 @@ Open **⚙️ Admin Panel** (`/admin`).
 ### Products
 | Action | How |
 |--------|-----|
-| Add | **➕ Add product** — name, price, stock, description |
-| **Import from file** | Admin → **📥 Import inventory** → optional template → send a `.txt` document |
+| Add | **➕ Add product** — name, price, stock, **unit** (vial/bottle/…), description |
+| **Import from file** | Admin → **📥 Import inventory** → add *new* products only |
+| **Mass edit** | Admin → **📝 Mass edit** → download `.txt`, edit, re-upload |
 | Change price | Products → pick item → **💲 Price** → send number (e.g. `45.00`) |
 | Change stock | Products → pick item → **📊 Stock** → absolute number (`10`) or adjust (`+5`, `-2`) |
+| Change unit | Products → pick item → **📏 Unit** → e.g. `vial`, `bottle`, `pack` |
 | Hide from catalog | Products → item → **⏸ Deactivate** |
 | Delete | Products → item → **🗑 Delete** |
 
-#### Import file layout (`.txt`)
+#### File layout (`.txt`) — import & mass edit
 ```text
 # comments start with #
-name | price | stock | description (optional)
-Tren Ace | 45.00 | 10 | acetate blend
-Test E | 30 | 5
+name | price | stock | unit | description
+Tren Ace | 45.00 | 10 | vial | acetate blend
+Test E | 30 | 5 | bottle |
 ```
-- **Add-only**: creates new products; existing names are **skipped** (price/stock not changed).
-- Nothing is deleted. Re-uploading the same file is safe.
+- Preferred: **5 columns** (`unit` = vial, bottle, pack, kit, etc.).
+- Legacy still works: `name | price | stock | description` (unit defaults to vial).
+- **Import**: add-only — existing names are **skipped**.
+- **Mass edit** modes:
+  - **Update existing** — change price/stock/unit/description by name; skip unknown
+  - **Add + update** — create new + update existing
+  - **Add new only** — same as Import
+- Match is by **product name** (case-insensitive). Stock in the file is **absolute**.
+- Nothing is deleted by import/mass edit.
 
 ### Minimum order (vial / kit)
 | Action | How |

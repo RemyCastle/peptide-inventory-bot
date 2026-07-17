@@ -92,6 +92,15 @@ EXISTING FEATURES
         Cart stores singles + kits; checkout expands kits to 10 stock units
         Schema v10: products.kit_price
 
+*** NEW FEATURES (mass edit + custom unit) ***
+  [NEW] Admin → Mass edit
+        Download inventory .txt → edit → upload with mode:
+          update_only | upsert | add_only
+        Format: name | price | stock | unit | description
+  [NEW] Per-product unit label (vial, bottle, pack, …)
+        Add product asks unit; product detail → Unit button
+        products.unit used in catalog display
+
 HOW COLLAB WORKS (customer story)
   1. Shop A admin: Admin → Collaborations → Create invite link
   2. Send link to Shop B admin → they open & accept

@@ -105,9 +105,11 @@ def symbol_for(chat_id: int | None) -> str:
     ADD_PROD_PRICE,
     ADD_PROD_STOCK,
     ADD_PROD_DESC,
+    ADD_PROD_UNIT,
     EDIT_PRICE_VALUE,
     EDIT_STOCK_VALUE,
     EDIT_NAME_VALUE,
+    EDIT_UNIT_VALUE,
     ADD_PAY_NAME,
     ADD_PAY_INSTR,
     SHIP_FEE,
@@ -126,9 +128,10 @@ def symbol_for(chat_id: int | None) -> str:
     FRANCHISE_PROOF,
     EDIT_SHOP_TITLE,
     IMPORT_INVENTORY_FILE,
+    MASS_EDIT_FILE,
     MIN_ORDER_QTY,
     EDIT_KIT_PRICE,
-) = range(27)
+) = range(30)
 
 # How long a pending admin/buyer prompt stays open (seconds)
 AWAITING_TTL_SEC = 600
@@ -2009,6 +2012,7 @@ async def _admin_home(
             ],
             [
                 InlineKeyboardButton("📥 Import inventory", callback_data="adm_import"),
+                InlineKeyboardButton("📝 Mass edit", callback_data="adm_massedit"),
             ],
             [
                 InlineKeyboardButton("📋 Orders", callback_data="adm_orders"),
@@ -2891,14 +2895,15 @@ async def cb_adm_import_start(
     )
     await safe_edit(
         query,
-        "📥 *Import inventory*\n\n"
+        "📥 *Import inventory* (add new only)\n\n"
         "Send a *`.txt` document* with one product per line:\n"
-        "`name | price | stock | description`\n\n"
+        "`name | price | stock | unit | description`\n\n"
         "Example:\n"
-        "`Tren Ace | 45.00 | 10 | acetate`\n"
-        "`Test E | 30 | 5`\n\n"
+        "`Tren Ace | 45.00 | 10 | vial | acetate`\n"
+        "`Test E | 30 | 5 | bottle |`\n\n"
         "• Lines starting with `#` are ignored\n"
         "• Existing product names are *skipped* (not updated)\n"
+        "• For bulk *updates*, use *Mass edit* instead\n"
         "• Nothing is deleted\n\n"
         "Upload the file now, or download the template first.\n"
         "/cancel to abort",
@@ -2924,22 +2929,16 @@ async def cb_adm_import_template(
         filename="inventory_import_template.txt",
         caption=(
             "Template ready. Edit in Notepad, then send the file back here "
-            "(name | price | stock | description)."
+            "(name | price | stock | unit | description)."
         ),
     )
     return IMPORT_INVENTORY_FILE
 
 
-async def on_import_inventory_document(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Receive .txt upload, parse, create products (add-only)."""
-    if not await accept_prompt_message(update, context):
-        return IMPORT_INVENTORY_FILE
-    sid, ok = _require_admin(update, context)
-    if not ok or sid is None:
-        clear_awaiting(context)
-        return ConversationHandler.END
+async def _read_inventory_document(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, conv_state: int
+) -> tuple[str | None, int]:
+    """Shared .txt download for import / mass edit. Returns (text, state) or (None, state)."""
     msg = update.message
     if not msg or not msg.document:
         if msg:
@@ -2947,7 +2946,7 @@ async def on_import_inventory_document(
                 "Please send a `.txt` *document* (not a photo).",
                 parse_mode=ParseMode.MARKDOWN,
             )
-        return IMPORT_INVENTORY_FILE
+        return None, conv_state
 
     doc = msg.document
     fname = (doc.file_name or "").lower()
@@ -2964,35 +2963,202 @@ async def on_import_inventory_document(
             f"Got: `{doc.file_name or 'unknown'}` ({doc.mime_type or 'no type'})",
             parse_mode=ParseMode.MARKDOWN,
         )
-        return IMPORT_INVENTORY_FILE
+        return None, conv_state
     if doc.file_size and doc.file_size > inventory_import.MAX_FILE_BYTES:
         await msg.reply_text(
             f"File too large (max {inventory_import.MAX_FILE_BYTES // 1000} KB)."
         )
-        return IMPORT_INVENTORY_FILE
+        return None, conv_state
 
     try:
         tg_file = await doc.get_file()
         data = bytes(await tg_file.download_as_bytearray())
         text = inventory_import.decode_upload_bytes(data)
+        return text, conv_state
     except ValueError as exc:
         await msg.reply_text(str(exc))
-        return IMPORT_INVENTORY_FILE
+        return None, conv_state
     except Exception as exc:
-        log.exception("import download failed")
+        log.exception("inventory file download failed")
         await msg.reply_text(f"Could not read file: {exc}")
-        return IMPORT_INVENTORY_FILE
+        return None, conv_state
 
-    parsed, imported = inventory_import.import_from_text(int(sid), text)
+
+async def on_import_inventory_document(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Receive .txt upload, parse, create products (add-only)."""
+    if not await accept_prompt_message(update, context):
+        return IMPORT_INVENTORY_FILE
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    text, st = await _read_inventory_document(
+        update, context, conv_state=IMPORT_INVENTORY_FILE
+    )
+    if text is None:
+        return st
+
+    parsed, imported = inventory_import.import_from_text(
+        int(sid), text, mode="add_only"
+    )
     clear_awaiting(context)
-    summary = inventory_import.format_import_summary(parsed, imported)
-    await msg.reply_text(
+    summary = inventory_import.format_import_summary(
+        parsed, imported, mode="add_only"
+    )
+    await update.message.reply_text(
         summary,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("📦 Products", callback_data="adm_prods")],
                 [InlineKeyboardButton("📥 Import again", callback_data="adm_import")],
+                [InlineKeyboardButton("« Admin", callback_data="admin")],
+            ]
+        ),
+    )
+    return ConversationHandler.END
+
+
+async def cb_adm_massedit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin mass edit hub: download catalog, choose upload mode."""
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await safe_edit(query, "Admin only.", back_main_kb())
+        return
+    n = len(db.list_products(sid, active_only=False))
+    text = (
+        "📝 *Mass edit inventory*\n\n"
+        f"Products in shop: *{n}*\n\n"
+        "1. *Download* your catalog as a `.txt` file\n"
+        "2. Edit in Notepad (price, stock, unit, description)\n"
+        "3. Choose a mode and *upload* the file\n\n"
+        "Format:\n"
+        "`name | price | stock | unit | description`\n\n"
+        "• Match by *product name* (case-insensitive)\n"
+        "• Stock values are absolute (not +/−)\n"
+        "• Units: vial, bottle, pack, kit, etc.\n"
+        "• Nothing is deleted by this tool"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⬇️ Download inventory", callback_data="mass_dl")],
+            [
+                InlineKeyboardButton(
+                    "⬆️ Upload — update existing", callback_data="mass_up:update_only"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬆️ Upload — add + update", callback_data="mass_up:upsert"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬆️ Upload — add new only", callback_data="mass_up:add_only"
+                )
+            ],
+            [InlineKeyboardButton("« Products", callback_data="adm_prods")],
+            [InlineKeyboardButton("« Admin", callback_data="admin")],
+        ]
+    )
+    await safe_edit(query, text, kb)
+
+
+async def cb_mass_download(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    text = inventory_import.export_inventory_text(
+        int(sid), active_only=False, shop_title=str(shop.get("title") or "shop")
+    )
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    safe_title = "".join(
+        c if c.isalnum() or c in "-_" else "_" for c in str(shop.get("title") or "shop")
+    )[:40]
+    buf = io.BytesIO(text.encode("utf-8"))
+    buf.name = f"inventory_{safe_title}_{day}.txt"
+    await query.message.reply_document(
+        document=buf,
+        filename=buf.name,
+        caption=(
+            "Current inventory export.\n"
+            "Edit, then Admin → Mass edit → choose upload mode and send this file back."
+        ),
+    )
+
+
+async def cb_mass_upload_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Begin mass-edit file upload with a chosen mode."""
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await safe_edit(query, "Admin only.", back_main_kb())
+        return ConversationHandler.END
+    mode = (query.data or "").split(":")[-1]
+    if mode not in ("add_only", "update_only", "upsert"):
+        mode = "upsert"
+    context.user_data["mass_edit_mode"] = mode
+    set_awaiting(context, "mass_edit_file")
+    labels = {
+        "add_only": "Add new only (skip existing names)",
+        "update_only": "Update existing only (skip unknown names)",
+        "upsert": "Add new + update existing",
+    }
+    await query.message.reply_text(
+        f"📝 *Mass edit — {labels[mode]}*\n\n"
+        "Send your `.txt` document now.\n"
+        "`name | price | stock | unit | description`\n\n"
+        "/cancel to abort",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Send inventory .txt file..."),
+    )
+    return MASS_EDIT_FILE
+
+
+async def on_mass_edit_document(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Receive mass-edit .txt and apply selected mode."""
+    if not await accept_prompt_message(update, context):
+        return MASS_EDIT_FILE
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    text, st = await _read_inventory_document(
+        update, context, conv_state=MASS_EDIT_FILE
+    )
+    if text is None:
+        return st
+
+    mode = context.user_data.get("mass_edit_mode") or "upsert"
+    if mode not in ("add_only", "update_only", "upsert"):
+        mode = "upsert"
+    parsed, imported = inventory_import.import_from_text(
+        int(sid), text, mode=mode  # type: ignore[arg-type]
+    )
+    clear_awaiting(context)
+    context.user_data.pop("mass_edit_mode", None)
+    summary = inventory_import.format_import_summary(
+        parsed, imported, mode=mode  # type: ignore[arg-type]
+    )
+    await update.message.reply_text(
+        summary,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📝 Mass edit", callback_data="adm_massedit")],
+                [InlineKeyboardButton("📦 Products", callback_data="adm_prods")],
                 [InlineKeyboardButton("« Admin", callback_data="admin")],
             ]
         ),
@@ -3015,6 +3181,7 @@ async def cb_adm_prods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 [
                     [InlineKeyboardButton("➕ Add product", callback_data="adm_addprod")],
                     [InlineKeyboardButton("📥 Import inventory", callback_data="adm_import")],
+                    [InlineKeyboardButton("📝 Mass edit", callback_data="adm_massedit")],
                     [InlineKeyboardButton("« Admin", callback_data="admin")],
                 ]
             ),
@@ -3035,6 +3202,9 @@ async def cb_adm_prods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             InlineKeyboardButton("➕ Add", callback_data="adm_addprod"),
             InlineKeyboardButton("📥 Import", callback_data="adm_import"),
         ]
+    )
+    buttons.append(
+        [InlineKeyboardButton("📝 Mass edit", callback_data="adm_massedit")]
     )
     buttons.append([InlineKeyboardButton("« Admin", callback_data="admin")])
     await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
@@ -3078,7 +3248,8 @@ async def cb_adm_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         kit_line = f"Kit of {KIT_SIZE}: _not set_\n"
     text = (
         f"*{p['name']}* (#{p['id']})\n"
-        f"Price: {money(p['price'])} / {p.get('unit')}\n"
+        f"Price: {money(p['price'])} / {p.get('unit') or 'vial'}\n"
+        f"Unit: {p.get('unit') or 'vial'}\n"
         f"{kit_line}"
         f"Stock: {p['stock']}\n"
         f"Active: {'yes' if p['active'] else 'no'}\n"
@@ -3091,6 +3262,7 @@ async def cb_adm_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             InlineKeyboardButton("💲 Price", callback_data=f"setprice:{pid}"),
             InlineKeyboardButton("📊 Stock", callback_data=f"setstock:{pid}"),
         ],
+        [InlineKeyboardButton("📏 Unit", callback_data=f"setunit:{pid}")],
         [
             InlineKeyboardButton("📦 Kit price", callback_data=f"setkit:{pid}"),
             InlineKeyboardButton("🗑 Clear kit", callback_data=f"clearkit:{pid}"),
@@ -3676,6 +3848,22 @@ async def add_prod_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return ADD_PROD_STOCK
     context.user_data["new_prod"]["stock"] = stock
+    set_awaiting(context, "add_prod_unit")
+    await update.message.reply_text(
+        "Unit name? (e.g. `vial`, `bottle`, `pack`, `kit`)\n"
+        "Send `-` for default *vial*.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("vial / bottle / pack …"),
+    )
+    return ADD_PROD_UNIT
+
+
+async def add_prod_unit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return ADD_PROD_UNIT
+    raw = (update.message.text or "").strip()
+    unit = inventory_import.normalize_unit(raw)
+    context.user_data.setdefault("new_prod", {})["unit"] = unit
     set_awaiting(context, "add_prod_desc")
     await update.message.reply_text(
         "Short description? (or `-` for none)",
@@ -3695,23 +3883,76 @@ async def add_prod_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if desc == "-":
         desc = ""
     np = context.user_data.get("new_prod") or {}
+    unit = inventory_import.normalize_unit(np.get("unit"))
     pid = db.add_product(
         sid,
         name=np["name"],
         price=np["price"],
         stock=np["stock"],
         description=desc,
+        unit=unit,
     )
     context.user_data.pop("new_prod", None)
     clear_awaiting(context)
     await update.message.reply_text(
-        f"✅ Added *{np['name']}* (#{pid}) — {money(np['price'])}, stock {np['stock']}",
+        f"✅ Added *{np['name']}* (#{pid}) — {money(np['price'])} / {unit}, "
+        f"stock {np['stock']}",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("« Products", callback_data="adm_prods")],
                 [InlineKeyboardButton("« Admin", callback_data="admin")],
             ]
+        ),
+    )
+    return ConversationHandler.END
+
+
+async def cb_set_unit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok:
+        return ConversationHandler.END
+    pid = int(query.data.split(":")[1])
+    p = db.get_product(pid)
+    if not p or (sid is not None and int(p["chat_id"]) != int(sid)):
+        await query.answer("Product not in this shop", show_alert=True)
+        return ConversationHandler.END
+    context.user_data["edit_pid"] = pid
+    set_awaiting(context, "edit_unit")
+    cur = p.get("unit") or "vial"
+    await query.message.reply_text(
+        f"📏 *Unit for {p['name']}*\n\n"
+        f"Current: `{cur}`\n"
+        f"Send new unit (e.g. vial, bottle, pack, kit).\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Unit e.g. bottle"),
+    )
+    return EDIT_UNIT_VALUE
+
+
+async def edit_unit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return EDIT_UNIT_VALUE
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    pid = context.user_data.get("edit_pid")
+    p = db.get_product(int(pid)) if pid else None
+    if not p or int(p["chat_id"]) != int(sid):
+        clear_awaiting(context)
+        await update.message.reply_text("Product not found in this shop.")
+        return ConversationHandler.END
+    unit = inventory_import.normalize_unit(update.message.text or "")
+    db.update_product(int(pid), unit=unit)
+    clear_awaiting(context)
+    await update.message.reply_text(
+        f"✅ Unit set to `{unit}`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Product", callback_data=f"admp:{pid}")]]
         ),
     )
     return ConversationHandler.END
@@ -4647,7 +4888,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Pay using the instructions, then tap *I've paid*\n"
         "• Inventory only drops after an admin confirms payment\n\n"
         "*Admins* (`/admin`)\n"
-        "• Products: add, vial price, kit price, stock\n"
+        "• Products: add, price, unit, kit price, stock\n"
+        "• *Mass edit*: download/upload `.txt` to bulk update\n"
         "• Orders: confirm/reject payments\n"
         "• Payment methods, shipping, and *min order (vial/kit)*\n"
         "• Add other admins per shop\n\n"
@@ -4912,6 +5154,7 @@ def build_app(token: str | None = None) -> Application:
             CallbackQueryHandler(cb_set_price_start, pattern=r"^setprice:\d+$"),
             CallbackQueryHandler(cb_set_kit_price_start, pattern=r"^setkit:\d+$"),
             CallbackQueryHandler(cb_set_stock_start, pattern=r"^setstock:\d+$"),
+            CallbackQueryHandler(cb_set_unit_start, pattern=r"^setunit:\d+$"),
             CallbackQueryHandler(cb_set_name_start, pattern=r"^setname:\d+$"),
             CallbackQueryHandler(cb_set_coa_start, pattern=r"^setcoa:\d+$"),
             CallbackQueryHandler(cb_add_pay_start, pattern=r"^adm_addpay$"),
@@ -4925,6 +5168,7 @@ def build_app(token: str | None = None) -> Application:
             CallbackQueryHandler(cb_franchise_proof_start, pattern=r"^frproof:\d+$"),
             CallbackQueryHandler(cb_adm_rename_shop_start, pattern=r"^adm_rename_shop$"),
             CallbackQueryHandler(cb_adm_import_start, pattern=r"^adm_import$"),
+            CallbackQueryHandler(cb_mass_upload_start, pattern=r"^mass_up:(add_only|update_only|upsert)$"),
             CommandHandler("search", cmd_search),
         ],
         states={
@@ -4943,6 +5187,10 @@ def build_app(token: str | None = None) -> Application:
                 MessageHandler(filters.Document.ALL, on_import_inventory_document),
                 CallbackQueryHandler(cb_adm_import_template, pattern=r"^adm_import_tpl$"),
                 CallbackQueryHandler(cb_adm_import_start, pattern=r"^adm_import$"),
+            ],
+            MASS_EDIT_FILE: [
+                MessageHandler(filters.Document.ALL, on_mass_edit_document),
+                CallbackQueryHandler(cb_adm_massedit, pattern=r"^adm_massedit$"),
             ],
             CHECKOUT_NAME: [
                 CallbackQueryHandler(cb_pay_method, pattern=r"^paym:\d+$"),
@@ -4975,6 +5223,9 @@ def build_app(token: str | None = None) -> Application:
             ADD_PROD_STOCK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_prod_stock),
             ],
+            ADD_PROD_UNIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_prod_unit),
+            ],
             ADD_PROD_DESC: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_prod_desc),
             ],
@@ -4986,6 +5237,9 @@ def build_app(token: str | None = None) -> Application:
             ],
             EDIT_STOCK_VALUE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_stock_value),
+            ],
+            EDIT_UNIT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_unit_value),
             ],
             EDIT_NAME_VALUE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_name_value),
@@ -5032,6 +5286,7 @@ def build_app(token: str | None = None) -> Application:
             CallbackQueryHandler(cb_adm_transfer, pattern=r"^adm_transfer$"),
             CallbackQueryHandler(cb_adm_rename_shop_start, pattern=r"^adm_rename_shop$"),
             CallbackQueryHandler(cb_adm_import_start, pattern=r"^adm_import$"),
+            CallbackQueryHandler(cb_adm_massedit, pattern=r"^adm_massedit$"),
             CallbackQueryHandler(cb_master_home, pattern=r"^master_home$"),
             CallbackQueryHandler(cb_master_setfee, pattern=r"^master_setfee$"),
             CallbackQueryHandler(cb_master_ledger, pattern=r"^master_ledger$"),
@@ -5119,6 +5374,8 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_del_product, pattern=r"^delp:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_view_coa, pattern=r"^viewcoa:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_clear_coa, pattern=r"^clearcoa:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_massedit, pattern=r"^adm_massedit$"))
+    app.add_handler(CallbackQueryHandler(cb_mass_download, pattern=r"^mass_dl$"))
     app.add_handler(CallbackQueryHandler(cb_adm_orders, pattern=r"^adm_orders$"))
     app.add_handler(CallbackQueryHandler(cb_adm_awaiting, pattern=r"^adm_awaiting$"))
     app.add_handler(CallbackQueryHandler(cb_adm_reject, pattern=r"^admreject:\d+$"))

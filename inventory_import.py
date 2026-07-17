@@ -1,9 +1,10 @@
-"""Parse layout text files and create shop products (add-only)."""
+"""Parse layout text files and create/update shop products (import + mass edit)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Literal
 
 import db
 
@@ -12,16 +13,25 @@ MAX_FILE_BYTES = 200_000
 MAX_PRODUCT_LINES = 200
 MAX_NAME_LEN = 120
 MAX_DESC_LEN = 500
+MAX_UNIT_LEN = 20
+DEFAULT_UNIT = "vial"
 
-TEMPLATE_TEXT = """# UnicornFartzz inventory import
-# One product per line. Format:
-#   name | price | stock | description (optional)
+ImportMode = Literal["add_only", "update_only", "upsert"]
+
+TEMPLATE_TEXT = """# UnicornFartzz inventory import / mass edit
+# One product per line. Preferred format:
+#   name | price | stock | unit | description
 # Lines starting with # are ignored. Blank lines ignored.
 #
+# Units: vial, bottle, pack, kit, ea, etc. (default: vial)
+#
 # Examples:
-Tren Ace | 45.00 | 10 | acetate blend
-Test E | 30 | 5
-HCG 5000 | 55.00 | 0 | fridge item
+Tren Ace | 45.00 | 10 | vial | acetate blend
+Test E | 30 | 5 | bottle |
+HCG 5000 | 55.00 | 0 | kit | fridge item
+#
+# Legacy (still works): name | price | stock | description
+# (4 fields after name/price/stock treated as description, unit = vial)
 """
 
 
@@ -30,8 +40,11 @@ class ParsedRow:
     name: str
     price: float
     stock: int
+    unit: str = DEFAULT_UNIT
     description: str = ""
     line_no: int = 0
+    # True when file explicitly included a unit column (5+ fields)
+    unit_explicit: bool = False
 
 
 @dataclass
@@ -43,12 +56,17 @@ class ParseResult:
 @dataclass
 class ImportResult:
     created: list[str] = field(default_factory=list)
+    updated: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     @property
     def created_count(self) -> int:
         return len(self.created)
+
+    @property
+    def updated_count(self) -> int:
+        return len(self.updated)
 
     @property
     def skipped_count(self) -> int:
@@ -59,19 +77,31 @@ def _norm_name(name: str) -> str:
     return " ".join((name or "").strip().split()).casefold()
 
 
+def normalize_unit(unit: str | None, *, default: str = DEFAULT_UNIT) -> str:
+    """Sanitize product unit label (vial, bottle, pack, …)."""
+    u = " ".join(str(unit or "").strip().split())
+    if not u or u == "-":
+        return default
+    # No pipes/newlines in unit (file delimiters)
+    u = u.replace("|", "/").replace("\n", " ").replace("\r", " ")
+    if len(u) > MAX_UNIT_LEN:
+        u = u[:MAX_UNIT_LEN]
+    return u or default
+
+
 def parse_inventory_text(text: str) -> ParseResult:
     """
     Parse pipe-separated inventory layout.
 
-    Required: name | price | stock
-    Optional: | description
+    Preferred: name | price | stock | unit | description
+    Legacy:    name | price | stock
+               name | price | stock | description
     """
     result = ParseResult()
     if text is None:
         result.errors.append("Empty file.")
         return result
 
-    # Strip UTF-8 BOM
     if text.startswith("\ufeff"):
         text = text[1:]
 
@@ -89,7 +119,20 @@ def parse_inventory_text(text: str) -> ParseResult:
             continue
 
         name, price_s, stock_s = parts[0], parts[1], parts[2]
-        description = " | ".join(parts[3:]).strip() if len(parts) > 3 else ""
+        unit = DEFAULT_UNIT
+        description = ""
+        unit_explicit = False
+
+        if len(parts) == 3:
+            pass
+        elif len(parts) == 4:
+            # Legacy: 4th field is description (no unit column)
+            description = parts[3]
+        else:
+            # 5+: name | price | stock | unit | description…
+            unit_explicit = True
+            unit = normalize_unit(parts[3])
+            description = " | ".join(parts[4:]).strip()
 
         # Header row
         if name.casefold() == "name" and price_s.casefold() in ("price", "cost"):
@@ -135,8 +178,10 @@ def parse_inventory_text(text: str) -> ParseResult:
                 name=name,
                 price=price,
                 stock=stock,
+                unit=unit,
                 description=description,
                 line_no=line_no,
+                unit_explicit=unit_explicit,
             )
         )
 
@@ -150,14 +195,25 @@ def import_products(
     chat_id: int,
     rows: list[ParsedRow],
     *,
-    skip_existing: bool = True,
+    mode: ImportMode = "add_only",
+    skip_existing: bool | None = None,
 ) -> ImportResult:
     """
-    Create products for a shop (add-only).
+    Apply product rows to a shop.
 
-    When skip_existing is True (default), names that already exist in this shop
-    (case-insensitive) are skipped without changing price/stock.
+    Modes:
+      add_only    — create new names only; skip existing (legacy default)
+      update_only — update existing by name; skip unknown
+      upsert      — update if exists, else create
+
+    skip_existing=True forces add_only for backward compatibility.
     """
+    if skip_existing is True:
+        mode = "add_only"
+    elif skip_existing is False and mode == "add_only":
+        # Historical: skip_existing=False meant create even if exists → treat as upsert
+        mode = "upsert"
+
     out = ImportResult()
     if not rows:
         return out
@@ -166,7 +222,6 @@ def import_products(
         _norm_name(p["name"]): p
         for p in db.list_products(int(chat_id), active_only=False)
     }
-    # Also track names created in this batch so duplicate lines in one file skip
     batch_seen: set[str] = set()
 
     for row in rows:
@@ -177,32 +232,110 @@ def import_products(
         if key in batch_seen:
             out.skipped.append(row.name)
             continue
-        if skip_existing and key in existing:
-            out.skipped.append(row.name)
-            continue
+
+        unit = normalize_unit(row.unit)
+        found = existing.get(key)
+
         try:
-            pid = db.add_product(
-                int(chat_id),
-                name=row.name,
-                price=row.price,
-                stock=row.stock,
-                description=row.description or "",
-            )
-            out.created.append(row.name)
+            if found is None:
+                if mode == "update_only":
+                    out.skipped.append(row.name)
+                    batch_seen.add(key)
+                    continue
+                pid = db.add_product(
+                    int(chat_id),
+                    name=row.name,
+                    price=row.price,
+                    stock=row.stock,
+                    description=row.description or "",
+                    unit=unit,
+                )
+                out.created.append(row.name)
+                batch_seen.add(key)
+                existing[key] = {
+                    "id": pid,
+                    "name": row.name,
+                    "price": row.price,
+                    "stock": row.stock,
+                    "unit": unit,
+                    "description": row.description or "",
+                }
+                continue
+
+            # Exists
+            if mode == "add_only":
+                out.skipped.append(row.name)
+                batch_seen.add(key)
+                continue
+
+            pid = int(found["id"])
+            # On update: always set price/stock/description; unit if explicit or always
+            fields: dict[str, Any] = {
+                "price": float(row.price),
+                "stock": int(row.stock),
+                "description": row.description or "",
+                "unit": unit,
+            }
+            ok = db.update_product(pid, **fields)
+            if not ok:
+                out.errors.append(f"L{row.line_no}: failed to update {row.name}")
+                continue
+            out.updated.append(row.name)
             batch_seen.add(key)
-            existing[key] = {"id": pid, "name": row.name}
-        except Exception as exc:  # noqa: BLE001 — report per-row, keep going
-            out.errors.append(f"L{row.line_no}: failed to add {row.name}: {exc}")
+            existing[key] = {
+                **found,
+                **fields,
+                "id": pid,
+                "name": found.get("name") or row.name,
+            }
+        except Exception as exc:  # noqa: BLE001
+            out.errors.append(f"L{row.line_no}: failed {row.name}: {exc}")
 
     return out
 
 
-def import_from_text(chat_id: int, text: str) -> tuple[ParseResult, ImportResult]:
-    """Parse then import; returns both result objects."""
+def import_from_text(
+    chat_id: int,
+    text: str,
+    *,
+    mode: ImportMode = "add_only",
+) -> tuple[ParseResult, ImportResult]:
+    """Parse then apply with the given mode."""
     parsed = parse_inventory_text(text)
-    imported = import_products(int(chat_id), parsed.rows, skip_existing=True)
-    # Fold parse errors into import summary visibility (caller can use both)
+    imported = import_products(int(chat_id), parsed.rows, mode=mode)
     return parsed, imported
+
+
+def export_inventory_text(
+    chat_id: int,
+    *,
+    active_only: bool = False,
+    shop_title: str | None = None,
+) -> str:
+    """
+    Export shop catalog as mass-edit .txt (5-column format).
+    """
+    products = db.list_products(int(chat_id), active_only=active_only)
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    title = (shop_title or "shop").strip() or "shop"
+    lines = [
+        f"# Inventory export — {title}",
+        f"# Exported {day} UTC · shop_id={chat_id}",
+        "# Edit and re-upload via Admin → Mass edit",
+        "# Format: name | price | stock | unit | description",
+        "# Matching is by product name (case-insensitive).",
+        "",
+        "name | price | stock | unit | description",
+    ]
+    for p in products:
+        name = str(p.get("name") or "").replace("|", "/")
+        desc = str(p.get("description") or "").replace("\n", " ").replace("|", "/")
+        unit = normalize_unit(p.get("unit"))
+        price = float(p.get("price") or 0)
+        stock = int(p.get("stock") or 0)
+        lines.append(f"{name} | {price:.2f} | {stock} | {unit} | {desc}".rstrip())
+    lines.append("")
+    return "\n".join(lines)
 
 
 def decode_upload_bytes(data: bytes) -> str:
@@ -218,25 +351,41 @@ def decode_upload_bytes(data: bytes) -> str:
 
 
 def format_import_summary(
-    parsed: ParseResult, imported: ImportResult, *, max_list: int = 8
+    parsed: ParseResult,
+    imported: ImportResult,
+    *,
+    mode: ImportMode = "add_only",
+    max_list: int = 8,
 ) -> str:
-    """Human-readable Telegram reply (Markdown-safe enough with plain names)."""
+    """Human-readable Telegram reply."""
+    mode_label = {
+        "add_only": "Add new only",
+        "update_only": "Update existing",
+        "upsert": "Add + update",
+    }.get(mode, mode)
     lines = [
-        "📥 *Inventory import*",
+        "📥 *Inventory file applied*",
+        f"Mode: *{mode_label}*",
         f"Created: *{imported.created_count}*",
-        f"Skipped (already exist): *{imported.skipped_count}*",
-        f"Parse/line errors: *{len(parsed.errors) + len(imported.errors)}*",
+        f"Updated: *{imported.updated_count}*",
+        f"Skipped: *{imported.skipped_count}*",
+        f"Errors: *{len(parsed.errors) + len(imported.errors)}*",
     ]
-    if imported.created:
-        sample = ", ".join(imported.created[:max_list])
-        extra = len(imported.created) - max_list
-        lines.append(f"\n✅ Added: {sample}" + (f" (+{extra} more)" if extra > 0 else ""))
-    if imported.skipped:
-        sample = ", ".join(imported.skipped[:max_list])
-        extra = len(imported.skipped) - max_list
+
+    def _sample(label: str, names: list[str], emoji: str) -> None:
+        if not names:
+            return
+        sample = ", ".join(names[:max_list])
+        extra = len(names) - max_list
         lines.append(
-            f"\n⏭ Skipped: {sample}" + (f" (+{extra} more)" if extra > 0 else "")
+            f"\n{emoji} {label}: {sample}"
+            + (f" (+{extra} more)" if extra > 0 else "")
         )
+
+    _sample("Added", imported.created, "✅")
+    _sample("Updated", imported.updated, "🔄")
+    _sample("Skipped", imported.skipped, "⏭")
+
     all_errs = list(parsed.errors) + list(imported.errors)
     if all_errs:
         lines.append("\n⚠️ Errors:")
@@ -244,6 +393,12 @@ def format_import_summary(
             lines.append(f"• {e}")
         if len(all_errs) > 12:
             lines.append(f"• …and {len(all_errs) - 12} more")
-    if imported.created_count == 0 and imported.skipped_count == 0 and all_errs:
-        lines.insert(1, "_Nothing was created._")
+
+    if (
+        imported.created_count == 0
+        and imported.updated_count == 0
+        and imported.skipped_count == 0
+        and all_errs
+    ):
+        lines.insert(1, "_Nothing changed._")
     return "\n".join(lines)
