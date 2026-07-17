@@ -10,3 +10,7 @@ bot.log
 bot.log.*
 .bot.pid
 .pytest_cache/
+backups/
+*.enc
+token_state.json
+*.pre_restore_*

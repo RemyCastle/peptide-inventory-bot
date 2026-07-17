@@ -35,11 +35,29 @@ from telegram.ext import (
     filters,
 )
 
+import backup as backup_mod
 import db
+import inventory_import
 import payment_templates as pt
 import reports
 import setup_wizard
-from config import BRAND_NAME, CURRENCY_SYMBOL, LOG_PATH, OWNER_IDS, TELEGRAM_BOT_TOKEN
+import token_pool
+from config import (
+    ACTIVE_BOT_INDEX,
+    BACKUP_DIR,
+    BACKUP_PASSPHRASE,
+    BACKUP_RETENTION_DAYS,
+    BRAND_NAME,
+    CURRENCY_SYMBOL,
+    DB_PATH,
+    LOG_PATH,
+    OWNER_IDS,
+    PUBLIC_BOT_USERNAME,
+    RECOVERY_URL,
+    TOKEN_FAILOVER,
+    TOKEN_STATE_PATH,
+    resolve_bot_tokens,
+)
 
 log = logging.getLogger("inventory_bot")
 
@@ -103,7 +121,9 @@ def symbol_for(chat_id: int | None) -> str:
     EDIT_COA_VALUE,
     MASTER_FEE_INPUT,
     FRANCHISE_PROOF,
-) = range(23)
+    EDIT_SHOP_TITLE,
+    IMPORT_INVENTORY_FILE,
+) = range(25)
 
 # How long a pending admin/buyer prompt stays open (seconds)
 AWAITING_TTL_SEC = 600
@@ -292,8 +312,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if arg0.startswith("shop_"):
             try:
                 sid = int(arg0.removeprefix("shop_"))
-                shop = db.get_shop(sid) or db.ensure_shop(sid)
-                set_shop(context, sid)
+                # Follow transfer aliases so old links still open the moved shop
+                resolved = db.resolve_shop_chat_id(sid)
+                shop = db.get_shop(resolved) or db.ensure_shop(resolved)
+                set_shop(context, resolved)
                 await _show_main(update, context, shop)
                 return
             except ValueError:
@@ -381,6 +403,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"2. Send this command *in that group*:\n"
                 f"`/claim_clone {token}`\n\n"
                 "That group gets separate prices + shared inventory with the master stock.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        if arg0.startswith("transfer_"):
+            token = arg0.removeprefix("transfer_")
+            inv = db.get_transfer_token(token)
+            if not inv or inv["status"] != "pending":
+                await update.message.reply_text("Transfer link not found or already used.")
+                return
+            context.user_data["pending_transfer_token"] = token
+            src = db.get_shop(int(inv["source_chat_id"]))
+            src_title = (src or {}).get("title") or str(inv["source_chat_id"])
+            await update.message.reply_text(
+                "🚚 *Move shop to another group*\n\n"
+                f"Shop: *{src_title}* (`{inv['source_chat_id']}`)\n\n"
+                "This *moves* the whole shop (catalog, stock, orders, payments) — "
+                "it does *not* clone it.\n\n"
+                "1. Add this bot to the *destination* Telegram group\n"
+                "2. In that group send:\n"
+                f"`/claim_transfer {token}`\n\n"
+                "Only a shop admin can claim. Destination group must be empty "
+                "(no existing products/orders).",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
@@ -1745,6 +1789,9 @@ async def _admin_home(
                 InlineKeyboardButton("➕ Add product", callback_data="adm_addprod"),
             ],
             [
+                InlineKeyboardButton("📥 Import inventory", callback_data="adm_import"),
+            ],
+            [
                 InlineKeyboardButton("📋 Orders", callback_data="adm_orders"),
                 InlineKeyboardButton("⏳ Needs confirm", callback_data="adm_awaiting"),
             ],
@@ -1761,6 +1808,10 @@ async def _admin_home(
             ],
             [
                 InlineKeyboardButton("🤝 Collaborations", callback_data="adm_collab"),
+            ],
+            [
+                InlineKeyboardButton("✏️ Rename shop", callback_data="adm_rename_shop"),
+                InlineKeyboardButton("🚚 Move to group", callback_data="adm_transfer"),
             ],
             [
                 InlineKeyboardButton("📋 Clone shop", callback_data="adm_clone"),
@@ -1802,6 +1853,99 @@ async def cb_adm_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🔗 *Customer shop link*\n\n`{link}`\n\nShare this so buyers open the right catalog.",
         back_main_kb([[InlineKeyboardButton("« Admin", callback_data="admin")]]),
     )
+
+
+async def cb_adm_rename_shop_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Shop admin: rename this shop's display title."""
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await safe_edit(query, "Admin only.", back_main_kb())
+        return ConversationHandler.END
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    set_awaiting(context, "edit_shop_title")
+    await query.message.reply_text(
+        f"✏️ *Rename shop*\n\nCurrent name: *{shop['title']}*\n\n"
+        "Send the new shop name (max 80 characters).\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("New shop name..."),
+    )
+    return EDIT_SHOP_TITLE
+
+
+async def edit_shop_title_value(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await accept_prompt_message(update, context):
+        return EDIT_SHOP_TITLE
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    raw = update.message.text or ""
+    success, result = db.rename_shop(
+        int(sid), raw, by_user=update.effective_user.id if update.effective_user else None
+    )
+    if not success:
+        await update.message.reply_text(result)
+        return EDIT_SHOP_TITLE
+    clear_awaiting(context)
+    await update.message.reply_text(
+        f"✅ Shop renamed to *{result}*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Admin", callback_data="admin")]]
+        ),
+    )
+    return ConversationHandler.END
+
+
+async def cb_adm_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin-only: create a one-time token to move this shop into another group."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        sid, ok = _require_admin(update, context)
+        if not ok or sid is None:
+            await safe_edit(
+                query,
+                "Admin only, or no shop selected. Send /start and open Admin again.",
+                back_main_kb(),
+            )
+            return ConversationHandler.END
+        try:
+            tok = db.create_transfer_token(sid, update.effective_user.id)
+        except PermissionError:
+            await safe_edit(query, "Admin only.", back_main_kb())
+            return ConversationHandler.END
+        me = await context.bot.get_me()
+        link = f"https://t.me/{me.username}?start={tok['deep_link_arg']}"
+        shop = db.get_shop(sid)
+        title = (shop or {}).get("title") or "Shop"
+        await safe_edit(
+            query,
+            f"🚚 *Move shop to another group*\n\n"
+            f"Shop: *{title}* (`{sid}`)\n\n"
+            "Moves *everything* (catalog, stock, orders, payments, admins) "
+            "to a new group. Old customer links keep working.\n\n"
+            "This is *not* a clone — the shop leaves the old chat.\n\n"
+            f"1. Add this bot to the destination group\n"
+            f"2. Open this link (you):\n{link}\n"
+            f"3. In the destination group send:\n"
+            f"`/claim_transfer {tok['token']}`\n\n"
+            "Destination must not already have products/orders.\n"
+            "Any previous unused transfer token for this shop is cancelled.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Admin", callback_data="admin")]]
+            ),
+        )
+    except Exception as exc:
+        log.exception("cb_adm_transfer failed")
+        await safe_edit(query, f"Transfer setup failed: {exc}", back_main_kb())
+    return ConversationHandler.END
 
 
 async def cb_adm_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1876,6 +2020,48 @@ async def cmd_claim_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     if ok:
         set_shop(context, chat.id)
+
+
+async def cmd_claim_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """In destination group: /claim_transfer <token> — move shop here."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text(
+            "Run /claim_transfer *inside the destination group* "
+            "where you want this shop to live.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/claim_transfer <token>`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    token = context.args[0].strip()
+    title = chat.title or None
+    ok, msg, new_id = db.transfer_shop_to_group(
+        token, chat.id, user.id, title=title
+    )
+    await update.message.reply_text(
+        ("✅ " if ok else "❌ ") + msg,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    if ok and new_id is not None:
+        set_shop(context, new_id)
+        me = await context.bot.get_me()
+        link = f"https://t.me/{me.username}?start=shop_{new_id}"
+        await update.message.reply_text(
+            f"🔗 New customer shop link:\n`{link}`\n\n"
+            "Share this with buyers. Old links still work via redirect.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]]
+            ),
+        )
 
 
 async def cmd_master(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2463,6 +2649,135 @@ async def cb_export_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # Products admin
 
 
+async def cb_adm_import_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Admin: wait for a .txt inventory layout document."""
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await safe_edit(query, "Admin only.", back_main_kb())
+        return ConversationHandler.END
+    set_awaiting(context, "import_inventory")
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📄 Download template", callback_data="adm_import_tpl")],
+            [InlineKeyboardButton("« Products", callback_data="adm_prods")],
+            [InlineKeyboardButton("« Admin", callback_data="admin")],
+        ]
+    )
+    await safe_edit(
+        query,
+        "📥 *Import inventory*\n\n"
+        "Send a *`.txt` document* with one product per line:\n"
+        "`name | price | stock | description`\n\n"
+        "Example:\n"
+        "`Tren Ace | 45.00 | 10 | acetate`\n"
+        "`Test E | 30 | 5`\n\n"
+        "• Lines starting with `#` are ignored\n"
+        "• Existing product names are *skipped* (not updated)\n"
+        "• Nothing is deleted\n\n"
+        "Upload the file now, or download the template first.\n"
+        "/cancel to abort",
+        kb,
+    )
+    return IMPORT_INVENTORY_FILE
+
+
+async def cb_adm_import_template(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Send a downloadable template; stay in import conversation."""
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return ConversationHandler.END
+    set_awaiting(context, "import_inventory")
+    buf = io.BytesIO(inventory_import.TEMPLATE_TEXT.encode("utf-8"))
+    buf.name = "inventory_import_template.txt"
+    await query.message.reply_document(
+        document=buf,
+        filename="inventory_import_template.txt",
+        caption=(
+            "Template ready. Edit in Notepad, then send the file back here "
+            "(name | price | stock | description)."
+        ),
+    )
+    return IMPORT_INVENTORY_FILE
+
+
+async def on_import_inventory_document(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Receive .txt upload, parse, create products (add-only)."""
+    if not await accept_prompt_message(update, context):
+        return IMPORT_INVENTORY_FILE
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    msg = update.message
+    if not msg or not msg.document:
+        if msg:
+            await msg.reply_text(
+                "Please send a `.txt` *document* (not a photo).",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        return IMPORT_INVENTORY_FILE
+
+    doc = msg.document
+    fname = (doc.file_name or "").lower()
+    mime = (doc.mime_type or "").lower()
+    ok_type = (
+        fname.endswith(".txt")
+        or fname.endswith(".csv")
+        or mime.startswith("text/")
+        or mime in ("application/octet-stream", "")
+    )
+    if not ok_type:
+        await msg.reply_text(
+            "Please upload a plain text file (`.txt`).\n"
+            f"Got: `{doc.file_name or 'unknown'}` ({doc.mime_type or 'no type'})",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return IMPORT_INVENTORY_FILE
+    if doc.file_size and doc.file_size > inventory_import.MAX_FILE_BYTES:
+        await msg.reply_text(
+            f"File too large (max {inventory_import.MAX_FILE_BYTES // 1000} KB)."
+        )
+        return IMPORT_INVENTORY_FILE
+
+    try:
+        tg_file = await doc.get_file()
+        data = bytes(await tg_file.download_as_bytearray())
+        text = inventory_import.decode_upload_bytes(data)
+    except ValueError as exc:
+        await msg.reply_text(str(exc))
+        return IMPORT_INVENTORY_FILE
+    except Exception as exc:
+        log.exception("import download failed")
+        await msg.reply_text(f"Could not read file: {exc}")
+        return IMPORT_INVENTORY_FILE
+
+    parsed, imported = inventory_import.import_from_text(int(sid), text)
+    clear_awaiting(context)
+    summary = inventory_import.format_import_summary(parsed, imported)
+    await msg.reply_text(
+        summary,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📦 Products", callback_data="adm_prods")],
+                [InlineKeyboardButton("📥 Import again", callback_data="adm_import")],
+                [InlineKeyboardButton("« Admin", callback_data="admin")],
+            ]
+        ),
+    )
+    return ConversationHandler.END
+
+
 async def cb_adm_prods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -2477,6 +2792,7 @@ async def cb_adm_prods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("➕ Add product", callback_data="adm_addprod")],
+                    [InlineKeyboardButton("📥 Import inventory", callback_data="adm_import")],
                     [InlineKeyboardButton("« Admin", callback_data="admin")],
                 ]
             ),
@@ -2495,9 +2811,10 @@ async def cb_adm_prods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     buttons.append(
         [
             InlineKeyboardButton("➕ Add", callback_data="adm_addprod"),
-            InlineKeyboardButton("« Admin", callback_data="admin"),
+            InlineKeyboardButton("📥 Import", callback_data="adm_import"),
         ]
     )
+    buttons.append([InlineKeyboardButton("« Admin", callback_data="admin")])
     await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
 
 
@@ -3215,6 +3532,8 @@ async def tracking_input_value(update: Update, context: ContextTypes.DEFAULT_TYP
             [[InlineKeyboardButton("« Orders", callback_data="adm_orders")]]
         ),
     )
+    if ok:
+        _schedule_paid_backup()
     if ok and order:
         # Franchisee: local admins only until remittance proof is sent to main
         is_fr = _is_franchisee_order(order)
@@ -3984,29 +4303,127 @@ async def _notify_low_stock(
             pass
 
 
+def _schedule_paid_backup() -> None:
+    """Encrypt live DB after stock-changing paid confirm (best-effort)."""
+    try:
+        path = backup_mod.maybe_backup_after_event(DB_PATH, reason="paid_confirm")
+        if path:
+            log.info("Post-paid backup ok: %s", path)
+    except Exception as exc:
+        log.exception("Post-paid backup error: %s", exc)
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: write encrypted snapshot now."""
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        if update.message:
+            await update.message.reply_text("Owners only.")
+        return
+    if not BACKUP_PASSPHRASE:
+        await update.message.reply_text(
+            "BACKUP_PASSPHRASE is not set on the host.\n"
+            "Set it in env, then /backup again.\n"
+            f"Vault dir: `{BACKUP_DIR}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    try:
+        path = backup_mod.create_encrypted_backup(
+            DB_PATH,
+            BACKUP_DIR,
+            BACKUP_PASSPHRASE,
+            reason="manual",
+        )
+        pruned = backup_mod.prune_old_backups(BACKUP_DIR, BACKUP_RETENTION_DAYS)
+        await update.message.reply_text(
+            f"✅ Encrypted backup written.\n"
+            f"File: `{path.name}`\n"
+            f"Also updated: `latest.enc`\n"
+            f"Dir: `{BACKUP_DIR}`\n"
+            f"Retention: {BACKUP_RETENTION_DAYS} days (pruned {pruned} old file(s)).\n\n"
+            f"Copy `latest.enc` to your laptop vault regularly.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as exc:
+        log.exception("Manual backup failed: %s", exc)
+        await update.message.reply_text(f"Backup failed: {exc}")
+
+
+async def cmd_backup_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: list recent vault files + token pool info."""
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        if update.message:
+            await update.message.reply_text("Owners only.")
+        return
+    files = backup_mod.list_backups(BACKUP_DIR)[:12]
+    lines = [
+        "*Backup / standby status*",
+        f"Vault: `{BACKUP_DIR}`",
+        f"Passphrase set: {'yes' if BACKUP_PASSPHRASE else 'NO'}",
+        f"Retention days: {BACKUP_RETENTION_DAYS}",
+        f"Failover: {'on' if TOKEN_FAILOVER else 'off'}",
+    ]
+    tokens = resolve_bot_tokens()
+    lines.append(f"Token pool size: {len(tokens)}")
+    if PUBLIC_BOT_USERNAME:
+        lines.append(f"Public bot: @{PUBLIC_BOT_USERNAME}")
+    if RECOVERY_URL:
+        lines.append(f"Recovery URL: {RECOVERY_URL}")
+    if files:
+        lines.append("\n*Recent snapshots:*")
+        for p in files:
+            try:
+                sz = p.stat().st_size
+                lines.append(f"• `{p.name}` ({sz} bytes)")
+            except OSError:
+                lines.append(f"• `{p.name}`")
+    else:
+        lines.append("\n_No `.enc` files in vault yet._")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
 async def post_init(app: Application) -> None:
-    await app.bot.set_my_commands(
-        [
-            BotCommand("start", "Open shop menu"),
-            BotCommand("catalog", "Browse products"),
-            BotCommand("search", "Search products"),
-            BotCommand("cart", "View cart"),
-            BotCommand("myorders", "Your order history"),
-            BotCommand("orders", "Orders (admin shop / your orders)"),
-            BotCommand("admin", "Admin panel"),
-            BotCommand("setup", "Guided shop setup (group admins)"),
-            BotCommand("claim_clone", "Attach cloned shop to this group"),
-            BotCommand("master", "Master fees/invoices (owner only)"),
-            BotCommand("help", "Help"),
-            BotCommand("cancel", "Cancel current step"),
-        ]
-    )
+    cmds = [
+        BotCommand("start", "Open shop menu"),
+        BotCommand("catalog", "Browse products"),
+        BotCommand("search", "Search products"),
+        BotCommand("cart", "View cart"),
+        BotCommand("myorders", "Your order history"),
+        BotCommand("orders", "Orders (admin shop / your orders)"),
+        BotCommand("admin", "Admin panel"),
+        BotCommand("setup", "Guided shop setup (group admins)"),
+        BotCommand("claim_clone", "Attach cloned shop to this group"),
+        BotCommand("claim_transfer", "Move shop into this group"),
+        BotCommand("master", "Master fees/invoices (owner only)"),
+        BotCommand("backup", "Encrypted DB snapshot (owner)"),
+        BotCommand("backup_status", "Vault + token pool (owner)"),
+        BotCommand("help", "Help"),
+        BotCommand("cancel", "Cancel current step"),
+    ]
+    await app.bot.set_my_commands(cmds)
 
 
-def build_app() -> Application:
-    if not TELEGRAM_BOT_TOKEN:
-        print("ERROR: Set TELEGRAM_BOT_TOKEN in .env")
-        sys.exit(1)
+def build_app(token: str | None = None) -> Application:
+    """Build PTB application for a specific bot token (standby pool aware)."""
+    tokens = resolve_bot_tokens()
+    use_token = (token or "").strip()
+    if not use_token:
+        if not tokens:
+            raise SystemExit(
+                "No bot token configured. Set TELEGRAM_BOT_TOKEN or BOT_TOKENS."
+            )
+        idx = token_pool.resolve_active_index(
+            tokens, ACTIVE_BOT_INDEX, TOKEN_STATE_PATH
+        )
+        use_token = tokens[idx]
+        log.info(
+            "Using token pool index=%s fingerprint=%s pool_size=%s",
+            idx,
+            token_pool.token_fingerprint(use_token),
+            len(tokens),
+        )
 
     db.init_db()
     version = db.get_schema_version()
@@ -4018,10 +4435,12 @@ def build_app() -> Application:
 
     app = (
         Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
+        .token(use_token)
         .post_init(post_init)
         .build()
     )
+    app.bot_data["bot_token"] = use_token
+    app.bot_data["token_fingerprint"] = token_pool.token_fingerprint(use_token)
 
     # Conversations (admin + checkout)
     conv = ConversationHandler(
@@ -4043,6 +4462,8 @@ def build_app() -> Application:
             CallbackQueryHandler(cb_search, pattern=r"^search$"),
             CallbackQueryHandler(cb_master_feeshop, pattern=r"^master_feeshop:-?\d+$"),
             CallbackQueryHandler(cb_franchise_proof_start, pattern=r"^frproof:\d+$"),
+            CallbackQueryHandler(cb_adm_rename_shop_start, pattern=r"^adm_rename_shop$"),
+            CallbackQueryHandler(cb_adm_import_start, pattern=r"^adm_import$"),
             CommandHandler("search", cmd_search),
         ],
         states={
@@ -4053,6 +4474,14 @@ def build_app() -> Application:
                 MessageHandler(filters.PHOTO, franchise_proof_message),
                 MessageHandler(filters.Document.ALL, franchise_proof_message),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, franchise_proof_message),
+            ],
+            EDIT_SHOP_TITLE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_shop_title_value),
+            ],
+            IMPORT_INVENTORY_FILE: [
+                MessageHandler(filters.Document.ALL, on_import_inventory_document),
+                CallbackQueryHandler(cb_adm_import_template, pattern=r"^adm_import_tpl$"),
+                CallbackQueryHandler(cb_adm_import_start, pattern=r"^adm_import$"),
             ],
             CHECKOUT_NAME: [
                 CallbackQueryHandler(cb_pay_method, pattern=r"^paym:\d+$"),
@@ -4133,6 +4562,9 @@ def build_app() -> Application:
             # Admin nav must work even if a prior prompt left the user mid-conversation
             CallbackQueryHandler(cb_adm_collab, pattern=r"^adm_collab$"),
             CallbackQueryHandler(cb_adm_clone, pattern=r"^adm_clone$"),
+            CallbackQueryHandler(cb_adm_transfer, pattern=r"^adm_transfer$"),
+            CallbackQueryHandler(cb_adm_rename_shop_start, pattern=r"^adm_rename_shop$"),
+            CallbackQueryHandler(cb_adm_import_start, pattern=r"^adm_import$"),
             CallbackQueryHandler(cb_master_home, pattern=r"^master_home$"),
             CallbackQueryHandler(cb_master_setfee, pattern=r"^master_setfee$"),
             CallbackQueryHandler(cb_master_ledger, pattern=r"^master_ledger$"),
@@ -4164,6 +4596,7 @@ def build_app() -> Application:
     CONV = 1
     app.add_handler(CallbackQueryHandler(cb_adm_collab, pattern=r"^adm_collab$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_adm_clone, pattern=r"^adm_clone$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_adm_transfer, pattern=r"^adm_transfer$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_franchise_proof_start, pattern=r"^frproof:\d+$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_master_home, pattern=r"^master_home$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_master_setfee, pattern=r"^master_setfee$"), group=NAV)
@@ -4190,7 +4623,10 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("claim_clone", cmd_claim_clone))
+    app.add_handler(CommandHandler("claim_transfer", cmd_claim_transfer))
     app.add_handler(CommandHandler("master", cmd_master))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("backup_status", cmd_backup_status))
 
     app.add_handler(CallbackQueryHandler(cb_pickshop, pattern=r"^pickshop:-?\d+$"))
     app.add_handler(CallbackQueryHandler(cb_main, pattern=r"^main$"))
@@ -4228,6 +4664,24 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_adm_export, pattern=r"^adm_export$"))
     app.add_handler(CallbackQueryHandler(cb_export_report, pattern=r"^export:(inv|pending|both)$"))
 
+    async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        err = context.error
+        if err is None:
+            return
+        log.error("Handler error: %s", err, exc_info=err)
+        if TOKEN_FAILOVER and token_pool.is_fatal_token_error(err):
+            log.critical(
+                "Fatal token error (%s) — stopping for failover",
+                type(err).__name__,
+            )
+            context.application.bot_data["token_dead"] = True
+            context.application.bot_data["token_dead_reason"] = str(err)
+            try:
+                context.application.stop_running()
+            except Exception:
+                pass
+
+    app.add_error_handler(_on_error)
     return app
 
 
@@ -4239,9 +4693,89 @@ def main() -> None:
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
-    app = build_app()
-    log.info("%s starting… owners=%s log=%s", BRAND_NAME, sorted(OWNER_IDS), LOG_PATH)
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    tokens = resolve_bot_tokens()
+    if not tokens:
+        print("ERROR: Set TELEGRAM_BOT_TOKEN or BOT_TOKENS in .env")
+        sys.exit(1)
+
+    start_idx = token_pool.resolve_active_index(
+        tokens, ACTIVE_BOT_INDEX, TOKEN_STATE_PATH
+    )
+    attempts = len(tokens) if TOKEN_FAILOVER else 1
+    idx = start_idx
+    tried: set[int] = set()
+
+    for _attempt in range(attempts):
+        if idx in tried and len(tried) >= len(tokens):
+            break
+        tried.add(idx)
+        token = tokens[idx]
+        fp = token_pool.token_fingerprint(token)
+        st = token_pool.load_state(TOKEN_STATE_PATH)
+        token_pool.save_state(
+            TOKEN_STATE_PATH,
+            {
+                "active_index": idx,
+                "dead_tokens": st.get("dead_tokens") or [],
+            },
+        )
+        log.info(
+            "%s starting… token_index=%s fp=%s owners=%s log=%s failover=%s",
+            BRAND_NAME,
+            idx,
+            fp,
+            sorted(OWNER_IDS),
+            LOG_PATH,
+            TOKEN_FAILOVER,
+        )
+        if BACKUP_PASSPHRASE:
+            log.info(
+                "Encrypted backups enabled dir=%s retention_days=%s",
+                BACKUP_DIR,
+                BACKUP_RETENTION_DAYS,
+            )
+        else:
+            log.warning(
+                "BACKUP_PASSPHRASE not set — paid-confirm vault snapshots disabled"
+            )
+
+        try:
+            app = build_app(token)
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES, drop_pending_updates=True
+            )
+            if app.bot_data.get("token_dead"):
+                reason = app.bot_data.get("token_dead_reason", "unknown")
+                log.critical("Token marked dead during run (%s): %s", fp, reason)
+                if not TOKEN_FAILOVER or len(tokens) < 2:
+                    raise SystemExit(
+                        f"Bot token unusable and no standby: {reason}"
+                    )
+                idx = token_pool.mark_token_dead(
+                    TOKEN_STATE_PATH, token, tokens, idx
+                )
+                log.warning("Failing over to token index %s", idx)
+                continue
+            log.info("Polling stopped cleanly for token %s", fp)
+            return
+        except SystemExit:
+            raise
+        except Exception as exc:
+            # InvalidToken often raised at startup before / during init
+            if (
+                TOKEN_FAILOVER
+                and token_pool.is_fatal_token_error(exc)
+                and len(tokens) > 1
+            ):
+                log.critical("Startup token error (%s): %s", fp, exc)
+                idx = token_pool.mark_token_dead(
+                    TOKEN_STATE_PATH, token, tokens, idx
+                )
+                log.warning("Failing over to token index %s", idx)
+                continue
+            raise
+
+    raise SystemExit("All BOT_TOKENS failed or failover disabled")
 
 
 if __name__ == "__main__":

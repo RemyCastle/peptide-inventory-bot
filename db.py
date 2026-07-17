@@ -262,6 +262,12 @@ def init_db() -> None:
     except Exception:
         pass
 
+    # Shop rename/transfer tokens + deep-link aliases
+    try:
+        ensure_shop_transfer_tables()
+    except Exception:
+        pass
+
 
 def shop_display(shop: dict | None) -> dict[str, Any]:
     """Resolved branding for a shop with instance-level fallbacks."""
@@ -350,6 +356,378 @@ def update_shop(chat_id: int, **fields: Any) -> None:
     vals.append(chat_id)
     with get_db() as conn:
         conn.execute(f"UPDATE shops SET {', '.join(cols)} WHERE chat_id = ?", vals)
+
+
+def rename_shop(
+    chat_id: int, new_title: str, *, by_user: int | None = None, max_len: int = 80
+) -> tuple[bool, str]:
+    """
+    Rename a shop (display title). Shop admins / global owners only when by_user set.
+    Returns (ok, message_or_title).
+    """
+    if by_user is not None and not is_admin(chat_id, by_user):
+        return False, "Admin only."
+    title = (new_title or "").strip()
+    # Strip accidental newlines / markdown bombs
+    title = " ".join(title.split())
+    if not title:
+        return False, "Title cannot be empty."
+    if len(title) > max_len:
+        return False, f"Title too long (max {max_len} characters)."
+    shop = get_shop(chat_id)
+    if not shop:
+        return False, "Shop not found."
+    update_shop(chat_id, title=title)
+    return True, title
+
+
+def ensure_shop_transfer_tables() -> None:
+    """Transfer tokens + deep-link aliases after a shop moves groups."""
+    with get_db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS shop_transfer_tokens (
+                token           TEXT PRIMARY KEY,
+                source_chat_id  INTEGER NOT NULL,
+                created_by      INTEGER NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                target_chat_id  INTEGER,
+                created_at      TEXT NOT NULL,
+                used_at         TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS shop_aliases (
+                old_chat_id     INTEGER PRIMARY KEY,
+                current_chat_id INTEGER NOT NULL,
+                transferred_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_shop_aliases_current
+                ON shop_aliases(current_chat_id);
+            CREATE INDEX IF NOT EXISTS idx_transfer_tokens_source
+                ON shop_transfer_tokens(source_chat_id, status);
+            """
+        )
+
+
+def resolve_shop_chat_id(chat_id: int) -> int:
+    """Follow transfer aliases so old deep links (shop_<old_id>) still resolve."""
+    ensure_shop_transfer_tables()
+    current = int(chat_id)
+    seen: set[int] = set()
+    with get_db() as conn:
+        while current not in seen:
+            seen.add(current)
+            row = conn.execute(
+                "SELECT current_chat_id FROM shop_aliases WHERE old_chat_id = ?",
+                (current,),
+            ).fetchone()
+            if not row:
+                break
+            current = int(row["current_chat_id"])
+    return current
+
+
+def get_shop_resolved(chat_id: int) -> Optional[dict]:
+    """get_shop with alias follow (for deep links after transfer)."""
+    return get_shop(resolve_shop_chat_id(chat_id))
+
+
+def create_transfer_token(source_chat_id: int, created_by: int) -> dict:
+    """Shop admin creates a one-time token to move this shop into another group."""
+    ensure_shop_transfer_tables()
+    if not is_admin(source_chat_id, created_by):
+        raise PermissionError("Admin only")
+    if not get_shop(source_chat_id):
+        raise ValueError("Shop not found")
+    import secrets
+    import string
+
+    alphabet = string.ascii_uppercase + string.digits
+    token = "TR" + "".join(secrets.choice(alphabet) for _ in range(10))
+    now = _utc_now()
+    with get_db() as conn:
+        # Invalidate previous pending transfers for this shop
+        conn.execute(
+            """
+            UPDATE shop_transfer_tokens
+            SET status = 'cancelled'
+            WHERE source_chat_id = ? AND status = 'pending'
+            """,
+            (int(source_chat_id),),
+        )
+        conn.execute(
+            """
+            INSERT INTO shop_transfer_tokens
+              (token, source_chat_id, created_by, status, created_at)
+            VALUES (?, ?, ?, 'pending', ?)
+            """,
+            (token, int(source_chat_id), int(created_by), now),
+        )
+    return {
+        "token": token,
+        "source_chat_id": int(source_chat_id),
+        "deep_link_arg": f"transfer_{token}",
+    }
+
+
+def get_transfer_token(token: str) -> Optional[dict]:
+    ensure_shop_transfer_tables()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM shop_transfer_tokens WHERE token = ?",
+            (token.strip(),),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _shop_is_empty(conn: sqlite3.Connection, chat_id: int) -> bool:
+    """True if shop has no catalog/order history worth keeping."""
+    for table, col in (
+        ("products", "chat_id"),
+        ("orders", "chat_id"),
+        ("payment_methods", "chat_id"),
+    ):
+        if not _table_exists(conn, table):
+            continue
+        n = conn.execute(
+            f"SELECT COUNT(*) AS c FROM {table} WHERE {col} = ?",
+            (int(chat_id),),
+        ).fetchone()["c"]
+        if int(n) > 0:
+            return False
+    return True
+
+
+def _delete_empty_shop(conn: sqlite3.Connection, chat_id: int) -> None:
+    """Remove an empty placeholder shop (and its admins) so PK remapping can use the id."""
+    cid = int(chat_id)
+    if _table_exists(conn, "admins"):
+        conn.execute("DELETE FROM admins WHERE chat_id = ?", (cid,))
+    if _table_exists(conn, "stock_audit"):
+        conn.execute("DELETE FROM stock_audit WHERE chat_id = ?", (cid,))
+    conn.execute("DELETE FROM shops WHERE chat_id = ?", (cid,))
+
+
+def _remap_chat_id_columns(conn: sqlite3.Connection, old_id: int, new_id: int) -> None:
+    """Rewrite every known chat_id reference from old_id → new_id (FK-safe order)."""
+    old_id, new_id = int(old_id), int(new_id)
+
+    # Child tables keyed by chat_id
+    simple: list[tuple[str, str]] = [
+        ("admins", "chat_id"),
+        ("products", "chat_id"),
+        ("payment_methods", "chat_id"),
+        ("orders", "chat_id"),
+        ("stock_audit", "chat_id"),
+    ]
+    for table, col in simple:
+        if _table_exists(conn, table):
+            conn.execute(
+                f"UPDATE {table} SET {col} = ? WHERE {col} = ?",
+                (new_id, old_id),
+            )
+
+    # order_items.owner_chat_id (collab multi-shop lines)
+    if _table_exists(conn, "order_items") and "owner_chat_id" in _table_columns(
+        conn, "order_items"
+    ):
+        conn.execute(
+            "UPDATE order_items SET owner_chat_id = ? WHERE owner_chat_id = ?",
+            (new_id, old_id),
+        )
+
+    # Collab
+    for table, cols in (
+        ("shop_invites", ("host_chat_id", "guest_chat_id")),
+        ("shop_shares", ("host_chat_id", "guest_chat_id")),
+        ("order_settlements", ("host_chat_id", "guest_chat_id")),
+    ):
+        if not _table_exists(conn, table):
+            continue
+        for col in cols:
+            if col in _table_columns(conn, table):
+                conn.execute(
+                    f"UPDATE {table} SET {col} = ? WHERE {col} = ?",
+                    (new_id, old_id),
+                )
+
+    # Franchise / fees
+    if _table_exists(conn, "service_fee_invoices"):
+        conn.execute(
+            "UPDATE service_fee_invoices SET chat_id = ? WHERE chat_id = ?",
+            (new_id, old_id),
+        )
+    if _table_exists(conn, "shop_clone_tokens"):
+        for col in ("source_chat_id", "target_chat_id"):
+            if col in _table_columns(conn, "shop_clone_tokens"):
+                conn.execute(
+                    f"UPDATE shop_clone_tokens SET {col} = ? WHERE {col} = ?",
+                    (new_id, old_id),
+                )
+
+    # Other shops that point at this shop as master/source
+    if "inventory_master_chat_id" in _table_columns(conn, "shops"):
+        conn.execute(
+            "UPDATE shops SET inventory_master_chat_id = ? WHERE inventory_master_chat_id = ?",
+            (new_id, old_id),
+        )
+    if "clone_of_chat_id" in _table_columns(conn, "shops"):
+        conn.execute(
+            "UPDATE shops SET clone_of_chat_id = ? WHERE clone_of_chat_id = ?",
+            (new_id, old_id),
+        )
+
+    # Transfer tokens + aliases that still point at old id as "current"
+    if _table_exists(conn, "shop_transfer_tokens"):
+        conn.execute(
+            "UPDATE shop_transfer_tokens SET source_chat_id = ? WHERE source_chat_id = ?",
+            (new_id, old_id),
+        )
+        conn.execute(
+            "UPDATE shop_transfer_tokens SET target_chat_id = ? WHERE target_chat_id = ?",
+            (new_id, old_id),
+        )
+    if _table_exists(conn, "shop_aliases"):
+        conn.execute(
+            "UPDATE shop_aliases SET current_chat_id = ? WHERE current_chat_id = ?",
+            (new_id, old_id),
+        )
+
+    # Finally remap the shop PK row itself
+    conn.execute(
+        "UPDATE shops SET chat_id = ? WHERE chat_id = ?",
+        (new_id, old_id),
+    )
+
+
+def transfer_shop_to_group(
+    token: str,
+    target_chat_id: int,
+    by_user: int,
+    *,
+    title: str | None = None,
+) -> tuple[bool, str, Optional[int]]:
+    """
+    Claim a transfer token in a target group chat.
+
+    Moves the entire shop (products, stock, orders, payments, collab, etc.)
+    from source_chat_id → target_chat_id. Returns (ok, message, new_chat_id).
+    """
+    ensure_shop_transfer_tables()
+    inv = get_transfer_token(token)
+    if not inv:
+        return False, "Transfer token not found.", None
+    if inv["status"] != "pending":
+        return False, f"Transfer already {inv['status']}.", None
+
+    source_id = int(inv["source_chat_id"])
+    target_id = int(target_chat_id)
+
+    if not is_admin(source_id, by_user) and not is_owner(by_user):
+        return False, "Only an admin of the source shop can claim this transfer.", None
+    if target_id == source_id:
+        return False, "Already linked to this chat.", None
+
+    source = get_shop(source_id)
+    if not source:
+        return False, "Source shop no longer exists.", None
+
+    now = _utc_now()
+    new_title = (title or "").strip() or source.get("title") or "Shop"
+
+    # Use a direct connection so we can toggle foreign_keys for PK remap
+    path = get_db_path()
+    with _lock:
+        conn = _connect(path)
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            # Target must be free or an empty placeholder
+            tgt = conn.execute(
+                "SELECT * FROM shops WHERE chat_id = ?", (target_id,)
+            ).fetchone()
+            if tgt is not None:
+                if not _shop_is_empty(conn, target_id):
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    conn.close()
+                    return (
+                        False,
+                        "Target group already has a shop with products/orders/payments. "
+                        "Use an empty group, or clear that shop first.",
+                        None,
+                    )
+                _delete_empty_shop(conn, target_id)
+
+            _remap_chat_id_columns(conn, source_id, target_id)
+
+            # Update title to group name when provided
+            conn.execute(
+                "UPDATE shops SET title = ? WHERE chat_id = ?",
+                (new_title, target_id),
+            )
+
+            # Alias: old deep links keep working
+            conn.execute(
+                """
+                INSERT INTO shop_aliases (old_chat_id, current_chat_id, transferred_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(old_chat_id) DO UPDATE SET
+                  current_chat_id = excluded.current_chat_id,
+                  transferred_at = excluded.transferred_at
+                """,
+                (source_id, target_id, now),
+            )
+            # Point any older aliases that still ended at source → new target
+            conn.execute(
+                """
+                UPDATE shop_aliases
+                SET current_chat_id = ?, transferred_at = ?
+                WHERE current_chat_id = ? AND old_chat_id != ?
+                """,
+                (target_id, now, source_id, source_id),
+            )
+
+            conn.execute(
+                """
+                UPDATE shop_transfer_tokens
+                SET status = 'used', target_chat_id = ?, used_at = ?
+                WHERE token = ?
+                """,
+                (target_id, now, inv["token"]),
+            )
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+            except Exception:
+                pass
+            conn.close()
+
+    # Ensure claimer remains admin on the moved shop
+    add_admin(target_id, by_user, None, by_user)
+    title_show = get_shop(target_id)
+    label = (title_show or {}).get("title") or new_title
+    return (
+        True,
+        (
+            f"Shop moved to this group as *{label}*.\n"
+            f"New shop id: `{target_id}`\n"
+            f"Old deep links (`shop_{source_id}`) still open this shop."
+        ),
+        target_id,
+    )
 
 
 def calc_shipping(shop: dict, subtotal: float) -> float:

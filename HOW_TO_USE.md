@@ -114,10 +114,21 @@ Open **⚙️ Admin Panel** (`/admin`).
 | Action | How |
 |--------|-----|
 | Add | **➕ Add product** — name, price, stock, description |
+| **Import from file** | Admin → **📥 Import inventory** → optional template → send a `.txt` document |
 | Change price | Products → pick item → **💲 Price** → send number (e.g. `45.00`) |
 | Change stock | Products → pick item → **📊 Stock** → absolute number (`10`) or adjust (`+5`, `-2`) |
 | Hide from catalog | Products → item → **⏸ Deactivate** |
 | Delete | Products → item → **🗑 Delete** |
+
+#### Import file layout (`.txt`)
+```text
+# comments start with #
+name | price | stock | description (optional)
+Tren Ace | 45.00 | 10 | acetate blend
+Test E | 30 | 5
+```
+- **Add-only**: creates new products; existing names are **skipped** (price/stock not changed).
+- Nothing is deleted. Re-uploading the same file is safe.
 
 ### Orders & payment confirmation
 1. **⏳ Needs confirm** — customers who tapped “I've paid” (and often attached a screenshot)  
@@ -161,6 +172,19 @@ Customers see shipping on the cart and final order total automatically.
 
 - Admins can change prices, stock, payments, shipping, and confirm orders for **that shop**  
 - Only **owners** can remove other admins (admins can remove themselves)  
+
+### Rename shop / move to another group
+Shop admins only (Admin Panel):
+
+| Action | How |
+|--------|-----|
+| **✏️ Rename shop** | Admin → **Rename shop** → send the new display name |
+| **🚚 Move to group** | Admin → **Move to group** → open the link → in the *destination* group send `/claim_transfer <token>` |
+
+- **Move** transfers the whole shop (catalog, stock, orders, payments, admins). It is *not* a clone.  
+- Destination group must be empty (no products/orders yet). Bot must already be a member.  
+- Old customer links (`shop_<old_id>`) still open the moved shop.  
+- After a move you get a new shop link to share.
 
 ---
 

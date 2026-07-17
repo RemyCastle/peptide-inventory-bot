@@ -44,6 +44,12 @@ Details: [`deploy/ALWAYS_ON.md`](deploy/ALWAYS_ON.md)
 
 **Only one runner at a time** (cloud *or* local), or Telegram will conflict.
 
+### Ban recovery / multi-token standby
+
+- Put spare BotFather tokens in `BOT_TOKENS` (different accounts OK). On invalid/banned token the process can fail over to the next while keeping the **same** `inventory.db`.
+- Set `BACKUP_PASSPHRASE` + `BACKUP_DIR` for encrypted snapshots (`latest.enc`) after each paid confirm, plus owner `/backup`.
+- Restore: `python scripts/restore_backup.py backups/latest.enc` — see [`deploy/RECOVER.md`](deploy/RECOVER.md).
+
 ---
 
 ## Quick start (Windows)

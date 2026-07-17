@@ -13,6 +13,7 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
+      # Optional: BOT_TOKENS=token_a,token_b  TOKEN_FAILOVER=1
       - key: OWNER_IDS
         sync: false
       - key: BRAND_NAME
@@ -21,6 +22,15 @@ services:
         value: /data/inventory.db
       - key: LOG_PATH
         value: /data/bot.log
+      - key: BACKUP_DIR
+        value: /data/backups
+      - key: BACKUP_RETENTION_DAYS
+        value: "30"
+      - key: TOKEN_STATE_PATH
+        value: /data/token_state.json
+      # Set in dashboard (secret): BACKUP_PASSPHRASE, optional BOT_TOKENS
+      - key: BACKUP_PASSPHRASE
+        sync: false
     disk:
       name: unicornfartzz-data
       mountPath: /data
