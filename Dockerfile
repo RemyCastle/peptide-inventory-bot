@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py config.py db.py permissions.py payment_templates.py setup_wizard.py reports.py run_cloud.py collab.py franchise.py inventory_import.py backup.py token_pool.py spbc_notify.py site_sync.py ./
 
 # Optional docs
-COPY README.md HOW_TO_USE.md .env.example ./
+COPY README.md HOW_TO_USE.md SITE-LINKING.txt .env.example ./
 
 # Render web healthcheck + Telegram long-poll
 CMD ["python", "run_cloud.py"]

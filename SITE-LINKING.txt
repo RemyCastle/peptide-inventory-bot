@@ -1,0 +1,128 @@
+================================================================
+  LINK YOUR WEBSITE TO YOUR TELEGRAM SHOP
+  (Site Links — quick guide for shop admins)
+================================================================
+
+Your bot shop can pull its catalog straight from your website.
+Prices and product names stay in sync automatically — you stop
+retyping them in two places.
+
+----------------------------------------------------------------
+1. HOW TO CONNECT
+----------------------------------------------------------------
+
+  Option A:  In your shop, open  ⚙️ Admin Panel → 🌐 Site links
+             and follow the buttons.
+
+  Option B:  Send this command while in your shop:
+
+               /linksite https://yoursite.com
+
+The bot checks the feed right away and tells you how many
+products it found. Up to 5 sites per shop.
+
+----------------------------------------------------------------
+2. WHAT YOUR SITE NEEDS TO PROVIDE
+----------------------------------------------------------------
+
+A public web address that returns JSON. The bot tries:
+
+    https://yoursite.com/api/products
+
+(If your feed lives at another path, just give the full URL —
+anything containing /api/ or ending in .json is used as-is.)
+
+The JSON must look like:
+
+    { "products": [ ...one entry per product... ] }
+
+Each product entry can be in either shape:
+
+  SIMPLE (recommended for most sites):
+    {
+      "id": 1,                  (or "sku": "ABC-1")
+      "name": "BPC-157 10MG",
+      "price": 41,
+      "kit_price": 294,         optional - price for a kit
+      "stock": 25,              optional - see stock rules below
+      "unit": "vial",           optional
+      "description": "...",     optional
+      "active": true,           optional
+      "sort_order": 10          optional
+    }
+
+  SPBC STOREFRONT shape (springfield-style sites):
+    {
+      "id": 1,
+      "name": "BPC-157 10MG",
+      "vial_price": 41,
+      "pack_price": 294,
+      "kit_only": false,
+      "sort_order": 10,
+      "active": true
+    }
+
+----------------------------------------------------------------
+3. WHO OWNS WHAT
+----------------------------------------------------------------
+
+  YOUR SITE owns:   names, prices, kit prices, active on/off,
+                    display order.
+
+  YOUR BOT owns:    stock counts — UNLESS your feed includes a
+                    "stock" number, in which case the bot follows
+                    your site's stock.
+
+  New products from the feed arrive with stock 0, so nothing can
+  sell until you set real stock (Admin Panel → 📦 Products).
+
+  Products that disappear from your feed are switched OFF in the
+  bot, never deleted. Turn the feed entry back on and they return
+  with their old stock.
+
+  Products you added by hand in the bot are NEVER touched by the
+  sync.
+
+----------------------------------------------------------------
+4. WHEN IT SYNCS
+----------------------------------------------------------------
+
+  * Automatically every few hours.
+  * Instantly when you tap  🔄 Sync now  in Site links.
+
+----------------------------------------------------------------
+5. REQUIREMENTS CHECKLIST
+----------------------------------------------------------------
+
+  [ ] Public HTTPS address (no login wall)
+  [ ] Returns HTTP 200 with JSON
+  [ ] Top-level "products" array
+  [ ] Every product has a name and a price
+
+  The bot identifies itself with:
+    User-Agent:  SPBC-InventoryBot/1.0
+    Header:      X-SPBC-Member: 1   (harmless for other sites)
+
+----------------------------------------------------------------
+6. TROUBLESHOOTING
+----------------------------------------------------------------
+
+  "Site API HTTP 403"
+      Your host is blocking bots. Ask them (or your firewall
+      settings) to allow the User-Agent "SPBC-InventoryBot/1.0".
+
+  "returned no products list"
+      The JSON is missing the top-level "products" array, or the
+      URL is returning an HTML page instead of JSON.
+
+  Linked but 0 products found
+      Each entry needs at least a name plus a price (simple
+      shape) or vial_price/pack_price (SPBC shape).
+
+  Wrong prices showing
+      Simple shape: "price" is the per-unit price, "kit_price"
+      the kit. SPBC shape: "vial_price" is per vial, "pack_price"
+      per 10-pack/kit. Check you filled the right fields.
+
+Questions? Message the shop owner.
+================================================================

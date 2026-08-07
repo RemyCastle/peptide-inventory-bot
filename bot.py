@@ -294,7 +294,7 @@ async def safe_edit(query, text: str, reply_markup=None) -> None:
         log.warning("reply fallback failed: %s", e3)
 
 
-def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
+def main_menu_kb(is_admin: bool = False, can_switch: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton("🧬 Catalog", callback_data="cat"),
@@ -308,6 +308,8 @@ def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton("ℹ️ Help", callback_data="help"),
         ],
     ]
+    if can_switch:
+        rows.append([InlineKeyboardButton("🏪 Switch shop", callback_data="shops")])
     if is_admin:
         rows.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")])
     return InlineKeyboardMarkup(rows)
@@ -530,6 +532,45 @@ async def cb_pickshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _show_main(update, context, shop, edit=True)
 
 
+def _shop_picker_view(user_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Shops this user can manage — owners see every shop."""
+    shops = db.shops_for_admin(user_id)
+    if not shops:
+        return (
+            "No shops you can manage yet.\n"
+            "Open the bot from a group with /start, or ask to be added as admin.",
+            None,
+        )
+    buttons = [
+        [
+            InlineKeyboardButton(
+                s["title"] or str(s["chat_id"]), callback_data=f"pickshop:{s['chat_id']}"
+            )
+        ]
+        for s in shops[:50]
+    ]
+    buttons.append([InlineKeyboardButton("« Main menu", callback_data="main")])
+    return (
+        "🏪 *Your shops* — pick one to shop or manage\n"
+        "(prices & stock: pick a shop → ⚙️ Admin Panel → 📦 Products)",
+        InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cb_shops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    text, kb = _shop_picker_view(update.effective_user.id)
+    await safe_edit(query, text, kb)
+
+
+async def cmd_shops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = _shop_picker_view(update.effective_user.id)
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+    )
+
+
 async def _show_main(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -554,7 +595,13 @@ async def _show_main(
     if int(display["min_order_qty"]) > 0:
         min_line = f"\n📦 {db.format_min_order_rule(display['min_order_qty'], display['min_order_label'])}"
     text = f"*{BRAND_NAME}*\n🏪 *{shop['title']}*\n\n{welcome}{ship}{min_line}"
-    kb = main_menu_kb(is_adm)
+    chat = update.effective_chat
+    can_switch = bool(
+        chat
+        and chat.type == ChatType.PRIVATE
+        and len(db.shops_for_admin(user.id)) > 1
+    )
+    kb = main_menu_kb(is_adm, can_switch)
     if edit and update.callback_query:
         await safe_edit(update.callback_query, text, kb)
     elif update.message:
@@ -2102,6 +2149,7 @@ async def _admin_home(
             ],
             [
                 InlineKeyboardButton("📤 Export Reports", callback_data="adm_export"),
+                InlineKeyboardButton("🌐 Site links", callback_data="adm_sites"),
             ],
             [
                 InlineKeyboardButton("👥 Admins", callback_data="adm_admins"),
@@ -5260,6 +5308,139 @@ async def cmd_backup_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+# ── Per-shop site links (Admin Panel → Site links) ──────────────────────────
+
+
+def _site_links_view(sid: int) -> tuple[str, InlineKeyboardMarkup]:
+    links = site_sync.list_links(sid)
+    lines = [
+        "🌐 *Site links* — pull your website's catalog into this shop.",
+        "",
+        "Add one: `/linksite https://yoursite.com`",
+        "Full how-to: tap 📄 below.",
+    ]
+    buttons: list[list[InlineKeyboardButton]] = []
+    if links:
+        lines.append("")
+        for i, ln in enumerate(links, 1):
+            status = ln.get("last_status") or "never synced"
+            lines.append(f"{i}. {ln['url']}\n   _{status}_")
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"🔄 Sync {i}", callback_data=f"sitesync:{ln['id']}"
+                    ),
+                    InlineKeyboardButton(
+                        f"🗑 Remove {i}", callback_data=f"siterm:{ln['id']}"
+                    ),
+                ]
+            )
+    else:
+        lines.append("\nNo sites linked yet.")
+    buttons.append(
+        [InlineKeyboardButton("📄 How-to guide (txt)", callback_data="sitehelp")]
+    )
+    buttons.append([InlineKeyboardButton("« Admin", callback_data="admin")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def cb_adm_sites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await safe_edit(query, "Admin only.")
+        return
+    text, kb = _site_links_view(sid)
+    await safe_edit(query, text, kb)
+
+
+async def cb_sitesync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await query.answer("Admin only.", show_alert=True)
+        return
+    link_id = int(query.data.split(":")[1])
+    link = site_sync.get_link(link_id)
+    if not link or int(link["chat_id"]) != int(sid):
+        await query.answer("Link not found.", show_alert=True)
+        return
+    await query.answer("Syncing…")
+    try:
+        result = await asyncio.to_thread(site_sync.sync_link, link)
+        text = result.summary()
+    except site_sync.SiteSyncError as exc:
+        text = f"⚠️ Sync failed: {exc}"
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("« Site links", callback_data="adm_sites")]]
+    )
+    await safe_edit(query, text, kb)
+
+
+async def cb_siterm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await query.answer("Admin only.", show_alert=True)
+        return
+    link_id = int(query.data.split(":")[1])
+    if site_sync.remove_link(link_id, sid):
+        await query.answer("Removed — its products were deactivated.")
+    else:
+        await query.answer("Link not found.", show_alert=True)
+    text, kb = _site_links_view(sid)
+    await safe_edit(query, text, kb)
+
+
+async def cb_sitehelp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    path = Path(__file__).resolve().parent / "SITE-LINKING.txt"
+    try:
+        with open(path, "rb") as fh:
+            await query.message.reply_document(
+                document=fh,
+                filename="SITE-LINKING.txt",
+                caption="How to link your website into your shop.",
+            )
+    except OSError:
+        await query.message.reply_text(
+            "Guide file missing on this deploy — ask the owner for SITE-LINKING.txt."
+        )
+
+
+async def cmd_linksite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /linksite <https-url> — connect a website feed to this shop."""
+    user = update.effective_user
+    sid = shop_id(context, update)
+    if sid is None:
+        await update.message.reply_text("No shop selected. Send /start first.")
+        return
+    if not user or not db.is_admin(sid, user.id):
+        await update.message.reply_text("Admins only.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /linksite https://yoursite.com\n"
+            "The site must serve /api/products JSON — tap 🌐 Site links in the "
+            "Admin Panel for the how-to guide."
+        )
+        return
+    url = context.args[0].strip()
+    await update.message.reply_text("Checking the feed…")
+    ok, msg, link_id = await asyncio.to_thread(site_sync.add_link, sid, url)
+    if not ok:
+        await update.message.reply_text(f"⚠️ {msg}")
+        return
+    link = site_sync.get_link(int(link_id))
+    try:
+        result = await asyncio.to_thread(site_sync.sync_link, link)
+        await update.message.reply_text(f"✅ {msg}\n\n{result.summary()}")
+    except site_sync.SiteSyncError as exc:
+        await update.message.reply_text(f"✅ {msg}\n⚠️ First sync failed: {exc}")
+
+
 async def cmd_syncsite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only: pull the website catalog into the SPBC shop now."""
     user = update.effective_user
@@ -5289,6 +5470,7 @@ async def post_init(app: Application) -> None:
         BotCommand("search", "Search products"),
         BotCommand("cart", "View cart"),
         BotCommand("myorders", "Your order history"),
+        BotCommand("shops", "Switch between your shops"),
         BotCommand("orders", "Orders (admin shop / your orders)"),
         BotCommand("admin", "Admin panel"),
         BotCommand("setup", "Guided shop setup (group admins)"),
@@ -5573,8 +5755,15 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("backup_status", cmd_backup_status))
     app.add_handler(CommandHandler("syncsite", cmd_syncsite))
+    app.add_handler(CommandHandler("shops", cmd_shops))
+    app.add_handler(CommandHandler("linksite", cmd_linksite))
+    app.add_handler(CallbackQueryHandler(cb_adm_sites, pattern=r"^adm_sites$"))
+    app.add_handler(CallbackQueryHandler(cb_sitesync, pattern=r"^sitesync:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_siterm, pattern=r"^siterm:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_sitehelp, pattern=r"^sitehelp$"))
 
     app.add_handler(CallbackQueryHandler(cb_pickshop, pattern=r"^pickshop:-?\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_shops, pattern=r"^shops$"))
     app.add_handler(CallbackQueryHandler(cb_main, pattern=r"^main$"))
     app.add_handler(CallbackQueryHandler(cb_catalog, pattern=r"^cat$"))
     app.add_handler(CallbackQueryHandler(cb_product, pattern=r"^prod:\d+$"))

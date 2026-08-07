@@ -22,6 +22,15 @@ WHAT YOU NEED TO KNOW
                     STOCK STAYS BOT-MANAGED (new products arrive at stock 0).
   Cutover steps: CUTOVER-SPBC.md. Env: see .env.example bottom section.
 
+  Also 2026-08-07:
+    /shops + "🏪 Switch shop" main-menu button — owners/multi-shop admins hop
+      between shops and edit each shop's prices/stock from one DM.
+    Per-shop site links — any shop links its own website feed:
+      /linksite <url> or Admin Panel → 🌐 Site links (sync now / remove /
+      how-to doc). Feed contract + rules: SITE-LINKING.txt. Auto-syncs on the
+      same interval as the SPBC sync. site_key namespaces: "S:" = env SPBC
+      sync, "L<link_id>:" = per-shop links.
+
 HOW TO RUN
   cd C:\Users\Remy\peptide_inventory_bot
   copy .env.example .env   (first time)
