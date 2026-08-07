@@ -34,6 +34,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -43,6 +44,8 @@ import inventory_import
 import payment_templates as pt
 import reports
 import setup_wizard
+import site_sync
+import spbc_notify
 import token_pool
 from config import (
     ACTIVE_BOT_INDEX,
@@ -58,6 +61,9 @@ from config import (
     OWNER_IDS,
     PUBLIC_BOT_USERNAME,
     RECOVERY_URL,
+    SITE_SYNC_INTERVAL_MIN,
+    SPBC_SHOP_CHAT_ID,
+    SPBC_SITE_URL,
     TOKEN_FAILOVER,
     TOKEN_STATE_PATH,
     resolve_bot_tokens,
@@ -5254,6 +5260,28 @@ async def cmd_backup_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+async def cmd_syncsite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: pull the website catalog into the SPBC shop now."""
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        if update.message:
+            await update.message.reply_text("Owners only.")
+        return
+    if not SPBC_SITE_URL or not SPBC_SHOP_CHAT_ID:
+        await update.message.reply_text(
+            "Site sync is not configured.\n"
+            "Set SPBC_SITE_URL and SPBC_SHOP_CHAT_ID in env, then restart."
+        )
+        return
+    await update.message.reply_text("Syncing catalog from the website…")
+    try:
+        result = await asyncio.to_thread(site_sync.sync_shop)
+    except site_sync.SiteSyncError as exc:
+        await update.message.reply_text(f"⚠️ Sync failed: {exc}")
+        return
+    await update.message.reply_text(result.summary())
+
+
 async def post_init(app: Application) -> None:
     cmds = [
         BotCommand("start", "Open shop menu"),
@@ -5273,6 +5301,15 @@ async def post_init(app: Application) -> None:
         BotCommand("cancel", "Cancel current step"),
     ]
     await app.bot.set_my_commands(cmds)
+
+    # Website catalog auto-sync (SPBC): keeps the Telegram shop matching the site
+    if SPBC_SITE_URL and SPBC_SHOP_CHAT_ID and SITE_SYNC_INTERVAL_MIN > 0:
+        app.create_task(site_sync.periodic_site_sync(app))
+        log.info(
+            "Site sync task started shop=%s every %s min",
+            SPBC_SHOP_CHAT_ID,
+            SITE_SYNC_INTERVAL_MIN,
+        )
 
 
 def build_app(token: str | None = None) -> Application:
@@ -5311,6 +5348,20 @@ def build_app(token: str | None = None) -> Application:
     )
     app.bot_data["bot_token"] = use_token
     app.bot_data["token_fingerprint"] = token_pool.token_fingerprint(use_token)
+    # Website /notify endpoint sends over plain HTTPS with this token
+    spbc_notify.set_bot_token(use_token)
+
+    # Supplier Q&A (total / OOS after a paid website order) must win over the
+    # shop conversation handlers, but ONLY for chats with an open supplier
+    # session — everyone else falls through untouched.
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT, spbc_notify.on_supplier_message
+        ),
+        group=-2,
+    )
+    # Passive recorder feeding /recent-chats and /resolve-chat lookups
+    app.add_handler(TypeHandler(Update, spbc_notify.on_record_chat), group=9)
 
     # Conversations (admin + checkout)
     conv = ConversationHandler(
@@ -5521,6 +5572,7 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("master", cmd_master))
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("backup_status", cmd_backup_status))
+    app.add_handler(CommandHandler("syncsite", cmd_syncsite))
 
     app.add_handler(CallbackQueryHandler(cb_pickshop, pattern=r"^pickshop:-?\d+$"))
     app.add_handler(CallbackQueryHandler(cb_main, pattern=r"^main$"))

@@ -95,6 +95,28 @@ try:
 except ValueError:
     CATALOG_TOP_N = 10
 
+# ── SPBC website integration (supplier notify + catalog sync) ──────────────
+# Shared secret with the spbc-orders Cloudflare worker (X-Notify-Secret).
+NOTIFY_SECRET = os.getenv("NOTIFY_SECRET", "").strip()
+# Fallback chat when a supplier has no telegram_chat_id in the payload.
+SUPPLIER_TELEGRAM_CHAT_ID = os.getenv("SUPPLIER_TELEGRAM_CHAT_ID", "").strip()
+# Where supplier totals / OOS answers are forwarded (defaults to supplier chat).
+OWNER_TELEGRAM_CHAT_ID = (
+    os.getenv("OWNER_TELEGRAM_CHAT_ID", "").strip() or SUPPLIER_TELEGRAM_CHAT_ID
+)
+# Storefront base URL whose /api/products feeds the Telegram catalog.
+SPBC_SITE_URL = os.getenv("SPBC_SITE_URL", "").strip()
+# Bot shop (chat id) that mirrors the website catalog. 0 = sync disabled.
+try:
+    SPBC_SHOP_CHAT_ID = int(os.getenv("SPBC_SHOP_CHAT_ID", "0"))
+except ValueError:
+    SPBC_SHOP_CHAT_ID = 0
+# Auto-sync interval in minutes. 0 = manual /syncsite only.
+try:
+    SITE_SYNC_INTERVAL_MIN = int(os.getenv("SITE_SYNC_INTERVAL_MIN", "0"))
+except ValueError:
+    SITE_SYNC_INTERVAL_MIN = 0
+
 # Schema version expected by this code release
 SCHEMA_VERSION = 10
 

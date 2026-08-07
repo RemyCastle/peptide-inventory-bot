@@ -1,7 +1,7 @@
 ================================================================================
   PEPTIDE INVENTORY BOT — PROJECT GUIDE
   Path: C:\Users\Remy\peptide_inventory_bot
-  Updated: 2026-07-14
+  Updated: 2026-08-07
 ================================================================================
 
 WHAT YOU NEED TO KNOW
@@ -10,6 +10,17 @@ WHAT YOU NEED TO KNOW
   stock drops. Owners use OWNER_IDS in .env for global access.
 
   Related but SEPARATE: peptide_telegram_bot = dosing calculator only.
+
+  2026-08-07: NOW ALSO the SPBC supplier bot (absorbed the Node
+  spbc-supplier-bot). New modules:
+    spbc_notify.py  HTTP /notify /resolve-chat /recent-chats (X-Notify-Secret)
+                    + supplier total/OOS Q&A over the PTB update stream.
+                    spbc-orders worker keeps calling the same endpoints.
+    site_sync.py    Mirrors springfieldpbc.com /api/products into the shop in
+                    SPBC_SHOP_CHAT_ID (/syncsite owner cmd + auto every
+                    SITE_SYNC_INTERVAL_MIN). Site owns names/prices/active;
+                    STOCK STAYS BOT-MANAGED (new products arrive at stock 0).
+  Cutover steps: CUTOVER-SPBC.md. Env: see .env.example bottom section.
 
 HOW TO RUN
   cd C:\Users\Remy\peptide_inventory_bot
