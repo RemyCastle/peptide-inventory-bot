@@ -20,6 +20,7 @@ from pathlib import Path
 
 from telegram import (
     BotCommand,
+    BotCommandScopeChat,
     ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -6368,19 +6369,59 @@ async def post_init(app: Application) -> None:
         BotCommand("cart", "View cart"),
         BotCommand("myorders", "Your order history"),
         BotCommand("shops", "Switch between your shops"),
-        BotCommand("webpanel", "Shop panel link for the web (admin)"),
-        BotCommand("orders", "Orders (admin shop / your orders)"),
+        BotCommand("help", "Help"),
+        BotCommand("cancel", "Cancel current step"),
+    ]
+    # Buyers only ever see the shopping commands
+    await app.bot.set_my_commands(cmds)
+
+    # Shop staff / owners get the full set, scoped to their own chat so the
+    # admin surface is never advertised to customers.
+    admin_cmds = cmds[:-2] + [
         BotCommand("admin", "Admin panel"),
+        BotCommand("orders", "Orders (admin shop / your orders)"),
+        BotCommand("webpanel", "Web panel link for this shop"),
+        BotCommand("linksite", "Link your website's catalog"),
         BotCommand("setup", "Guided shop setup (group admins)"),
         BotCommand("claim_clone", "Attach cloned shop to this group"),
         BotCommand("claim_transfer", "Move shop into this group"),
-        BotCommand("master", "Master fees/invoices (owner only)"),
+        BotCommand("help", "Help"),
+        BotCommand("cancel", "Cancel current step"),
+    ]
+    owner_cmds = admin_cmds[:-2] + [
+        BotCommand("invitevendor", "Invite a vendor (owner)"),
+        BotCommand("syncsite", "Pull the SPBC site catalog (owner)"),
+        BotCommand("master", "Master fees/invoices (owner)"),
         BotCommand("backup", "Encrypted DB snapshot (owner)"),
         BotCommand("backup_status", "Vault + token pool (owner)"),
         BotCommand("help", "Help"),
         BotCommand("cancel", "Cancel current step"),
     ]
-    await app.bot.set_my_commands(cmds)
+    for uid in sorted(OWNER_IDS):
+        try:
+            await app.bot.set_my_commands(
+                owner_cmds, scope=BotCommandScopeChat(chat_id=uid)
+            )
+        except Exception as exc:
+            log.info("Could not scope owner commands for %s: %s", uid, exc)
+    # Shop admins (non-owners) get the admin set in their own chat
+    try:
+        with db.get_db() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT user_id FROM admins"
+            ).fetchall()
+        for r in rows:
+            uid = int(r["user_id"])
+            if uid in OWNER_IDS:
+                continue
+            try:
+                await app.bot.set_my_commands(
+                    admin_cmds, scope=BotCommandScopeChat(chat_id=uid)
+                )
+            except Exception:
+                pass  # they may not have opened the bot yet
+    except Exception as exc:
+        log.info("Could not scope admin commands: %s", exc)
 
     # Website catalog auto-sync (SPBC): keeps the Telegram shop matching the site
     if SPBC_SITE_URL and SPBC_SHOP_CHAT_ID and SITE_SYNC_INTERVAL_MIN > 0:
