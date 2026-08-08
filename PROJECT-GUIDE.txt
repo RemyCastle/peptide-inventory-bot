@@ -50,6 +50,15 @@ WHAT YOU NEED TO KNOW
       fulfillment request at their prices, stock deducts (audit reason
       'order_route', re-checked at apply). Advisory only; supplier flow
       unchanged. Master shop (SPBC_SHOP_CHAT_ID) excluded from quoting.
+    Pre-built vendor shops (2026-08-08): /newvendor <name> (owner) creates
+      the shop immediately with a synthetic chat_id (db.VIRTUAL_SHOP_BASE,
+      9.1e12 — never collides with a real Telegram id); owner stocks it,
+      then /handover [shop id] issues an invite bound to that shop so the
+      vendor's tap adopts the finished store. Shop id never changes.
+    Restock (2026-08-08): /restock with no args DMs a panel link with
+      &mode=restock that opens straight into a "what arrived" list (adds to
+      stock, never replaces; audit reason 'restock'/'web_panel'). Inline
+      form also works: /restock BPC-157 10, TB-500 5
     Vendor web console (webpanel.py) — /webpanel DMs a 3-day magic link to
       <PANEL_BASE_URL>/panel?t=… where admins edit products/stock/prices/
       payments/shipping from a browser (same DB rows Telegram sells from;

@@ -518,6 +518,34 @@ def ensure_shop(chat_id: int, title: str = "Shop") -> dict:
         return dict(row)
 
 
+# Shops created by the owner BEFORE the vendor has joined get a synthetic
+# chat_id from this range — far above any real Telegram id, so it can never
+# collide with a user or group chat. The id never changes: claiming the shop
+# just adds the vendor as an admin, so nothing has to be migrated.
+VIRTUAL_SHOP_BASE = 9_100_000_000_000
+
+
+def is_virtual_shop(chat_id: int | None) -> bool:
+    try:
+        return int(chat_id or 0) >= VIRTUAL_SHOP_BASE
+    except (TypeError, ValueError):
+        return False
+
+
+def create_virtual_shop(title: str, created_by: int) -> dict:
+    """A vendor shop that exists before the vendor does."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT MAX(chat_id) AS m FROM shops WHERE chat_id >= ?",
+            (VIRTUAL_SHOP_BASE,),
+        ).fetchone()
+        nxt = int(row["m"]) + 1 if row and row["m"] else VIRTUAL_SHOP_BASE
+    shop = ensure_shop(nxt, title=(title or "New vendor").strip()[:80])
+    # the owner administers it until the vendor claims it
+    add_admin(nxt, int(created_by), None, int(created_by))
+    return shop
+
+
 def get_shop(chat_id: int) -> Optional[dict]:
     with get_db() as conn:
         row = conn.execute("SELECT * FROM shops WHERE chat_id = ?", (chat_id,)).fetchone()

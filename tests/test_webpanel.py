@@ -81,16 +81,70 @@ class TokenTests(WebPanelBase):
 class InviteTests(WebPanelBase):
     def test_invite_single_use(self):
         raw = webpanel.create_vendor_invite(1, "Oliver")
-        ok, note = webpanel.redeem_vendor_invite(raw, USER)
+        ok, note, prebuilt = webpanel.redeem_vendor_invite(raw, USER)
         self.assertTrue(ok)
         self.assertEqual(note, "Oliver")
-        ok2, msg = webpanel.redeem_vendor_invite(raw, USER + 1)
+        self.assertIsNone(prebuilt)
+        ok2, msg, _ = webpanel.redeem_vendor_invite(raw, USER + 1)
         self.assertFalse(ok2)
         self.assertIn("already used", msg)
 
     def test_unknown_invite(self):
-        ok, msg = webpanel.redeem_vendor_invite("bogus", USER)
+        ok, msg, _ = webpanel.redeem_vendor_invite("bogus", USER)
         self.assertFalse(ok)
+
+    def test_handover_invite_carries_prebuilt_shop(self):
+        shop = db.create_virtual_shop("Prebuilt Vendor", created_by=1)
+        sid = int(shop["chat_id"])
+        self.assertTrue(db.is_virtual_shop(sid))
+        raw = webpanel.create_vendor_invite(1, "Prebuilt Vendor", shop_chat_id=sid)
+        ok, note, prebuilt = webpanel.redeem_vendor_invite(raw, USER)
+        self.assertTrue(ok)
+        self.assertEqual(prebuilt, sid)
+
+    def test_virtual_shop_ids_do_not_collide(self):
+        a = int(db.create_virtual_shop("A", 1)["chat_id"])
+        b = int(db.create_virtual_shop("B", 1)["chat_id"])
+        self.assertNotEqual(a, b)
+        self.assertGreaterEqual(a, db.VIRTUAL_SHOP_BASE)
+        # a real Telegram user/group id is never mistaken for a virtual shop
+        self.assertFalse(db.is_virtual_shop(6086230967))
+        self.assertFalse(db.is_virtual_shop(-1001234567890))
+
+
+class RestockTests(WebPanelBase):
+    def test_restock_adds_and_audits(self):
+        p1 = db.add_product(SHOP, "BPC", 41.0, 5)
+        p2 = db.add_product(SHOP, "TB-500", 47.0, 0)
+        code, data = webpanel.api_restock(
+            self.tok, {"items": [{"id": p1, "add": 10}, {"id": p2, "add": 3}]}
+        )
+        self.assertEqual(code, 200, data)
+        self.assertEqual(data["count"], 2)
+        self.assertEqual(db.get_product(p1)["stock"], 15)  # added, not replaced
+        self.assertEqual(db.get_product(p2)["stock"], 3)
+        with db.get_db() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) c FROM stock_audit WHERE reason='web_panel'"
+            ).fetchone()["c"]
+        self.assertEqual(n, 2)
+
+    def test_restock_rejects_bad_and_foreign(self):
+        db.ensure_shop(SHOP + 1, title="Other")
+        foreign = db.add_product(SHOP + 1, "Foreign", 10.0, 1)
+        mine = db.add_product(SHOP, "BPC", 41.0, 5)
+        code, data = webpanel.api_restock(
+            self.tok,
+            {"items": [{"id": foreign, "add": 5}, {"id": mine, "add": -3}]},
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(data["count"], 0)
+        self.assertEqual(db.get_product(foreign)["stock"], 1)
+        self.assertEqual(db.get_product(mine)["stock"], 5)
+
+    def test_restock_empty(self):
+        code, _ = webpanel.api_restock(self.tok, {"items": []})
+        self.assertEqual(code, 400)
 
 
 class ApiTests(WebPanelBase):

@@ -436,22 +436,38 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         if arg0.startswith("vendor_"):
             token = arg0.removeprefix("vendor_")
-            ok, note = webpanel.redeem_vendor_invite(token, user.id)
+            ok, note, prebuilt = webpanel.redeem_vendor_invite(token, user.id)
             if not ok:
                 await update.message.reply_text(note)
                 return
-            title = f"{user.first_name or 'Vendor'}'s Shop"
-            shop = db.get_shop(user.id) or db.ensure_shop(user.id, title=title)
-            db.add_admin(user.id, user.id, user.username, user.id)
-            set_shop(context, user.id)
+            if prebuilt and db.get_shop(int(prebuilt)):
+                # Owner already built and stocked this shop — hand it over
+                sid = int(prebuilt)
+                shop = db.get_shop(sid)
+            else:
+                sid = user.id
+                title = f"{user.first_name or 'Vendor'}'s Shop"
+                shop = db.get_shop(sid) or db.ensure_shop(sid, title=title)
+            db.add_admin(sid, user.id, user.username, user.id)
+            set_shop(context, sid)
+            stocked = len(db.list_products(sid, active_only=True))
             lines = [
-                f"🎉 Welcome{' ' + note if note else ''}! Your shop *{shop['title']}* is ready.",
+                f"🎉 Welcome{' ' + note if note else ''}! "
+                f"Your shop *{shop['title']}* is ready.",
                 "",
-                "Fastest way to set up — from your phone:",
             ]
+            if stocked:
+                lines += [
+                    f"It's already set up with *{stocked} product"
+                    f"{'s' if stocked != 1 else ''}* — you can start selling now.",
+                    "",
+                    "To change prices or stock:",
+                ]
+            else:
+                lines.append("Fastest way to set up — from your phone:")
             if PANEL_BASE_URL:
                 link = webpanel.panel_url(
-                    PANEL_BASE_URL, webpanel.issue_token(user.id, user.id)
+                    PANEL_BASE_URL, webpanel.issue_token(sid, user.id)
                 )
                 lines += [
                     f"1. Open your [shop panel]({link})",
@@ -6182,6 +6198,192 @@ async def cmd_webpanel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await safe_reply(update.message, text)
 
 
+async def cmd_restock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: add received stock. `/restock BPC 10, TB-500 5` or one per line."""
+    user = update.effective_user
+    sid = shop_id(context, update)
+    if sid is None:
+        await update.message.reply_text("No shop selected. Send /start first.")
+        return
+    if not user or not db.is_admin(sid, user.id):
+        await update.message.reply_text("Admins only.")
+        return
+    raw = " ".join(context.args) if context.args else ""
+    if update.message.text and "\n" in update.message.text:
+        raw = update.message.text.split("\n", 1)[1]
+    if not raw.strip():
+        chat = update.effective_chat
+        text = (
+            "📦 *Received a shipment?*\n\n"
+            "Tap below to punch in what arrived — the whole list on one "
+            "screen, no typing names.\n"
+        )
+        if PANEL_BASE_URL:
+            link = webpanel.panel_url(
+                PANEL_BASE_URL,
+                webpanel.issue_token(int(sid), user.id),
+                mode="restock",
+            )
+            text += f"\n{link}\n"
+        text += (
+            "\nOr do it right here — name then quantity:\n"
+            "`/restock BPC-157 10`\n"
+            "Several at once (new line or comma):\n"
+            "`/restock BPC-157 10, TB-500 5`\n\n"
+            "_Either way this ADDS to current stock. To set an exact number "
+            "instead, use Admin → Products._"
+        )
+        if PANEL_BASE_URL and chat and chat.type != ChatType.PRIVATE:
+            # never post a shop-editing link into a group
+            try:
+                await context.bot.send_message(
+                    user.id,
+                    text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                )
+                await update.message.reply_text("Sent you the restock link in DM.")
+            except Exception:
+                await update.message.reply_text(
+                    "Open the bot privately and send /restock there."
+                )
+            return
+        await safe_reply(update.message, text)
+        return
+
+    products = db.list_products(int(sid), active_only=False)
+    by_name = {" ".join(p["name"].split()).lower(): p for p in products}
+    done, missed = [], []
+    entries = [e.strip() for e in raw.replace("\n", ",").split(",") if e.strip()]
+    for entry in entries[:100]:
+        parts = entry.rsplit(None, 1)
+        if len(parts) != 2 or not parts[1].lstrip("+").isdigit():
+            missed.append(f"{entry} (need: name then quantity)")
+            continue
+        name, qty_s = parts[0].strip(), parts[1].lstrip("+")
+        qty = int(qty_s)
+        key = " ".join(name.split()).lower()
+        p = by_name.get(key)
+        if p is None:
+            matches = [v for k, v in by_name.items() if key in k]
+            if len(matches) == 1:
+                p = matches[0]
+            elif len(matches) > 1:
+                missed.append(f"{name} (matches {len(matches)} products)")
+                continue
+        if p is None:
+            missed.append(f"{name} (not found)")
+            continue
+        before = int(p["stock"] or 0)
+        after = before + qty
+        db.update_product(int(p["id"]), stock=after)
+        with db.get_db() as conn:
+            conn.execute(
+                "INSERT INTO stock_audit (chat_id, product_id, product_name, "
+                "delta, stock_before, stock_after, reason, actor_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'restock', ?, ?)",
+                (
+                    int(sid),
+                    int(p["id"]),
+                    p["name"],
+                    qty,
+                    before,
+                    after,
+                    user.id,
+                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+        done.append(f"• {p['name']}: {before} → *{after}* (+{qty})")
+
+    lines = []
+    if done:
+        lines.append(f"📦 *Stock added ({len(done)})*")
+        lines += done
+    if missed:
+        lines.append("\n⚠️ Skipped:")
+        lines += [f"• {m}" for m in missed[:8]]
+    if not done and not missed:
+        lines = ["Nothing to add."]
+    await safe_reply(
+        update.message,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📦 Products", callback_data="adm_prods")]]
+        ),
+    )
+
+
+async def cmd_newvendor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: build a vendor's shop NOW, stock it, invite them once it's ready."""
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await update.message.reply_text("Owners only.")
+        return
+    name = " ".join(context.args).strip() if context.args else ""
+    if not name:
+        await update.message.reply_text(
+            "Usage: /newvendor <name>\n\n"
+            "Creates their shop right away so you can add products, photos and "
+            "COAs before they join. When it's ready, send them the invite."
+        )
+        return
+    shop = db.create_virtual_shop(name, user.id)
+    sid = int(shop["chat_id"])
+    set_shop(context, sid)
+    rows = [[InlineKeyboardButton("⚙️ Set it up now", callback_data="admin")]]
+    text = [
+        f"🏪 Created *{shop['title']}*.",
+        "",
+        "You're now switched to this shop — add products, photos, COAs, "
+        "payment methods and shipping.",
+    ]
+    if PANEL_BASE_URL:
+        link = webpanel.panel_url(PANEL_BASE_URL, webpanel.issue_token(sid, user.id))
+        text += ["", f"Or build it in your browser:\n{link}"]
+    text += [
+        "",
+        f"When it's ready, send `/handover {sid}` to get their invite link.",
+    ]
+    await safe_reply(
+        update.message, "\n".join(text), reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+async def cmd_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: invite link that hands a pre-built shop to its vendor."""
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await update.message.reply_text("Owners only.")
+        return
+    sid = None
+    if context.args:
+        try:
+            sid = int(context.args[0])
+        except ValueError:
+            sid = None
+    if sid is None:
+        sid = shop_id(context, update)
+    shop = db.get_shop(sid) if sid else None
+    if not shop:
+        await update.message.reply_text(
+            "Usage: /handover <shop id>\n"
+            "(or switch to the shop with /shops first, then /handover)"
+        )
+        return
+    bot_username = (context.bot.username or "").lstrip("@")
+    token = webpanel.create_vendor_invite(user.id, shop["title"], shop_chat_id=sid)
+    link = f"https://t.me/{bot_username}?start=vendor_{token}"
+    n = len(db.list_products(int(sid), active_only=True))
+    await safe_reply(
+        update.message,
+        f"🎟 *Handover link for {shop['title']}*\n"
+        f"{link}\n\n"
+        f"They tap it once and the shop — with its {n} product"
+        f"{'s' if n != 1 else ''} — becomes theirs. "
+        "You keep full access. Single-use, valid 14 days.",
+    )
+
+
 async def cmd_invitevendor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner: one-time invite link that sets a new vendor up end-to-end."""
     user = update.effective_user
@@ -6381,6 +6583,7 @@ async def post_init(app: Application) -> None:
         BotCommand("admin", "Admin panel"),
         BotCommand("orders", "Orders (admin shop / your orders)"),
         BotCommand("webpanel", "Web panel link for this shop"),
+        BotCommand("restock", "Add stock from a shipment"),
         BotCommand("linksite", "Link your website's catalog"),
         BotCommand("setup", "Guided shop setup (group admins)"),
         BotCommand("claim_clone", "Attach cloned shop to this group"),
@@ -6390,6 +6593,8 @@ async def post_init(app: Application) -> None:
     ]
     owner_cmds = admin_cmds[:-2] + [
         BotCommand("invitevendor", "Invite a vendor (owner)"),
+        BotCommand("newvendor", "Build a vendor's shop (owner)"),
+        BotCommand("handover", "Hand a built shop to its vendor (owner)"),
         BotCommand("syncsite", "Pull the SPBC site catalog (owner)"),
         BotCommand("master", "Master fees/invoices (owner)"),
         BotCommand("backup", "Encrypted DB snapshot (owner)"),
@@ -6710,6 +6915,9 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("linksite", cmd_linksite))
     app.add_handler(CommandHandler("webpanel", cmd_webpanel))
     app.add_handler(CommandHandler("invitevendor", cmd_invitevendor))
+    app.add_handler(CommandHandler("newvendor", cmd_newvendor))
+    app.add_handler(CommandHandler("handover", cmd_handover))
+    app.add_handler(CommandHandler("restock", cmd_restock))
     app.add_handler(CallbackQueryHandler(cb_adm_sites, pattern=r"^adm_sites$"))
     app.add_handler(CallbackQueryHandler(cb_sitesync, pattern=r"^sitesync:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_siterm, pattern=r"^siterm:\d+$"))

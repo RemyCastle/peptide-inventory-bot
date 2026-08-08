@@ -177,6 +177,13 @@ def ensure_webpanel_tables() -> None:
             );
             """
         )
+        cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(vendor_invites)").fetchall()
+        }
+        if "shop_chat_id" not in cols:
+            # set when the owner pre-built the shop; claiming adopts it
+            conn.execute("ALTER TABLE vendor_invites ADD COLUMN shop_chat_id INTEGER")
 
 
 # ── Panel tokens ─────────────────────────────────────────────────────────────
@@ -227,13 +234,20 @@ def resolve_token(raw: str) -> Optional[dict]:
     return {"chat_id": int(row["chat_id"]), "user_id": int(row["user_id"])}
 
 
-def panel_url(base_url: str, raw_token: str) -> str:
-    return f"{base_url.rstrip('/')}/panel?t={urllib.parse.quote(raw_token)}"
+def panel_url(base_url: str, raw_token: str, mode: str = "") -> str:
+    """mode='restock' opens straight into the shipment-receiving view."""
+    url = f"{base_url.rstrip('/')}/panel?t={urllib.parse.quote(raw_token)}"
+    if mode:
+        url += f"&mode={urllib.parse.quote(mode)}"
+    return url
 
 
 # ── Vendor invites ───────────────────────────────────────────────────────────
 
-def create_vendor_invite(created_by: int, note: str = "") -> str:
+def create_vendor_invite(
+    created_by: int, note: str = "", shop_chat_id: int | None = None
+) -> str:
+    """Invite token. With shop_chat_id, claiming adopts that pre-built shop."""
     ensure_webpanel_tables()
     # Telegram start payloads allow [A-Za-z0-9_-] up to 64 chars, but '_'/'-'
     # break Markdown parsing when the link is rendered — keep it hex.
@@ -242,36 +256,40 @@ def create_vendor_invite(created_by: int, note: str = "") -> str:
     with db.get_db() as conn:
         conn.execute(
             "INSERT INTO vendor_invites (token_hash, note, created_by, created_at, "
-            "expires_at) VALUES (?, ?, ?, ?, ?)",
+            "expires_at, shop_chat_id) VALUES (?, ?, ?, ?, ?, ?)",
             (
                 _hash(raw),
                 note.strip()[:80],
                 int(created_by),
                 _ts(now),
                 _ts(now + timedelta(hours=INVITE_TTL_HOURS)),
+                int(shop_chat_id) if shop_chat_id else None,
             ),
         )
     return raw
 
 
-def redeem_vendor_invite(raw: str, user_id: int) -> tuple[bool, str]:
-    """One-time redemption. Returns (ok, message)."""
+def redeem_vendor_invite(
+    raw: str, user_id: int
+) -> tuple[bool, str, Optional[int]]:
+    """One-time redemption. Returns (ok, message, pre_built_shop_chat_id)."""
     ensure_webpanel_tables()
     with db.get_db() as conn:
         row = conn.execute(
             "SELECT * FROM vendor_invites WHERE token_hash = ?", (_hash(raw),)
         ).fetchone()
         if not row:
-            return False, "Invite not found."
+            return False, "Invite not found.", None
         if row["used_by"] is not None:
-            return False, "Invite already used."
+            return False, "Invite already used.", None
         if _ts(_utc_now()) > str(row["expires_at"]):
-            return False, "Invite expired — ask for a fresh link."
+            return False, "Invite expired — ask for a fresh link.", None
         conn.execute(
             "UPDATE vendor_invites SET used_by = ?, used_at = ? WHERE id = ?",
             (int(user_id), _ts(_utc_now()), int(row["id"])),
         )
-    return True, str(row["note"] or "")
+        shop_id = row["shop_chat_id"]
+    return True, str(row["note"] or ""), (int(shop_id) if shop_id else None)
 
 
 # ── JSON API (pure functions; HTTP layer is a thin wrapper) ─────────────────
@@ -496,6 +514,44 @@ def api_media(tok: dict, payload: dict) -> tuple[int, dict]:
     return 200, {"ok": True, "coa_url": url}
 
 
+def api_restock(tok: dict, payload: dict) -> tuple[int, dict]:
+    """Shipment arrived: ADD to stock (never replace). {items:[{id, add}]}"""
+    chat_id = tok["chat_id"]
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        return _err(400, "Nothing to add")
+    owned = {int(p["id"]): p for p in db.list_products(chat_id, active_only=False)}
+    applied, skipped = [], []
+    for it in items[:200]:
+        if not isinstance(it, dict):
+            continue
+        try:
+            pid = int(it.get("id"))
+            add = int(it.get("add") or 0)
+        except (TypeError, ValueError):
+            continue
+        if add == 0:
+            continue
+        if add < 0 or add > 100_000:
+            skipped.append(f"#{pid}: bad quantity")
+            continue
+        row = owned.get(pid)
+        if row is None:
+            skipped.append(f"#{pid}: not in your shop")
+            continue
+        before = int(row.get("stock") or 0)
+        after = before + add
+        db.update_product(pid, stock=after)
+        _audit_stock(chat_id, row, before, after, tok["user_id"])
+        applied.append({"id": pid, "name": row["name"], "added": add, "stock": after})
+    return 200, {
+        "ok": True,
+        "applied": applied,
+        "count": len(applied),
+        "skipped": skipped[:10],
+    }
+
+
 def api_bulk(tok: dict, payload: dict) -> tuple[int, dict]:
     text = str(payload.get("text") or "")
     if not text.strip():
@@ -592,6 +648,7 @@ def api_shop(tok: dict, payload: dict) -> tuple[int, dict]:
 _API_POST = {
     "product": api_product,
     "media": api_media,
+    "restock": api_restock,
     "bulk": api_bulk,
     "payment": api_payment,
     "shipping": api_shipping,
@@ -694,7 +751,9 @@ expired — send <b>/webpanel</b> to the bot for a fresh one.</div></div>
 <script>
 // Keep the token out of the visible URL (browser history / shoulder surfing).
 // It stays in sessionStorage for reloads; the emailed link always re-supplies it.
-let T=new URLSearchParams(location.search).get('t')||'';
+const Q=new URLSearchParams(location.search);
+let T=Q.get('t')||'';
+const MODE=Q.get('mode')||'';
 try{
   if(T){sessionStorage.setItem('spbc_panel_t',T);
     history.replaceState(null,'',location.pathname);}
@@ -768,6 +827,25 @@ function render(){
       <div><button class="sub" id="shop-save">Save</button></div></div>
   </div>
   <div class="card"><h2>Products (${S.products.length})</h2>
+    <div class="flex" style="margin-bottom:10px">
+      <button id="restock-on">📦 Received a shipment</button>
+      <span class="tag grow">Adds to stock instead of replacing it</span>
+    </div>
+    <div id="restock" style="display:none">
+      <div class="tag" style="margin-bottom:6px">Type how many arrived of each
+        item, then Apply. Blank = unchanged.</div>
+      ${S.products.map(p=>`<div class="row rs" data-id="${p.id}">
+        <div class="name"><label>${esc(p.name)}</label>
+          <span class="tag">now: ${p.stock}</span></div>
+        <div class="num"><label>+ arrived</label>
+          <input class="rs-add" type="number" step="1" min="0" placeholder="0"></div>
+      </div>`).join('')}
+      <div class="flex">
+        <button class="sub" id="restock-off">Cancel</button>
+        <span class="grow"></span>
+        <button id="restock-go">✅ Apply shipment</button>
+      </div>
+    </div>
     <div id="plist">${S.products.map(prodRow).join('')}</div>
     <div class="prod"><div class="row">
       <div class="name"><label>New product</label><input id="np-name" placeholder="BPC-157 10MG"></div>
@@ -845,6 +923,22 @@ function pickFile(accept,resize){
 async function media(body){const d=await api('media',body);if(d.ok)load();return d;}
 
 function wire(){
+  const rs=$('#restock'),pl=$('#plist');
+  const openRestock=()=>{rs.style.display='';pl.style.display='none';
+    $('#restock-on').style.display='none';
+    rs.scrollIntoView({behavior:'smooth',block:'start'});};
+  $('#restock-on').onclick=openRestock;
+  if(MODE==='restock')openRestock();
+  $('#restock-off').onclick=()=>{rs.style.display='none';pl.style.display='';
+    $('#restock-on').style.display='';};
+  $('#restock-go').onclick=async()=>{
+    const items=[...document.querySelectorAll('#restock .rs')].map(el=>({
+      id:el.dataset.id, add:parseInt(el.querySelector('.rs-add').value||'0',10)
+    })).filter(x=>x.add>0);
+    if(!items.length){toast('Enter at least one quantity',true);return;}
+    const d=await api('restock',{items});
+    if(d.ok){toast(`Stock added to ${d.count} product${d.count===1?'':'s'} ✅`);
+      load();}};
   $('#shop-save').onclick=async()=>{
     const d=await api('shop',{title:$('#shop-title').value});
     if(d.ok){toast('Shop name saved');S.shop.title=$('#shop-title').value;
