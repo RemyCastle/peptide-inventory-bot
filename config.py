@@ -120,6 +120,8 @@ except ValueError:
 # Public base URL of this service (for vendor web panel links).
 # e.g. https://spbc-supplier-bot.onrender.com — empty disables /webpanel links.
 PANEL_BASE_URL = os.getenv("PANEL_BASE_URL", "").strip().rstrip("/")
+# Where panel-uploaded product photos / COA files are stored (persistent disk)
+MEDIA_DIR = os.getenv("MEDIA_DIR", str(DB_PATH.parent / "uploads"))
 
 # Schema version expected by this code release
 SCHEMA_VERSION = 10

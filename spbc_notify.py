@@ -46,7 +46,7 @@ PLACED_STATUSES = {"pending", "placed", "received", "order_received"}
 PAID_STATUSES = {"paid", "shipped", "complete"}
 
 SESSION_TTL_SEC = 48 * 60 * 60
-MAX_BODY_BYTES = 256 * 1024
+MAX_BODY_BYTES = 9 * 1024 * 1024  # panel photo uploads travel as base64 JSON
 RECENT_CHATS_CAP = 200
 
 # ── Shared state (HTTP thread + PTB loop) ────────────────────────────────────
@@ -798,6 +798,30 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path in ("/", "/health"):
             self._json(200, _status_body())
+            return
+        if path.startswith("/media/"):
+            # Public by necessity: Telegram fetches product photos by URL.
+            # Names are 128-bit random and regex-validated before any file open.
+            import webpanel
+
+            got = webpanel.read_media(path[len("/media/") :])
+            if got is None:
+                self._json(404, {"error": "not_found"})
+                return
+            blob, ctype = got
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(blob)))
+            # Never let a stored file be interpreted as markup
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'none'")
+            self.send_header("X-Robots-Tag", "noindex")
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            if ctype == "application/pdf":
+                # download rather than render: a PDF can carry active content
+                self.send_header("Content-Disposition", "attachment")
+            self.end_headers()
+            self.wfile.write(blob)
             return
         if path.startswith("/panel"):
             import webpanel

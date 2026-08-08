@@ -47,8 +47,11 @@ services:
       - key: SITE_SYNC_INTERVAL_MIN
         value: "360"
       # Public URL of THIS service — enables /webpanel vendor console links
+      # and the photo/COA uploads served from /media
       - key: PANEL_BASE_URL
         sync: false
+      - key: MEDIA_DIR
+        value: /data/uploads
     disk:
       name: unicornfartzz-data
       mountPath: /data

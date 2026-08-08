@@ -178,6 +178,122 @@ class ApiTests(WebPanelBase):
         self.assertEqual(db.get_shop(SHOP)["title"], "Oliver Peptides")
 
 
+JPEG = b"\xff\xd8\xff\xe0" + b"x" * 40
+PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 40
+PDF = b"%PDF-1.4\n" + b"x" * 40
+
+
+def data_url(mime, blob):
+    import base64
+
+    return f"data:{mime};base64," + base64.b64encode(blob).decode()
+
+
+class UploadTests(WebPanelBase):
+    def setUp(self):
+        super().setUp()
+        self._media = tempfile.TemporaryDirectory()
+        self._p1 = mock.patch.object(webpanel, "MEDIA_DIR", self._media.name)
+        self._p2 = mock.patch.object(
+            webpanel, "PANEL_BASE_URL", "https://bot.example.com"
+        )
+        self._p1.start()
+        self._p2.start()
+        webpanel._upload_budget.clear()
+        self.pid = db.add_product(SHOP, "BPC", 41.0, 5)
+
+    def tearDown(self):
+        self._p1.stop()
+        self._p2.stop()
+        self._media.cleanup()
+        super().tearDown()
+
+    def test_photo_upload_sets_url(self):
+        code, data = webpanel.api_media(
+            self.tok, {"id": self.pid, "kind": "photo", "data_url": data_url("image/jpeg", JPEG)}
+        )
+        self.assertEqual(code, 200, data)
+        url = data["photo_url"]
+        self.assertTrue(url.startswith("https://bot.example.com/media/"))
+        self.assertEqual(db.get_product(self.pid)["photo_file_id"], url)
+        # served back with the right type
+        got = webpanel.read_media(url.rsplit("/", 1)[-1])
+        self.assertIsNotNone(got)
+        self.assertEqual(got[1], "image/jpeg")
+
+    def test_declared_mime_cannot_smuggle_a_type(self):
+        """An HTML payload labelled image/png must be refused (magic wins)."""
+        evil = b"<html><script>alert(1)</script></html>"
+        code, data = webpanel.api_media(
+            self.tok,
+            {"id": self.pid, "kind": "photo", "data_url": data_url("image/png", evil)},
+        )
+        self.assertEqual(code, 400)
+        self.assertIn("JPG, PNG or PDF", data["error"])
+
+    def test_pdf_rejected_as_product_photo(self):
+        code, _ = webpanel.api_media(
+            self.tok,
+            {"id": self.pid, "kind": "photo", "data_url": data_url("application/pdf", PDF)},
+        )
+        self.assertEqual(code, 400)
+
+    def test_coa_pdf_and_link(self):
+        code, data = webpanel.api_media(
+            self.tok,
+            {"id": self.pid, "kind": "coa", "data_url": data_url("application/pdf", PDF)},
+        )
+        self.assertEqual(code, 200, data)
+        self.assertTrue(db.get_product(self.pid)["coa_url"].endswith(".pdf"))
+        code2, data2 = webpanel.api_media(
+            self.tok, {"id": self.pid, "kind": "coa", "url": "https://lab.example.com/a.pdf"}
+        )
+        self.assertEqual(code2, 200, data2)
+        self.assertEqual(
+            db.get_product(self.pid)["coa_url"], "https://lab.example.com/a.pdf"
+        )
+        code3, _ = webpanel.api_media(
+            self.tok, {"id": self.pid, "kind": "coa", "url": "javascript:alert(1)"}
+        )
+        self.assertEqual(code3, 400)
+
+    def test_clear_photo_and_coa(self):
+        webpanel.api_media(
+            self.tok, {"id": self.pid, "kind": "photo", "data_url": data_url("image/png", PNG)}
+        )
+        webpanel.api_media(self.tok, {"id": self.pid, "kind": "photo", "clear": True})
+        self.assertIsNone(db.get_product(self.pid)["photo_file_id"])
+
+    def test_cannot_upload_to_another_shop(self):
+        db.ensure_shop(SHOP + 1, title="Other")
+        other = db.add_product(SHOP + 1, "Foreign", 10.0, 1)
+        code, _ = webpanel.api_media(
+            self.tok, {"id": other, "kind": "photo", "data_url": data_url("image/png", PNG)}
+        )
+        self.assertEqual(code, 404)
+
+    def test_media_name_validation_blocks_traversal(self):
+        for bad in (
+            "../../etc/passwd",
+            "..%2f..%2fetc",
+            "abc.jpg",
+            "0123456789abcdef0123456789abcdef.exe",
+            "",
+        ):
+            self.assertIsNone(webpanel.read_media(bad), bad)
+
+    def test_daily_budget_enforced(self):
+        webpanel._upload_budget[SHOP] = {
+            "day": webpanel._utc_now().strftime("%Y-%m-%d"),
+            "count": webpanel.UPLOADS_PER_DAY,
+            "bytes": 0,
+        }
+        code, data = webpanel.api_media(
+            self.tok, {"id": self.pid, "kind": "photo", "data_url": data_url("image/png", PNG)}
+        )
+        self.assertEqual(code, 429)
+
+
 class HttpLayerTests(WebPanelBase):
     def test_get_page(self):
         code, ctype, body = webpanel.handle_panel_get("/panel", {})

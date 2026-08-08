@@ -20,22 +20,124 @@ creates the vendor's personal shop + admin rights + their panel link.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
+import re
 import secrets
 import urllib.parse
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import db
 import inventory_import
+from config import MEDIA_DIR, PANEL_BASE_URL
 
 log = logging.getLogger("webpanel")
 
 TOKEN_TTL_HOURS = 72
 INVITE_TTL_HOURS = 14 * 24
 MAX_BULK_BYTES = 100_000
+
+# ── Uploads (product photos + COA files) ────────────────────────────────────
+MAX_UPLOAD_BYTES = 6 * 1024 * 1024
+# Declared mime is never trusted — the magic bytes decide.
+_MAGIC = (
+    (b"\xff\xd8\xff", "image/jpeg", "jpg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png", "png"),
+    (b"%PDF-", "application/pdf", "pdf"),
+)
+MEDIA_NAME_RE = re.compile(r"^[a-f0-9]{32}\.(jpg|png|pdf)$")
+_CONTENT_TYPES = {
+    "jpg": "image/jpeg",
+    "png": "image/png",
+    "pdf": "application/pdf",
+}
+
+
+# Per-shop upload budget so a leaked panel link can't fill the disk
+UPLOADS_PER_DAY = 60
+UPLOAD_BYTES_PER_DAY = 60 * 1024 * 1024
+_upload_budget: dict[int, dict] = {}
+
+
+def _check_budget(chat_id: int, size: int) -> tuple[bool, str]:
+    day = _utc_now().strftime("%Y-%m-%d")
+    b = _upload_budget.get(int(chat_id))
+    if not b or b["day"] != day:
+        b = {"day": day, "count": 0, "bytes": 0}
+        _upload_budget[int(chat_id)] = b
+    if b["count"] >= UPLOADS_PER_DAY or b["bytes"] + size > UPLOAD_BYTES_PER_DAY:
+        return False, "Daily upload limit reached — try again tomorrow."
+    b["count"] += 1
+    b["bytes"] += size
+    return True, ""
+
+
+def media_dir() -> Path:
+    p = Path(MEDIA_DIR)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def sniff_kind(blob: bytes) -> Optional[tuple[str, str]]:
+    """(mime, extension) from magic bytes, or None if not an allowed type."""
+    for magic, mime, ext in _MAGIC:
+        if blob.startswith(magic):
+            return mime, ext
+    return None
+
+
+def save_upload(data_url: str) -> tuple[bool, str]:
+    """Validate a data: URL and store it. Returns (ok, filename_or_error)."""
+    raw = (data_url or "").strip()
+    if not raw.startswith("data:"):
+        return False, "Expected a data: URL"
+    head, _, b64 = raw.partition(",")
+    if not b64 or "base64" not in head:
+        return False, "Upload must be base64 encoded"
+    # Cheap size gate before decoding (base64 is ~4/3 of the payload)
+    if len(b64) > MAX_UPLOAD_BYTES * 4 // 3 + 1024:
+        return False, "File too large (max 6 MB)"
+    try:
+        blob = base64.b64decode(b64, validate=True)
+    except Exception:
+        return False, "Could not read that file"
+    if not blob or len(blob) > MAX_UPLOAD_BYTES:
+        return False, "File too large (max 6 MB)"
+    sniffed = sniff_kind(blob)
+    if sniffed is None:
+        return False, "Only JPG, PNG or PDF files are accepted"
+    _mime, ext = sniffed
+    name = f"{secrets.token_hex(16)}.{ext}"
+    try:
+        (media_dir() / name).write_bytes(blob)
+    except OSError as exc:
+        log.error("upload write failed: %s", exc)
+        return False, "Could not save the file"
+    return True, name
+
+
+def media_url(filename: str) -> str:
+    return f"{PANEL_BASE_URL.rstrip('/')}/media/{filename}"
+
+
+def read_media(filename: str) -> Optional[tuple[bytes, str]]:
+    """(bytes, content_type) for a stored file, or None. Traversal-safe."""
+    if not MEDIA_NAME_RE.match(filename or ""):
+        return None
+    base = media_dir().resolve()
+    path = (base / filename).resolve()
+    # resolve() + prefix check: a crafted name can never escape the dir
+    if path.parent != base or not path.is_file():
+        return None
+    ext = filename.rsplit(".", 1)[-1]
+    try:
+        return path.read_bytes(), _CONTENT_TYPES[ext]
+    except OSError:
+        return None
 
 
 def _utc_now() -> datetime:
@@ -202,6 +304,7 @@ def _audit_stock(
 
 
 def _product_public(p: dict) -> dict:
+    photo = (p.get("photo_file_id") or "").strip()
     return {
         "id": p["id"],
         "name": p["name"],
@@ -211,6 +314,11 @@ def _product_public(p: dict) -> dict:
         "unit": p.get("unit") or "vial",
         "active": int(p.get("active") or 0),
         "site_key": p.get("site_key"),
+        # only URL photos can be shown in a browser (Telegram file_ids can't)
+        "photo_url": photo if photo.startswith("http") else "",
+        "has_photo": bool(photo),
+        "coa_url": (p.get("coa_url") or "").strip(),
+        "has_coa_file": bool((p.get("coa_file_id") or "").strip()),
     }
 
 
@@ -331,6 +439,63 @@ def api_product(tok: dict, payload: dict) -> tuple[int, dict]:
     return 200, {"ok": True, "id": pid, "created": False}
 
 
+def api_media(tok: dict, payload: dict) -> tuple[int, dict]:
+    """Upload a product photo or COA file and attach it to a product."""
+    chat_id = tok["chat_id"]
+    kind = str(payload.get("kind") or "").strip()
+    if kind not in ("photo", "coa"):
+        return _err(400, "Unknown upload kind")
+    try:
+        pid = int(payload.get("id"))
+    except (TypeError, ValueError):
+        return _err(400, "Bad product id")
+    current = db.get_product(pid)
+    if not current or int(current["chat_id"]) != int(chat_id):
+        return _err(404, "Product not found in your shop")
+
+    # Clearing an existing file/link
+    if payload.get("clear"):
+        if kind == "photo":
+            db.update_product(pid, photo_file_id=None)
+        else:
+            with db.get_db() as conn:
+                conn.execute(
+                    "UPDATE products SET coa_url = NULL, coa_file_id = NULL, "
+                    "coa_file_type = NULL, coa_filename = NULL, updated_at = ? "
+                    "WHERE id = ? AND chat_id = ?",
+                    (_ts(_utc_now()), pid, int(chat_id)),
+                )
+        return 200, {"ok": True, "cleared": True}
+
+    # COA can be a plain link instead of a file
+    link = str(payload.get("url") or "").strip()
+    if kind == "coa" and link:
+        ok, msg = db.set_product_coa_url(pid, int(chat_id), link)
+        if not ok:
+            return _err(400, msg)
+        return 200, {"ok": True, "coa_url": msg}
+
+    if not PANEL_BASE_URL:
+        return _err(503, "Uploads are not configured on this deploy")
+    data_url = str(payload.get("data_url") or "")
+    okb, whyb = _check_budget(chat_id, len(data_url))
+    if not okb:
+        return _err(429, whyb)
+    ok, result = save_upload(data_url)
+    if not ok:
+        return _err(400, result)
+    url = media_url(result)
+    if kind == "photo":
+        if not result.endswith((".jpg", ".png")):
+            return _err(400, "Product photos must be JPG or PNG")
+        db.update_product(pid, photo_file_id=url)
+        return 200, {"ok": True, "photo_url": url}
+    ok2, msg2 = db.set_product_coa_url(pid, int(chat_id), url)
+    if not ok2:
+        return _err(400, msg2)
+    return 200, {"ok": True, "coa_url": url}
+
+
 def api_bulk(tok: dict, payload: dict) -> tuple[int, dict]:
     text = str(payload.get("text") or "")
     if not text.strip():
@@ -426,6 +591,7 @@ def api_shop(tok: dict, payload: dict) -> tuple[int, dict]:
 
 _API_POST = {
     "product": api_product,
+    "media": api_media,
     "bulk": api_bulk,
     "payment": api_payment,
     "shipping": api_shipping,
@@ -513,6 +679,11 @@ PANEL_HTML = """<!doctype html>
   textarea{min-height:110px;font-family:ui-monospace,Consolas,monospace;
            font-size:.85rem}
   .low{color:var(--warn);font-weight:600}
+  .thumb{width:44px;height:44px;object-fit:cover;border-radius:8px;
+         border:1px solid var(--line)}
+  .media{margin-top:8px;flex-wrap:wrap}
+  .media button{padding:6px 10px;font-size:.85rem}
+  .media a{color:var(--accent)}
 </style>
 </head>
 <body>
@@ -521,7 +692,14 @@ PANEL_HTML = """<!doctype html>
 expired — send <b>/webpanel</b> to the bot for a fresh one.</div></div>
 <div class="msg" id="msg"></div>
 <script>
-const T=new URLSearchParams(location.search).get('t')||'';
+// Keep the token out of the visible URL (browser history / shoulder surfing).
+// It stays in sessionStorage for reloads; the emailed link always re-supplies it.
+let T=new URLSearchParams(location.search).get('t')||'';
+try{
+  if(T){sessionStorage.setItem('spbc_panel_t',T);
+    history.replaceState(null,'',location.pathname);}
+  else{T=sessionStorage.getItem('spbc_panel_t')||'';}
+}catch(e){/* private mode: token simply stays in the URL */}
 const $=s=>document.querySelector(s);
 let S=null;
 function toast(t,bad){const m=$('#msg');m.textContent=t;
@@ -545,6 +723,12 @@ function esc(x){const d=document.createElement('div');
   d.textContent=x==null?'':String(x);return d.innerHTML;}
 function prodRow(p){
   const low=p.active&&p.stock<=2?' low':'';
+  const thumb=p.photo_url
+    ? `<img class="thumb" src="${esc(p.photo_url)}" alt="">`
+    : (p.has_photo?'<span class="tag">photo set in Telegram</span>':'');
+  const coaBit=p.coa_url
+    ? `<a href="${esc(p.coa_url)}" target="_blank" rel="noopener">COA ✓</a>`
+    : (p.has_coa_file?'<span class="tag">COA file in Telegram</span>':'<span class="tag">no COA</span>');
   return `<div class="prod${p.active?'':' off'}" data-id="${p.id}">
     <div class="row">
       <div class="name"><label>Product</label>
@@ -555,6 +739,18 @@ function prodRow(p){
         <input class="f-kit" type="number" step="0.01" min="0" value="${p.kit_price==null?'':p.kit_price}"></div>
       <div class="num"><label>Stock</label>
         <input class="f-stock${low}" type="number" step="1" min="0" value="${p.stock}"></div>
+    </div>
+    <div class="flex media">
+      ${thumb}
+      <button class="sub b-photo">📷 ${p.has_photo?'Change':'Add'} photo</button>
+      ${p.has_photo?'<button class="danger b-photox">✕</button>':''}
+      <span class="grow"></span>
+    </div>
+    <div class="flex media">
+      <span class="tag">COA:</span> ${coaBit}
+      <button class="sub b-coafile">📄 Upload PDF</button>
+      <button class="sub b-coalink">🔗 Link</button>
+      ${(p.coa_url||p.has_coa_file)?'<button class="danger b-coax">✕</button>':''}
     </div>
     <div class="flex">
       <label class="flex" style="margin:0"><input type="checkbox" class="f-act"
@@ -616,12 +812,67 @@ function render(){
     <span class="tag">Changes apply to new checkouts immediately.</span>
   </div>`;
   wire();}
+// Read a file, shrinking images client-side so phone photos upload fast
+function pickFile(accept,resize){
+  return new Promise(res=>{
+    const inp=document.createElement('input');
+    inp.type='file';inp.accept=accept;
+    inp.onchange=()=>{
+      const f=inp.files&&inp.files[0];
+      if(!f)return res(null);
+      if(f.size>6*1024*1024&&!resize)
+        {toast('File too big (max 6 MB)',true);return res(null);}
+      const fr=new FileReader();
+      fr.onload=()=>{
+        if(!resize)return res(fr.result);
+        const img=new Image();
+        img.onload=()=>{
+          const max=1280;
+          let{width:w,height:h}=img;
+          if(w>max||h>max){const s=Math.min(max/w,max/h);w=Math.round(w*s);h=Math.round(h*s);}
+          const c=document.createElement('canvas');c.width=w;c.height=h;
+          c.getContext('2d').drawImage(img,0,0,w,h);
+          res(c.toDataURL('image/jpeg',0.82));
+        };
+        img.onerror=()=>res(fr.result);
+        img.src=fr.result;
+      };
+      fr.readAsDataURL(f);
+    };
+    inp.click();
+  });
+}
+async function media(body){const d=await api('media',body);if(d.ok)load();return d;}
+
 function wire(){
   $('#shop-save').onclick=async()=>{
     const d=await api('shop',{title:$('#shop-title').value});
     if(d.ok){toast('Shop name saved');S.shop.title=$('#shop-title').value;
       $('#title').textContent=S.shop.title;}};
   document.querySelectorAll('#plist .prod').forEach(el=>{
+    const id=el.dataset.id;
+    el.querySelector('.b-photo').onclick=async()=>{
+      const d=await pickFile('image/*',true);
+      if(!d)return;
+      toast('Uploading photo…');
+      await media({id,kind:'photo',data_url:d});};
+    const px=el.querySelector('.b-photox');
+    if(px)px.onclick=async()=>{
+      if(!confirm('Remove this photo?'))return;
+      await media({id,kind:'photo',clear:true});};
+    el.querySelector('.b-coafile').onclick=async()=>{
+      const d=await pickFile('application/pdf,image/*',false);
+      if(!d)return;
+      toast('Uploading COA…');
+      await media({id,kind:'coa',data_url:d});};
+    el.querySelector('.b-coalink').onclick=async()=>{
+      const u=prompt('Paste the COA link (https://...)');
+      if(!u)return;
+      await media({id,kind:'coa',url:u.trim()});};
+    const cx=el.querySelector('.b-coax');
+    if(cx)cx.onclick=async()=>{
+      if(!confirm('Remove this COA?'))return;
+      await media({id,kind:'coa',clear:true});};
     el.querySelector('.b-save').onclick=async()=>{
       const d=await api('product',{id:el.dataset.id,
         name:el.querySelector('.f-name').value,

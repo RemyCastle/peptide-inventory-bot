@@ -21,6 +21,10 @@ retyping them in two places.
 The bot checks the feed right away and tells you how many
 products it found. Up to 5 sites per shop.
 
+  TIP: photos and COAs can be added straight from the panel —
+  tap 📷 on a product to upload a photo, and 📄 Upload PDF or
+  🔗 Link to attach its COA. No Telegram needed.
+
 ----------------------------------------------------------------
 2. WHAT YOUR SITE NEEDS TO PROVIDE
 ----------------------------------------------------------------
