@@ -7,16 +7,25 @@ shop (all bot shops except the SPBC master shop) against the order's lines:
 - vial lines cost qty × price; kit lines use kit_price when set (stock must
   cover qty × KIT_SIZE vials), else KIT_SIZE × vial price
 
-The owner gets a DM listing the top quotes with approve buttons. Approving
-sends that vendor a fulfillment request (their own prices, so totals are fine
-to show) and deducts their stock with an 'order_route' audit trail. Nothing is
-automatic: no button tap → nothing changes, and the regular supplier notify
-flow runs regardless.
+The owner gets a DM listing the top quotes (with margin) and an approve button.
+
+Approving sends the vendor an OFFER, not an order:
+
+    quoted → offered → accepted | declined | expired
+
+Nothing moves until the vendor taps Accept: no stock is deducted and the
+customer's shipping address is NOT included in the offer. On Accept the stock
+is re-checked, deducted with an 'order_route' audit trail, and the address is
+released. On Decline/expiry the owner is told and can offer the next-cheapest
+vendor with one tap. The owner can also override and push immediately.
+
+The regular supplier notify flow runs regardless of any of this.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import threading
 import time
@@ -30,8 +39,22 @@ log = logging.getLogger("order_router")
 QUOTE_TTL_SEC = 48 * 60 * 60
 MAX_SUGGESTIONS = 3
 
-# quote_id -> {order_number, shop_chat_id, shop_title, total, lines, shipping,
-#              created_at, applied}
+# How long a vendor has to answer an offer before the owner is nudged
+try:
+    OFFER_TTL_SEC = max(5, int(os.getenv("VENDOR_OFFER_TTL_MIN", "360"))) * 60
+except ValueError:
+    OFFER_TTL_SEC = 6 * 60 * 60
+
+# Quote lifecycle states
+QUOTED = "quoted"
+OFFERED = "offered"
+ACCEPTED = "accepted"
+DECLINED = "declined"
+EXPIRED = "expired"
+
+# quote_id -> {order_number, shop_chat_id, shop_title, total, order_total,
+#              lines, shipping, created_at, applied, state, offered_at,
+#              decline_reason}
 _pending: dict[str, dict] = {}
 _lock = threading.Lock()
 
@@ -154,6 +177,10 @@ def register_quotes(payload: dict, quotes: list[dict]) -> list[tuple[str, dict]]
         payload.get("order_number") or payload.get("orderNumber") or "UNKNOWN"
     )
     shipping = payload.get("shipping") if isinstance(payload.get("shipping"), dict) else None
+    try:
+        order_total = float(payload.get("total_cents") or 0) / 100.0
+    except (TypeError, ValueError):
+        order_total = 0.0
     out = []
     with _lock:
         for q in quotes[:MAX_SUGGESTIONS]:
@@ -163,13 +190,86 @@ def register_quotes(payload: dict, quotes: list[dict]) -> list[tuple[str, dict]]
                 "shop_chat_id": q["shop_chat_id"],
                 "shop_title": q["shop_title"],
                 "total": q["total"],
+                "order_total": order_total,
                 "lines": q["breakdown"],
                 "shipping": shipping,
                 "created_at": time.time(),
                 "applied": False,
+                "state": QUOTED,
+                "offered_at": None,
+                "decline_reason": "",
             }
-            out.append((qid, q))
+            # return the stored record so callers see order_total/state too
+            out.append((qid, dict(_pending[qid])))
     return out
+
+
+# ── Offer lifecycle ─────────────────────────────────────────────────────────
+
+def offer_quote(quote_id: str) -> tuple[bool, str, Optional[dict]]:
+    """quoted → offered. No stock moves; address stays withheld."""
+    with _lock:
+        q = _pending.get(quote_id)
+        if q is None:
+            return False, "Quote expired or unknown.", None
+        if q["state"] == ACCEPTED:
+            return False, "Already accepted.", dict(q)
+        if q["state"] == OFFERED:
+            return False, "Already waiting on this vendor.", dict(q)
+        q["state"] = OFFERED
+        q["offered_at"] = time.time()
+        return True, "Offer sent.", dict(q)
+
+
+def decline_quote(
+    quote_id: str, actor_id: int, reason: str = ""
+) -> tuple[bool, str, Optional[dict]]:
+    with _lock:
+        q = _pending.get(quote_id)
+        if q is None:
+            return False, "Offer expired or unknown.", None
+        if q["state"] == ACCEPTED:
+            return False, "Already accepted — can't decline now.", dict(q)
+        if q["state"] == DECLINED:
+            return False, "Already declined.", dict(q)
+        q["state"] = DECLINED
+        q["decline_reason"] = str(reason or "")[:200]
+        return True, "Declined.", dict(q)
+
+
+def expire_offer(quote_id: str) -> Optional[dict]:
+    """Mark an unanswered offer expired. Returns the quote if it was pending."""
+    with _lock:
+        q = _pending.get(quote_id)
+        if q is None or q["state"] != OFFERED:
+            return None
+        q["state"] = EXPIRED
+        return dict(q)
+
+
+def alternatives_for(order_number: str, exclude_quote_id: str = "") -> list[tuple[str, dict]]:
+    """Other vendors still available for this order, cheapest first."""
+    _prune()
+    with _lock:
+        items = [
+            (qid, dict(q))
+            for qid, q in _pending.items()
+            if q["order_number"] == order_number
+            and qid != exclude_quote_id
+            and q["state"] == QUOTED
+        ]
+    items.sort(key=lambda kv: kv[1]["total"])
+    return items
+
+
+def can_accept(quote_id: str, user_id: int) -> tuple[bool, str, Optional[dict]]:
+    """Only an admin of the offered vendor shop may accept/decline."""
+    q = get_quote(quote_id)
+    if q is None:
+        return False, "Offer expired or unknown.", None
+    if not db.is_admin(int(q["shop_chat_id"]), int(user_id)):
+        return False, "Only this shop's admins can answer.", None
+    return True, "", q
 
 
 def get_quote(quote_id: str) -> Optional[dict]:
@@ -191,31 +291,60 @@ def dismiss_order(order_number: str) -> int:
 
 def build_owner_suggestion(order_number: str, registered: list[tuple[str, dict]]) -> dict:
     """Text + inline keyboard spec (Telegram sendMessage reply_markup dict)."""
-    lines = [
-        f"💡 Vendor quotes for order {order_number}",
-        "These vendors can fill the whole order from current bot stock:",
-        "",
-    ]
+    order_total = 0.0
+    for _, q in registered:
+        order_total = float(q.get("order_total") or 0) or order_total
+    lines = [f"💡 Vendor quotes for order {order_number}"]
+    if order_total:
+        lines.append(f"Customer paid: ${order_total:.2f}")
+    lines += ["These vendors can fill the whole order from stock:", ""]
     buttons = []
     for i, (qid, q) in enumerate(registered, 1):
         tag = " ← cheapest" if i == 1 else ""
-        lines.append(f"{i}. {q['shop_title']} — ${q['total']:.2f}{tag}")
+        cost = float(q["total"])
+        line = f"{i}. {q['shop_title']} — cost ${cost:.2f}{tag}"
+        if order_total:
+            margin = order_total - cost
+            pct = (margin / order_total * 100) if order_total else 0
+            line += f"\n    margin ${margin:.2f} ({pct:.0f}%)"
+        lines.append(line)
         buttons.append(
             [
                 {
-                    "text": f"✅ Route to {q['shop_title'][:24]} (${q['total']:.2f})",
+                    "text": f"📨 Offer to {q['shop_title'][:22]} (${cost:.2f})",
                     "callback_data": f"routeq:{qid}",
                 }
             ]
         )
     lines += [
         "",
-        "Approving sends the vendor a fulfillment request and deducts "
-        "their bot stock. Doing nothing changes nothing — your regular "
+        "Offering asks the vendor to Accept first — no stock moves and the "
+        "customer's address stays private until they do. Your regular "
         "suppliers were notified as usual.",
     ]
     buttons.append([{"text": "✖️ Dismiss", "callback_data": f"routeq_x:{order_number}"}])
     return {"text": "\n".join(lines), "reply_markup": {"inline_keyboard": buttons}}
+
+
+def build_vendor_offer(quote: dict) -> str:
+    """Offer WITHOUT the customer address — released only after Accept."""
+    lines = [
+        "🤝 Fulfillment offer from SPBC",
+        f"Order: {quote['order_number']}",
+        "",
+        "Can you fill this from your stock?",
+        "",
+    ]
+    for ln in quote["lines"]:
+        kind = " (kit)" if ln["kind"] == "kit" else ""
+        lines.append(f"• {ln['qty']}× {ln['name']}{kind} — ${ln['cost']:.2f}")
+    lines += [
+        f"\nYou'd be paid: ${quote['total']:.2f}",
+        "",
+        "Tap Accept and we'll send the shipping address and reduce your stock. "
+        "Decline and nothing happens — we'll ask someone else.",
+    ]
+    return "\n".join(lines)
 
 
 def build_vendor_message(quote: dict) -> str:
@@ -313,6 +442,9 @@ def apply_route(quote_id: str, actor_id: int) -> tuple[bool, str, Optional[dict]
         log.error("apply_route failed: %s", exc, exc_info=exc)
         return False, "Routing failed — vendor stock unchanged.", None
 
+    with _lock:
+        if quote_id in _pending:
+            _pending[quote_id]["state"] = ACCEPTED
     log.info(
         "order_route applied order=%s shop=%s total=%s",
         quote["order_number"],

@@ -38,6 +38,12 @@ WHAT YOU NEED TO KNOW
       without tracking (admconfirmnt:), DM-failure fallbacks to admin,
       admin sale reports render Markdown w/ plain fallback, empty-state
       and dead-end fixes (group /start deep-link, SPBC shop button).
+    Vendor handshake (2026-08-08): owner taps 📨 Offer → vendor gets
+      Accept/Decline with NO customer address and NO stock movement; on
+      Accept stock is re-checked + deducted and the address is released,
+      owner notified. Decline/timeout (VENDOR_OFFER_TTL_MIN, default 6h)
+      pings the owner with a one-tap "offer next cheapest". Owner override:
+      ⚡ Send anyway. Quote DM now shows customer total, vendor cost, margin.
     Quote-and-suggest routing (order_router.py) — on paid site orders the
       bot quotes every vendor shop (full-basket, stock-gated, kit-aware) and
       DMs the owner top-3 quotes with approve buttons. Approve → vendor gets

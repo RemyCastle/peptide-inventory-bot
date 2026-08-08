@@ -5886,7 +5886,42 @@ async def cmd_backup_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ── Order routing approvals (quote-and-suggest) ─────────────────────────────
 
 
+async def _offer_expiry_watch(context, quote_id: str, owner_id: int) -> None:
+    """Nudge the owner if a vendor never answers."""
+    import order_router
+
+    await asyncio.sleep(order_router.OFFER_TTL_SEC)
+    quote = order_router.expire_offer(quote_id)
+    if not quote:
+        return  # answered already
+    alts = order_router.alternatives_for(quote["order_number"], quote_id)
+    rows = []
+    if alts:
+        nid, nq = alts[0]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"📨 Offer to {nq['shop_title'][:20]} (${nq['total']:.2f})",
+                    callback_data=f"routeq:{nid}",
+                )
+            ]
+        )
+    rows.append(
+        [InlineKeyboardButton("⚡ Send anyway", callback_data=f"routeqf:{quote_id}")]
+    )
+    try:
+        await context.bot.send_message(
+            owner_id,
+            f"⏰ {quote['shop_title']} hasn't answered the offer for order "
+            f"{quote['order_number']}.\nNothing was deducted or shared.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    except Exception:
+        pass
+
+
 async def cb_route_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner taps Offer → ask the vendor first. No stock moves, no address."""
     query = update.callback_query
     user = update.effective_user
     if not user or not db.is_owner(user.id):
@@ -5895,31 +5930,185 @@ async def cb_route_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     import order_router
 
     quote_id = query.data.split(":", 1)[1]
+    ok, msg, quote = order_router.offer_quote(quote_id)
+    if not ok:
+        await query.answer(msg, show_alert=True)
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=quote["shop_chat_id"],
+            text=order_router.build_vendor_offer(quote),
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Accept", callback_data=f"voffer_ok:{quote_id}"
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Decline", callback_data=f"voffer_no:{quote_id}"
+                        ),
+                    ]
+                ]
+            ),
+        )
+    except Exception as exc:
+        log.error("vendor_offer_failed: %s", exc)
+        order_router.decline_quote(quote_id, user.id, "could not reach vendor")
+        await query.answer("Could not message that vendor.", show_alert=True)
+        await safe_edit(
+            query,
+            f"⚠️ Couldn't reach *{quote['shop_title']}* — have they opened the "
+            "bot? Nothing was deducted.",
+        )
+        return
+    await query.answer("Offer sent — waiting on them.")
+    await safe_edit(
+        query,
+        f"📨 Offered order *{quote['order_number']}* to *{quote['shop_title']}* "
+        f"(${quote['total']:.2f}).\n"
+        "Waiting for them to accept. No stock moved and the customer's "
+        "address has not been shared.",
+        InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⚡ Skip asking — send now",
+                        callback_data=f"routeqf:{quote_id}",
+                    )
+                ]
+            ]
+        ),
+    )
+    context.application.create_task(
+        _offer_expiry_watch(context, quote_id, user.id)
+    )
+
+
+async def _finish_route(update, context, quote_id: str, *, forced: bool) -> None:
+    """Deduct stock and release the address to the vendor."""
+    import order_router
+
+    query = update.callback_query
+    user = update.effective_user
     ok, msg, quote = order_router.apply_route(quote_id, user.id)
     if not ok:
         await query.answer(msg, show_alert=True)
         return
-    await query.answer("Routed.")
-    vendor_text = order_router.build_vendor_message(quote)
-    sent_note = f"✅ Routed to {quote['shop_title']} — ${quote['total']:.2f}"
     try:
         await context.bot.send_message(
             chat_id=quote["shop_chat_id"],
-            text=vendor_text,
+            text=order_router.build_vendor_message(quote),
             disable_web_page_preview=True,
         )
+        delivered = True
     except Exception as exc:
         log.error("vendor_route_message_failed: %s", exc)
-        sent_note += (
-            "\n⚠️ Could not message the vendor (have they opened the bot?). "
-            "Their stock WAS deducted — forward the order manually."
-        )
+        delivered = False
     order_router.dismiss_order(quote["order_number"])
+    note = (
+        f"✅ {quote['shop_title']} is fulfilling order {quote['order_number']} "
+        f"— ${quote['total']:.2f}\nStock deducted (audit: order_route)."
+    )
+    if forced:
+        note = "⚡ Sent without waiting.\n" + note
+    if not delivered:
+        note += (
+            "\n⚠️ Could not deliver the details — forward the order manually."
+        )
+    owner_id = min(OWNER_IDS) if OWNER_IDS else None
+    if forced or (user and db.is_owner(user.id)):
+        await safe_edit(query, note)
+    else:
+        # vendor accepted — confirm to them, report to the owner
+        await safe_edit(
+            query,
+            f"✅ Thanks — order {quote['order_number']} is yours.\n"
+            "Shipping details sent below; your stock has been updated.",
+        )
+        if owner_id:
+            try:
+                await context.bot.send_message(owner_id, note)
+            except Exception:
+                pass
+
+
+async def cb_vendor_accept(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    import order_router
+
+    quote_id = query.data.split(":", 1)[1]
+    allowed, why, _ = order_router.can_accept(quote_id, user.id if user else 0)
+    if not allowed:
+        await query.answer(why, show_alert=True)
+        return
+    await query.answer("Accepted ✅")
+    await _finish_route(update, context, quote_id, forced=False)
+
+
+async def cb_vendor_decline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    import order_router
+
+    quote_id = query.data.split(":", 1)[1]
+    allowed, why, _ = order_router.can_accept(quote_id, user.id if user else 0)
+    if not allowed:
+        await query.answer(why, show_alert=True)
+        return
+    ok, msg, quote = order_router.decline_quote(quote_id, user.id)
+    if not ok:
+        await query.answer(msg, show_alert=True)
+        return
+    await query.answer("Declined — thanks for the quick answer.")
     await safe_edit(
         query,
-        f"{sent_note}\nOrder: {quote['order_number']}\n"
-        "Their stock was deducted (audit: order_route).",
+        f"❌ Declined order {quote['order_number']}. Nothing changed on your "
+        "side — we'll ask someone else.",
     )
+    owner_id = min(OWNER_IDS) if OWNER_IDS else None
+    if not owner_id:
+        return
+    alts = order_router.alternatives_for(quote["order_number"], quote_id)
+    rows = []
+    if alts:
+        nid, nq = alts[0]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"📨 Offer to {nq['shop_title'][:20]} (${nq['total']:.2f})",
+                    callback_data=f"routeq:{nid}",
+                )
+            ]
+        )
+    text = (
+        f"❌ *{quote['shop_title']}* declined order {quote['order_number']}.\n"
+        "No stock moved and no address was shared."
+    )
+    if not alts:
+        text += "\nNo other vendor can fill this one from stock."
+    try:
+        await context.bot.send_message(
+            owner_id,
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+        )
+    except Exception:
+        pass
+
+
+async def cb_route_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner override: skip the handshake and push the order now."""
+    query = update.callback_query
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await query.answer("Owners only.", show_alert=True)
+        return
+    quote_id = query.data.split(":", 1)[1]
+    await query.answer("Sending…")
+    await _finish_route(update, context, quote_id, forced=True)
 
 
 async def cb_route_dismiss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6485,6 +6674,9 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_siterm, pattern=r"^siterm:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_sitehelp, pattern=r"^sitehelp$"))
     app.add_handler(CallbackQueryHandler(cb_route_approve, pattern=r"^routeq:[0-9a-f]+$"))
+    app.add_handler(CallbackQueryHandler(cb_route_force, pattern=r"^routeqf:[0-9a-f]+$"))
+    app.add_handler(CallbackQueryHandler(cb_vendor_accept, pattern=r"^voffer_ok:[0-9a-f]+$"))
+    app.add_handler(CallbackQueryHandler(cb_vendor_decline, pattern=r"^voffer_no:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(cb_route_dismiss, pattern=r"^routeq_x:"))
 
     app.add_handler(CallbackQueryHandler(cb_pickshop, pattern=r"^pickshop:-?\d+$"))

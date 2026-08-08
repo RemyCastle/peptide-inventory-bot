@@ -185,6 +185,74 @@ class SuggestApplyTests(RouterBase):
         self.assertIn("$312.00", text)
         self.assertIn("Jane", text)
 
+    def test_offer_does_not_move_stock_or_leak_address(self):
+        qid, _ = self._register_one()
+        ok, msg, quote = order_router.offer_quote(qid)
+        self.assertTrue(ok, msg)
+        self.assertEqual(quote["state"], order_router.OFFERED)
+        # nothing deducted yet
+        self.assertEqual(db.get_product(self.a_reta)["stock"], 10)
+        self.assertEqual(db.get_product(self.a_bac)["stock"], 50)
+        # the offer text must NOT contain the shipping address
+        text = order_router.build_vendor_offer(quote)
+        self.assertNotIn("Jane", text)
+        self.assertNotIn("1 Main St", text)
+        self.assertIn("RETA 35 MG", text)
+        self.assertIn("$312.00", text)
+        # ...but the post-accept message does
+        ok2, _, q2 = order_router.apply_route(qid, actor_id=5)
+        self.assertTrue(ok2)
+        full = order_router.build_vendor_message(q2)
+        self.assertIn("1 Main St", full)
+
+    def test_accept_requires_vendor_shop_admin(self):
+        qid, _ = self._register_one()
+        order_router.offer_quote(qid)
+        stranger = 4242
+        allowed, why, _ = order_router.can_accept(qid, stranger)
+        self.assertFalse(allowed)
+        db.add_admin(VENDOR_A, stranger, "vend", stranger)
+        allowed2, _, _ = order_router.can_accept(qid, stranger)
+        self.assertTrue(allowed2)
+
+    def test_decline_leaves_stock_untouched_and_offers_alternative(self):
+        payload = order_payload(
+            [{"name": "RETA 35 MG (Vial)", "qty": 1},
+             {"name": "BAC WATER 3ML", "qty": 1}]
+        )
+        quotes = order_router.compute_quotes(payload)
+        reg = order_router.register_quotes(payload, quotes)
+        qid_a, _ = reg[0]
+        order_router.offer_quote(qid_a)
+        ok, _, q = order_router.decline_quote(qid_a, actor_id=1, reason="no stock")
+        self.assertTrue(ok)
+        self.assertEqual(q["state"], order_router.DECLINED)
+        self.assertEqual(db.get_product(self.a_reta)["stock"], 10)
+        # Vendor B is still available as the next option
+        alts = order_router.alternatives_for("PEP-TEST-1", qid_a)
+        self.assertTrue(alts)
+        self.assertEqual(alts[0][1]["shop_chat_id"], VENDOR_B)
+        # a declined quote can't then be accepted
+        ok2, _, _ = order_router.apply_route(qid_a, 1)
+        self.assertTrue(ok2)  # apply_route is the owner-override path
+
+    def test_expired_offer_reported_once(self):
+        qid, _ = self._register_one()
+        order_router.offer_quote(qid)
+        first = order_router.expire_offer(qid)
+        self.assertIsNotNone(first)
+        self.assertIsNone(order_router.expire_offer(qid))
+
+    def test_owner_suggestion_shows_margin(self):
+        payload = order_payload([{"name": "RETA 35 MG (Vial)", "qty": 1}])
+        payload["total_cents"] = 24000
+        quotes = order_router.compute_quotes(payload)
+        reg = order_router.register_quotes(payload, quotes)
+        spec = order_router.build_owner_suggestion("PEP-TEST-1", reg)
+        self.assertIn("Customer paid: $240.00", spec["text"])
+        self.assertIn("margin $90.00", spec["text"])  # 240 - 150 (Vendor A)
+        self.assertIn("Offer to", spec["reply_markup"]["inline_keyboard"][0][0]["text"])
+
     def test_dismiss_clears_order_quotes(self):
         qid, _ = self._register_one()
         n = order_router.dismiss_order("PEP-TEST-1")
