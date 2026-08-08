@@ -117,6 +117,10 @@ try:
 except ValueError:
     SITE_SYNC_INTERVAL_MIN = 0
 
+# Public base URL of this service (for vendor web panel links).
+# e.g. https://spbc-supplier-bot.onrender.com — empty disables /webpanel links.
+PANEL_BASE_URL = os.getenv("PANEL_BASE_URL", "").strip().rstrip("/")
+
 # Schema version expected by this code release
 SCHEMA_VERSION = 10
 

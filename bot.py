@@ -47,6 +47,7 @@ import setup_wizard
 import site_sync
 import spbc_notify
 import token_pool
+import webpanel
 from config import (
     ACTIVE_BOT_INDEX,
     BACKUP_DIR,
@@ -59,6 +60,7 @@ from config import (
     KIT_SIZE,
     LOG_PATH,
     OWNER_IDS,
+    PANEL_BASE_URL,
     PUBLIC_BOT_USERNAME,
     RECOVERY_URL,
     SITE_SYNC_INTERVAL_MIN,
@@ -386,6 +388,49 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"Pick which of *your* shops will share stock with them:",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            return
+        if arg0.startswith("vendor_"):
+            token = arg0.removeprefix("vendor_")
+            ok, note = webpanel.redeem_vendor_invite(token, user.id)
+            if not ok:
+                await update.message.reply_text(note)
+                return
+            title = f"{user.first_name or 'Vendor'}'s Shop"
+            shop = db.get_shop(user.id) or db.ensure_shop(user.id, title=title)
+            db.add_admin(user.id, user.id, user.username, user.id)
+            set_shop(context, user.id)
+            lines = [
+                f"🎉 Welcome{' ' + note if note else ''}! Your shop *{shop['title']}* is ready.",
+                "",
+                "Fastest way to set up — from your phone:",
+            ]
+            if PANEL_BASE_URL:
+                link = webpanel.panel_url(
+                    PANEL_BASE_URL, webpanel.issue_token(user.id, user.id)
+                )
+                lines += [
+                    f"1. Open your [shop panel]({link})",
+                    "2. Add products (bulk paste works), payment methods, shipping",
+                    "3. Come back here and tap Catalog to see your shop live",
+                    "",
+                    "The link lasts 3 days — send /webpanel any time for a fresh one.",
+                ]
+            else:
+                lines += [
+                    "1. Tap ⚙️ Admin Panel below",
+                    "2. Add products, payment methods, shipping",
+                ]
+            lines += [
+                "",
+                "Have a website? Link its catalog with /linksite — "
+                "tap Admin Panel → 🌐 Site links for the guide.",
+            ]
+            await update.message.reply_text(
+                "\n".join(lines),
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+                reply_markup=main_menu_kb(True),
             )
             return
         if arg0.startswith("setup_"):
@@ -5308,6 +5353,85 @@ async def cmd_backup_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+# ── Vendor web panel + invites ───────────────────────────────────────────────
+
+
+async def cmd_webpanel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: DM a fresh magic link to this shop's web panel.
+    /webpanel revoke kills every outstanding link for the shop."""
+    user = update.effective_user
+    chat = update.effective_chat
+    sid = shop_id(context, update)
+    if sid is None:
+        await update.message.reply_text("No shop selected. Send /start first.")
+        return
+    if not user or not db.is_admin(sid, user.id):
+        await update.message.reply_text("Admins only.")
+        return
+    if context.args and context.args[0].lower() == "revoke":
+        n = webpanel.revoke_tokens(sid)
+        await update.message.reply_text(
+            f"Revoked {n} panel link(s). Send /webpanel for a fresh one."
+        )
+        return
+    if not PANEL_BASE_URL:
+        await update.message.reply_text(
+            "Web panel is not configured on this deploy (PANEL_BASE_URL unset)."
+        )
+        return
+    link = webpanel.panel_url(PANEL_BASE_URL, webpanel.issue_token(sid, user.id))
+    text = (
+        "🖥 *Your shop panel* — edit products, stock, prices, payments, "
+        f"shipping from any browser:\n{link}\n\n"
+        "Link lasts 3 days and edits this shop only. Don't forward it — "
+        "anyone with the link can edit. /webpanel revoke kills old links."
+    )
+    if chat and chat.type != ChatType.PRIVATE:
+        # Never drop an edit link into a group
+        try:
+            await context.bot.send_message(
+                user.id,
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+            await update.message.reply_text("Sent you the panel link in DM.")
+        except Exception:
+            await update.message.reply_text(
+                "I can't DM you yet — open the bot privately, press Start, "
+                "then send /webpanel there."
+            )
+        return
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+    )
+
+
+async def cmd_invitevendor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: one-time invite link that sets a new vendor up end-to-end."""
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await update.message.reply_text("Owners only.")
+        return
+    bot_username = (context.bot.username or "").lstrip("@")
+    if not bot_username:
+        await update.message.reply_text("Bot username unavailable — try again.")
+        return
+    note = " ".join(context.args) if context.args else ""
+    token = webpanel.create_vendor_invite(user.id, note)
+    link = f"https://t.me/{bot_username}?start=vendor_{token}"
+    await update.message.reply_text(
+        "🎟 *Vendor invite* — send this to ONE vendor"
+        + (f" ({note})" if note else "")
+        + ":\n"
+        f"{link}\n\n"
+        "One click gives them their own shop, admin rights, and a web panel "
+        "link to load products from their phone. Single-use, valid 14 days.",
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
+
+
 # ── Per-shop site links (Admin Panel → Site links) ──────────────────────────
 
 
@@ -5471,6 +5595,7 @@ async def post_init(app: Application) -> None:
         BotCommand("cart", "View cart"),
         BotCommand("myorders", "Your order history"),
         BotCommand("shops", "Switch between your shops"),
+        BotCommand("webpanel", "Shop panel link for the web (admin)"),
         BotCommand("orders", "Orders (admin shop / your orders)"),
         BotCommand("admin", "Admin panel"),
         BotCommand("setup", "Guided shop setup (group admins)"),
@@ -5757,6 +5882,8 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("syncsite", cmd_syncsite))
     app.add_handler(CommandHandler("shops", cmd_shops))
     app.add_handler(CommandHandler("linksite", cmd_linksite))
+    app.add_handler(CommandHandler("webpanel", cmd_webpanel))
+    app.add_handler(CommandHandler("invitevendor", cmd_invitevendor))
     app.add_handler(CallbackQueryHandler(cb_adm_sites, pattern=r"^adm_sites$"))
     app.add_handler(CallbackQueryHandler(cb_sitesync, pattern=r"^sitesync:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_siterm, pattern=r"^siterm:\d+$"))

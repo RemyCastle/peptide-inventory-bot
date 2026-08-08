@@ -46,6 +46,9 @@ services:
         sync: false
       - key: SITE_SYNC_INTERVAL_MIN
         value: "360"
+      # Public URL of THIS service — enables /webpanel vendor console links
+      - key: PANEL_BASE_URL
+        sync: false
     disk:
       name: unicornfartzz-data
       mountPath: /data

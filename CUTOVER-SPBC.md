@@ -40,6 +40,7 @@ spbc-orders worker needs **zero changes**.
    | `SPBC_SITE_URL` | `https://springfieldpbc.com` |
    | `SPBC_SHOP_CHAT_ID` | see "Create the SPBC shop" below |
    | `SITE_SYNC_INTERVAL_MIN` | `360` |
+   | `PANEL_BASE_URL` | `https://<this-service>.onrender.com` (enables /webpanel + vendor invites) |
 
 4. Manual Deploy → **Deploy latest commit**. Health check path stays `/`.
 

@@ -729,10 +729,28 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
+    def _send_raw(self, code: int, content_type: str, body: bytes) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        if content_type.startswith("text/html"):
+            self.send_header("X-Robots-Tag", "noindex")
+            self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:  # noqa: N802
-        path = urllib.parse.urlparse(self.path).path
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
         if path in ("/", "/health"):
             self._json(200, _status_body())
+            return
+        if path.startswith("/panel"):
+            import webpanel
+
+            query = urllib.parse.parse_qs(parsed.query)
+            code, ctype, body = webpanel.handle_panel_get(path, query)
+            self._send_raw(code, ctype, body)
             return
         if path == "/recent-chats":
             if not self._check_secret():
@@ -747,6 +765,16 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/panel/api/"):
+            import webpanel
+
+            payload = self._read_json()
+            if payload is None:
+                self._json(400, {"error": "bad_json"})
+                return
+            code, ctype, body = webpanel.handle_panel_post(path, payload)
+            self._send_raw(code, ctype, body)
+            return
         if path not in ("/notify", "/resolve-chat"):
             self._json(404, {"error": "not_found"})
             return

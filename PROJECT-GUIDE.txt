@@ -30,6 +30,12 @@ WHAT YOU NEED TO KNOW
       how-to doc). Feed contract + rules: SITE-LINKING.txt. Auto-syncs on the
       same interval as the SPBC sync. site_key namespaces: "S:" = env SPBC
       sync, "L<link_id>:" = per-shop links.
+    Vendor web console (webpanel.py) — /webpanel DMs a 3-day magic link to
+      <PANEL_BASE_URL>/panel?t=… where admins edit products/stock/prices/
+      payments/shipping from a browser (same DB rows Telegram sells from;
+      stock edits audit as 'web_panel'). /webpanel revoke kills links.
+      /invitevendor (owner) → one-time t.me deep link that creates the
+      vendor's shop + admin + panel link in one tap. Needs PANEL_BASE_URL.
 
 HOW TO RUN
   cd C:\Users\Remy\peptide_inventory_bot
