@@ -1969,6 +1969,88 @@ def list_user_orders(user_id: int, limit: int = 20) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+STATUS_LABELS = {
+    "pending_payment": "🕐 Awaiting your payment",
+    "awaiting_confirmation": "👀 Payment under review",
+    "paid": "✅ Paid — being prepared",
+    "shipped": "📦 Shipped",
+    "complete": "🏁 Complete",
+    "cancelled": "✖️ Cancelled",
+    "rejected": "❌ Rejected",
+}
+
+
+def status_label(status: str) -> str:
+    """Buyer-friendly wording for raw order statuses."""
+    return STATUS_LABELS.get(str(status or ""), str(status or "unknown"))
+
+
+def last_ship_details(user_id: int) -> Optional[dict]:
+    """Most recent shipping name+address this user entered (any shop)."""
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT ship_name, ship_address FROM orders
+            WHERE user_id = ?
+              AND ship_name IS NOT NULL AND TRIM(ship_name) != ''
+              AND ship_address IS NOT NULL AND TRIM(ship_address) != ''
+              AND status != 'rejected'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def mark_order_shipped(order_id: int) -> tuple[bool, str]:
+    """paid → shipped (stock already deducted at confirm)."""
+    with get_db() as conn:
+        order = conn.execute(
+            "SELECT status FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        if not order:
+            return False, "Order not found."
+        if order["status"] == "shipped":
+            return False, "Already marked shipped."
+        if order["status"] != "paid":
+            return False, f"Order must be paid first (status: {order['status']})."
+        now = _utc_now()
+        conn.execute(
+            """
+            UPDATE orders
+            SET status = 'shipped', shipped_at = COALESCE(shipped_at, ?),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, order_id),
+        )
+        return True, "Marked shipped."
+
+
+def cart_entries_from_items(items: list[dict], kit_size: int) -> dict[int, dict]:
+    """Rebuild cart entries {pid: {singles, kits}} from past order items.
+
+    Kit lines are recognized by the "(kit of N)" name suffix written at
+    checkout; anything else re-adds as singles.
+    """
+    entries: dict[int, dict] = {}
+    for it in items:
+        pid = it.get("product_id")
+        if pid is None:
+            continue
+        pid = int(pid)
+        qty = int(it.get("quantity") or 0)
+        if qty <= 0:
+            continue
+        e = entries.setdefault(pid, {"singles": 0, "kits": 0})
+        name = str(it.get("product_name") or "")
+        if "(kit of" in name.lower() and qty % kit_size == 0:
+            e["kits"] += qty // kit_size
+        else:
+            e["singles"] += qty
+    return entries
+
+
 def mark_order_awaiting_confirmation(
     order_id: int,
     *,

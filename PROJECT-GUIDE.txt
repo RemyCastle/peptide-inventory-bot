@@ -30,6 +30,14 @@ WHAT YOU NEED TO KNOW
       how-to doc). Feed contract + rules: SITE-LINKING.txt. Auto-syncs on the
       same interval as the SPBC sync. site_key namespaces: "S:" = env SPBC
       sync, "L<link_id>:" = per-shop links.
+    UX batch 2026-08-08 (research+audit driven): saved-address reuse at
+      checkout, per-field ship edit, DM-only checkout (group → deep-link),
+      catalog pagination (catp:<page>, full catalog), in-cart count on
+      product cards, /myorders human status labels + shop names, Reorder
+      button, shipped status (markship:) + buyer notify, one-tap confirm
+      without tracking (admconfirmnt:), DM-failure fallbacks to admin,
+      admin sale reports render Markdown w/ plain fallback, empty-state
+      and dead-end fixes (group /start deep-link, SPBC shop button).
     Quote-and-suggest routing (order_router.py) — on paid site orders the
       bot quotes every vendor shop (full-basket, stock-gated, kit-aware) and
       DMs the owner top-3 quotes with approve buttons. Approve → vendor gets

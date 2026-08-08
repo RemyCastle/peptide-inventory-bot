@@ -504,13 +504,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = (
             f"*{BRAND_NAME}*\n"
             f"Shop linked to this group: *{shop['title']}*\n\n"
-            "Members: use /catalog or /order in DM with the bot for a private cart.\n"
+            "Shop privately in DM — your cart and address stay off the group.\n"
             "Admins: /admin here or in DM after being added."
         )
+        bot_username = (context.bot.username or "").lstrip("@")
+        kb_rows = [
+            [
+                InlineKeyboardButton(
+                    "🛍 Shop privately in DM",
+                    url=f"https://t.me/{bot_username}?start=shop_{chat.id}",
+                )
+            ]
+        ]
+        base_kb = main_menu_kb(db.is_admin(chat.id, user.id))
         await update.message.reply_text(
             text,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=main_menu_kb(db.is_admin(chat.id, user.id)),
+            reply_markup=InlineKeyboardMarkup(
+                kb_rows + list(base_kb.inline_keyboard)
+            ),
         )
         return
 
@@ -557,12 +569,30 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # A customer found the bot directly — open the main shop if one exists
+    if SPBC_SHOP_CHAT_ID and db.get_shop(int(SPBC_SHOP_CHAT_ID)):
+        main_shop = db.get_shop(int(SPBC_SHOP_CHAT_ID))
+        await update.message.reply_text(
+            f"*{BRAND_NAME}*\nWelcome! 👋",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            f"🛍 Open {main_shop['title']}",
+                            callback_data=f"pickshop:{SPBC_SHOP_CHAT_ID}",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
     await update.message.reply_text(
         f"*{BRAND_NAME}*\n\n"
         "No shop is linked yet.\n"
-        "• Join a seller group that uses this bot, or\n"
-        "• Open the bot from a group with `/start`, or\n"
-        "• Use a shop link: `t.me/<bot>?start=shop_<id>`\n\n"
+        "• Ask your seller for their shop link (looks like "
+        "`t.me/<bot>?start=shop_...`), or\n"
+        "• Open the bot from their Telegram group with `/start`.\n\n"
         "Owners: set your Telegram ID in `OWNER_IDS` and /start again.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -765,8 +795,18 @@ async def cb_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _send_catalog(update, context, edit=True)
 
 
+async def cb_catalog_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split(":")[1])
+    await _send_catalog(update, context, edit=True, page=page)
+
+
 async def _send_catalog(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    edit: bool = False,
+    page: int = 0,
 ) -> None:
     sid = shop_id(context, update)
     if sid is None:
@@ -786,21 +826,41 @@ async def _send_catalog(
             p["is_guest"] = False
 
     if not products:
-        text = f"*{shop['title']}* — catalog is empty."
-        await _reply_or_edit(update, text, back_main_kb(), edit=edit)
+        user = update.effective_user
+        extra = []
+        if user and db.is_admin(int(sid), user.id):
+            extra = [
+                [
+                    InlineKeyboardButton("➕ Add product", callback_data="adm_addprod"),
+                    InlineKeyboardButton("📥 Import", callback_data="adm_import"),
+                ]
+            ]
+            text = (
+                f"*{shop['title']}* — no products yet.\n"
+                "Add your first product below, or bulk-import a list."
+            )
+        else:
+            text = (
+                f"*{shop['title']}* — nothing in stock right now.\n"
+                "Check back soon!"
+            )
+        await _reply_or_edit(update, text, back_main_kb(extra), edit=edit)
         return
 
     total_n = len(products)
-    top_n = int(CATALOG_TOP_N)
-    # Rank by paid sales; show only top N on open (rest via search)
+    page_size = max(1, int(CATALOG_TOP_N))
+    # Rank by paid sales, then page through the FULL catalog
     sales = db.product_sales_counts(int(sid))
-    products = db.rank_products_by_popularity(
-        products, sales, chat_id=int(sid), limit=top_n
+    ranked = db.rank_products_by_popularity(
+        products, sales, chat_id=int(sid), limit=None
     )
+    pages = max(1, (total_n + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    page_products = ranked[page * page_size : (page + 1) * page_size]
 
     # Present guest shares with sell price in list labels via name suffix
     display_products = []
-    for p in products:
+    for p in page_products:
         q = dict(p)
         sell = float(p.get("sell_price", p.get("price", 0)))
         if p.get("is_guest"):
@@ -809,31 +869,33 @@ async def _send_catalog(
             q["price"] = sell
         display_products.append(q)
 
-    showing = len(display_products)
-    more_note = ""
-    if total_n > showing:
-        more_note = (
-            f"\n_Showing top {showing} by popularity · "
-            f"{total_n - showing} more via search_"
-        )
+    has_sales = any(int(v) > 0 for v in (sales or {}).values())
+    header = "Popular first" if has_sales else "Catalog"
     text = (
-        f"🧬 *{shop['title']} — Popular picks*\n"
-        f"_Top {showing} most ordered"
-        + (f" of {total_n}" if total_n > showing else "")
-        + "._\n"
-        f"Use *Search entire catalog* for everything else.\n"
-        f"{more_note}\n\n"
-        f"Tap a product to add to cart:"
+        f"🧬 *{shop['title']} — {header}*\n"
+        f"_{total_n} products"
+        + (f" · page {page + 1}/{pages}" if pages > 1 else "")
+        + "_\n\n"
+        "Tap a product to see details and add to cart:"
     )
-    footer = [
+    footer = []
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("‹ Prev", callback_data=f"catp:{page - 1}"))
+        nav.append(
+            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=f"catp:{page}")
+        )
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ›", callback_data=f"catp:{page + 1}"))
+        footer.append(nav)
+    footer.append(
         [
-            InlineKeyboardButton(
-                "🔍 Search entire catalog", callback_data="search"
-            ),
+            InlineKeyboardButton("🔍 Search", callback_data="search"),
             InlineKeyboardButton("🛒 Cart", callback_data="cart"),
-        ],
-        [InlineKeyboardButton("« Menu", callback_data="main")],
-    ]
+        ]
+    )
+    footer.append([InlineKeyboardButton("« Menu", callback_data="main")])
     kb = product_list_keyboard(display_products, footer_rows=footer)
     await _reply_or_edit(update, text, kb, edit=edit)
 
@@ -1011,21 +1073,14 @@ def _catalog_entry_for_shop(sid: int | None, pid: int) -> dict | None:
     return None
 
 
-async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    pid = int(query.data.split(":")[1])
-    sid = shop_id(context, update)
-    p = _catalog_entry_for_shop(sid, pid)
-    if not p or not p["active"]:
-        await query.answer("Product unavailable in this shop", show_alert=True)
-        return
-    stock = int(p["stock"])
+def _product_card_text(p: dict, stock: int, in_cart_vials: int) -> str:
     text = (
         f"*{p['name']}*\n"
         f"Price: *{money(p['price'])}* / {p.get('unit') or 'vial'}\n"
         f"Stock: {stock}\n"
     )
+    if in_cart_vials > 0:
+        text += f"🛒 *In your cart: {in_cart_vials}*\n"
     if p.get("is_guest"):
         guest = p.get("guest_title") or "partner"
         text += f"_Partner stock ({guest})_\n"
@@ -1040,7 +1095,26 @@ async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         text += "\n_Currently out of stock._"
     if db.product_has_coa(p):
         text += "\n_COA available — tap 📄 COA for the file and/or link._"
+    return text
+
+
+async def _render_product_card(query, context, sid, pid: int) -> None:
+    p = _catalog_entry_for_shop(sid, pid)
+    if not p or not p["active"]:
+        await query.answer("Product unavailable in this shop", show_alert=True)
+        return
+    stock = int(p["stock"])
+    in_cart = db.cart_entry_vials(cart_get_entry(context, pid))
+    text = _product_card_text(p, stock, in_cart)
     await safe_edit(query, text, product_detail_keyboard(p, stock=stock))
+
+
+async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    pid = int(query.data.split(":")[1])
+    sid = shop_id(context, update)
+    await _render_product_card(query, context, sid, pid)
 
 
 async def cb_add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1059,9 +1133,9 @@ async def cb_add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer(f"Only {stock} available", show_alert=True)
         return
     cart_set_entry(context, pid, e["singles"] + qty, e["kits"])
-    await query.answer(
-        f"Added {qty}× {p['name']} (cart: {new_vials} vials)"
-    )
+    await query.answer(f"Added {qty}× {p['name']} ✅")
+    # Refresh the card so the buyer SEES the cart count change
+    await _render_product_card(query, context, sid, pid)
 
 
 async def cb_add_kit_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1087,9 +1161,8 @@ async def cb_add_kit_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     cart_set_entry(context, pid, e["singles"], e["kits"] + 1)
     kp = db.product_kit_price(p)
-    await query.answer(
-        f"Added kit of {KIT_SIZE} · {money(kp)} (cart: {new_vials} vials)"
-    )
+    await query.answer(f"Added kit of {KIT_SIZE} · {money(kp)} ✅")
+    await _render_product_card(query, context, sid, pid)
 
 
 async def cb_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1250,6 +1323,27 @@ async def cb_checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await safe_edit(query, "Cart is empty or no shop selected.")
         return ConversationHandler.END
 
+    # Never collect a shipping address in a group chat — hand off to DM.
+    chat = update.effective_chat
+    if chat and chat.type != ChatType.PRIVATE:
+        bot_username = (context.bot.username or "").lstrip("@")
+        await safe_edit(
+            query,
+            "🔒 *Checkout continues in private chat* so your shipping address "
+            "stays off the group.\nYour cart comes with you.",
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "➡️ Continue in DM",
+                            url=f"https://t.me/{bot_username}?start=shop_{sid}",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return ConversationHandler.END
+
     shop = db.get_shop(sid) or db.ensure_shop(sid)
 
     # Drop kit deals if stock fell below KIT_SIZE
@@ -1306,9 +1400,12 @@ async def cb_checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         p = _product_with_stock(int(pid))
         need = db.cart_entry_vials(e)
         if not p or not p["active"] or int(p["stock"]) < need:
+            pname = (p or {}).get("name") or (entry or {}).get("name") or f"item #{pid}"
+            left = int(p["stock"]) if p else 0
             await safe_edit(
                 query,
-                f"Stock issue with product id {pid}. Adjust cart and try again.",
+                f"⚠️ *{pname}* only has {left} in stock (you have {need} in "
+                "your cart). Adjust the cart and try again.",
                 back_main_kb([[InlineKeyboardButton("🛒 Cart", callback_data="cart")]]),
             )
             return ConversationHandler.END
@@ -1387,6 +1484,52 @@ async def cb_pay_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await safe_edit(query, "Payment method unavailable.")
         return ConversationHandler.END
     context.user_data["checkout_pay"] = method
+
+    # Repeat buyers: offer their last shipping details instead of retyping
+    user = update.effective_user
+    saved = db.last_ship_details(user.id) if user else None
+    if saved:
+        preview = saved["ship_address"]
+        if len(preview) > 120:
+            preview = preview[:117] + "…"
+        await safe_edit(
+            query,
+            "📬 *Shipping*\n\nUse your saved details?\n\n"
+            f"*{saved['ship_name']}*\n{preview}",
+            InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("✅ Use saved address", callback_data="useaddr")],
+                    [InlineKeyboardButton("✏️ Enter a new address", callback_data="newaddr")],
+                    [InlineKeyboardButton("« Cancel", callback_data="cart")],
+                ]
+            ),
+        )
+        return CHECKOUT_NAME
+    await query.message.reply_text(
+        "📬 *Shipping — full name*\n\nSend the recipient's full name.\n/cancel to abort.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Full name..."),
+    )
+    return CHECKOUT_NAME
+
+
+async def cb_use_saved_addr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    saved = db.last_ship_details(user.id) if user else None
+    if not saved:
+        await safe_edit(query, "No saved address found — let's enter it.")
+        return await cb_new_addr(update, context)
+    context.user_data["ship_name"] = saved["ship_name"]
+    context.user_data["ship_address"] = saved["ship_address"]
+    context.user_data["ship_notes"] = ""
+    return await _prompt_address_verify(update, context)
+
+
+async def cb_new_addr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
     await query.message.reply_text(
         "📬 *Shipping — full name*\n\nSend the recipient's full name.\n/cancel to abort.",
         parse_mode=ParseMode.MARKDOWN,
@@ -1404,6 +1547,8 @@ async def checkout_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if not await accept_prompt_message(update, context):
         return CHECKOUT_NAME
     context.user_data["ship_name"] = (update.message.text or "").strip()
+    if context.user_data.pop("co_edit_one", None):
+        return await _prompt_address_verify(update, context)
     await update.message.reply_text(
         "📬 *Shipping address*\n\n"
         "Send full address (street, city, state/region, ZIP, country).\n"
@@ -1418,6 +1563,8 @@ async def checkout_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not await accept_prompt_message(update, context):
         return CHECKOUT_ADDRESS
     context.user_data["ship_address"] = (update.message.text or "").strip()
+    if context.user_data.pop("co_edit_one", None):
+        return await _prompt_address_verify(update, context)
     await update.message.reply_text(
         "📝 Any delivery notes? (or send `-` for none)\n/cancel to abort.",
         parse_mode=ParseMode.MARKDOWN,
@@ -1434,6 +1581,7 @@ async def checkout_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if notes == "-":
         notes = ""
     context.user_data["ship_notes"] = notes
+    context.user_data.pop("co_edit_one", None)
     return await _prompt_address_verify(update, context)
 
 
@@ -1467,14 +1615,57 @@ async def _prompt_address_verify(
 
 
 async def cb_ship_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pick which single field to change instead of restarting the interview."""
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text(
-        "📬 *Shipping — full name*\n\nSend the recipient's full name.\n/cancel to abort.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=force_reply("Full name..."),
+    await safe_edit(
+        query,
+        "✏️ *What would you like to change?*",
+        InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("👤 Name", callback_data="shipeditf:name")],
+                [InlineKeyboardButton("🏠 Address", callback_data="shipeditf:addr")],
+                [InlineKeyboardButton("📝 Notes", callback_data="shipeditf:notes")],
+                [InlineKeyboardButton("« Back to review", callback_data="shipeditback")],
+            ]
+        ),
     )
-    return CHECKOUT_NAME
+    return CHECKOUT_VERIFY
+
+
+_EDIT_FIELD_PROMPTS = {
+    "name": ("📬 Send the recipient's full name.", "Full name...", "CHECKOUT_NAME"),
+    "addr": (
+        "📬 Send the full address (street, city, state/region, ZIP, country).",
+        "Shipping address...",
+        "CHECKOUT_ADDRESS",
+    ),
+    "notes": ("📝 Send delivery notes (or `-` for none).", "Notes or - ...", "CHECKOUT_NOTES"),
+}
+
+
+async def cb_ship_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    field = query.data.split(":")[1]
+    prompt, placeholder, state_name = _EDIT_FIELD_PROMPTS[field]
+    context.user_data["co_edit_one"] = field
+    await query.message.reply_text(
+        prompt + "\n/cancel to abort.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply(placeholder),
+    )
+    return {
+        "CHECKOUT_NAME": CHECKOUT_NAME,
+        "CHECKOUT_ADDRESS": CHECKOUT_ADDRESS,
+        "CHECKOUT_NOTES": CHECKOUT_NOTES,
+    }[state_name]
+
+
+async def cb_ship_edit_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    return await _prompt_address_verify(update, context)
 
 
 async def cb_ship_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1684,12 +1875,23 @@ async def _notify_admins_sale_report(
 
     for uid in recipients:
         try:
-            await context.bot.send_message(
-                uid,
-                text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
+            # Markdown first (report is authored with * and `); plain fallback
+            # because usernames/notes can contain characters that break parsing
+            try:
+                await context.bot.send_message(
+                    uid,
+                    text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                await context.bot.send_message(
+                    uid,
+                    text,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                )
         except Exception as e:
             log.info("Could not notify admin %s of sale: %s", uid, e)
 
@@ -2031,6 +2233,102 @@ async def cb_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await safe_edit(query, f"❌ Order #{oid} cancelled.\nInventory unchanged.", back_main_kb())
 
 
+async def cb_reorder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """One tap rebuilds the cart from a past order (available items only)."""
+    query = update.callback_query
+    user = update.effective_user
+    oid = int(query.data.split(":")[1])
+    order = db.get_order(oid)
+    if not order or order["user_id"] != user.id:
+        await query.answer("Not your order", show_alert=True)
+        return
+    sid = int(order["chat_id"])
+    set_shop(context, sid)
+    entries = db.cart_entries_from_items(db.get_order_items(oid), int(KIT_SIZE))
+    added, skipped = 0, []
+    for pid, e in entries.items():
+        p = _catalog_entry_for_shop(sid, pid)
+        if not p or not p["active"]:
+            skipped.append(f"item #{pid} (no longer sold)")
+            continue
+        stock = int(p["stock"])
+        want = e["singles"] + e["kits"] * int(KIT_SIZE)
+        if stock < want:
+            if stock > 0:
+                cart_set_entry(context, pid, min(e["singles"], stock), 0)
+                skipped.append(f"{p['name']} (only {stock} left — added {min(e['singles'], stock)})")
+                added += 1
+            else:
+                skipped.append(f"{p['name']} (out of stock)")
+            continue
+        kits = e["kits"] if db.kit_option_available(p, stock=stock) else 0
+        singles = e["singles"] + (e["kits"] - kits) * int(KIT_SIZE)
+        cart_set_entry(context, pid, singles, kits)
+        added += 1
+    if not added:
+        await query.answer("Nothing from that order is available right now.", show_alert=True)
+        return
+    note = ""
+    if skipped:
+        note = "\n⚠️ " + "\n⚠️ ".join(skipped[:5])
+    await query.answer(f"Cart rebuilt — {added} item(s) added ✅")
+    await _render_cart(update, context, edit=True)
+    if note and query.message:
+        try:
+            await query.message.reply_text(f"Reorder notes:{note}")
+        except Exception:
+            pass
+
+
+async def cb_mark_shipped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: paid → shipped, with a buyer notification."""
+    query = update.callback_query
+    user = update.effective_user
+    oid = int(query.data.split(":")[1])
+    order = db.get_order(oid)
+    if not order or not db.is_admin(order["chat_id"], user.id):
+        await query.answer("Not allowed", show_alert=True)
+        return
+    ok, msg = db.mark_order_shipped(oid)
+    if not ok:
+        await query.answer(msg, show_alert=True)
+        return
+    await query.answer("Marked shipped 📦")
+    order = db.get_order(oid)
+    cust = f"📦 *Your order #{oid} is on the way!*\n"
+    track = (order.get("tracking_number") or "").strip()
+    if track:
+        cust += f"Tracking: `{track}`"
+        car = (order.get("tracking_carrier") or "").strip()
+        if car:
+            cust += f" ({car})"
+    else:
+        cust += "_The shop will share tracking if available._"
+    delivered = True
+    try:
+        await context.bot.send_message(
+            order["user_id"], cust, parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        delivered = False
+        log.info("Could not notify buyer %s of shipment: %s", order["user_id"], e)
+    note = f"✅ Order #{oid} marked shipped."
+    if not delivered:
+        uname = f"@{order['username']}" if order.get("username") else "the buyer"
+        note += (
+            f"\n⚠️ Could not DM {uname} — they may not have started the bot. "
+            "Let them know directly."
+        )
+    items = db.get_order_items(oid)
+    await safe_edit(
+        query,
+        f"{note}\n\n{db.format_order_summary(order, items, SYM)}",
+        InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Orders", callback_data="adm_orders")]]
+        ),
+    )
+
+
 async def cb_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -2042,8 +2340,11 @@ async def cb_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lines = ["📦 *Your orders*\n"]
     buttons = []
     for o in orders:
+        shop = db.get_shop(int(o["chat_id"]))
+        shop_note = f" · {shop['title']}" if shop else ""
         lines.append(
-            f"#{o['id']} · {o['status']} · {money(o['total'])} · {o['created_at'][:10]}"
+            f"#{o['id']} · {db.status_label(o['status'])} · "
+            f"{money(o['total'])} · {o['created_at'][:10]}{shop_note}"
         )
         buttons.append(
             [InlineKeyboardButton(f"Order #{o['id']}", callback_data=f"vieword:{o['id']}")]
@@ -2066,14 +2367,34 @@ async def cb_view_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.answer("Not allowed", show_alert=True)
         return
     items = db.get_order_items(oid)
-    text = db.format_order_summary(order, items, SYM)
+    text = (
+        f"{db.status_label(order['status'])}\n\n"
+        + db.format_order_summary(order, items, SYM)
+    )
     buttons = []
     if order["user_id"] == user.id and order["status"] == "pending_payment":
         buttons.append(
             [InlineKeyboardButton("✅ I've paid", callback_data=f"paid:{oid}")]
         )
+    if order["user_id"] == user.id and order["status"] in (
+        "pending_payment",
+        "awaiting_confirmation",
+    ):
         buttons.append(
             [InlineKeyboardButton("❌ Cancel", callback_data=f"cancelord:{oid}")]
+        )
+    if order["user_id"] == user.id and order["status"] in (
+        "paid",
+        "shipped",
+        "complete",
+        "cancelled",
+    ):
+        buttons.append(
+            [InlineKeyboardButton("🔄 Order again", callback_data=f"reorder:{oid}")]
+        )
+    if is_adm and order["status"] == "paid":
+        buttons.append(
+            [InlineKeyboardButton("📦 Mark shipped", callback_data=f"markship:{oid}")]
         )
     if is_adm and order["status"] in ("pending_payment", "awaiting_confirmation"):
         buttons.append(
@@ -4304,11 +4625,20 @@ async def cb_adm_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.message.reply_text(
         f"✅ *Confirm payment — order #{oid}*\n"
         f"Payment code: `{code}` · Total: {money(order['total'])}\n\n"
-        "Send *tracking number* (and optional carrier on the same line, e.g. `1Z999 USPS`).\n"
-        "Or send `-` to confirm *without* tracking (you can add tracking later).\n"
+        "Send *tracking number* (optional carrier after a space, e.g. `1Z999 USPS`) — "
+        "or confirm without tracking below.\n"
         "/cancel",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=force_reply("Tracking or - ..."),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Confirm — no tracking yet",
+                        callback_data=f"admconfirmnt:{oid}",
+                    )
+                ]
+            ]
+        ),
     )
     return TRACKING_INPUT
 
@@ -4338,6 +4668,30 @@ async def tracking_input_value(update: Update, context: ContextTypes.DEFAULT_TYP
         tracking = parts[0]
         carrier = parts[1] if len(parts) > 1 else None
 
+    return await _finalize_confirm(update.message, context, user, int(oid), tracking, carrier)
+
+
+async def cb_adm_confirm_notrack(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """One-tap confirm without tracking (tracking can be added later)."""
+    query = update.callback_query
+    user = update.effective_user
+    oid = int(query.data.split(":")[1])
+    order = db.get_order(oid)
+    if not order or not user or not db.is_admin(order["chat_id"], user.id):
+        await query.answer("Not allowed", show_alert=True)
+        return ConversationHandler.END
+    if order["status"] not in ("pending_payment", "awaiting_confirmation"):
+        await query.answer(f"Status: {db.status_label(order['status'])}", show_alert=True)
+        return ConversationHandler.END
+    await query.answer("Confirming…")
+    return await _finalize_confirm(query.message, context, user, oid, None, None)
+
+
+async def _finalize_confirm(
+    reply_target, context: ContextTypes.DEFAULT_TYPE, user, oid: int, tracking, carrier
+) -> int:
     ok, msg, low_alerts = db.confirm_order_payment(
         int(oid),
         user.id,
@@ -4348,7 +4702,7 @@ async def tracking_input_value(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data.pop("confirm_order_id", None)
     order = db.get_order(int(oid))
     items = db.get_order_items(int(oid))
-    await update.message.reply_text(
+    await reply_target.reply_text(
         f"{'✅' if ok else '⚠️'} {msg}\n\n{db.format_order_summary(order, items, SYM)}",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(
@@ -4390,7 +4744,7 @@ async def tracking_input_value(update: Update, context: ContextTypes.DEFAULT_TYP
             audience="local" if is_fr else "auto",
         )
         if is_fr:
-            await update.message.reply_text(
+            await reply_target.reply_text(
                 "This is a *franchisee* sale.\n"
                 "Main shop will *not* see it until you:\n"
                 "1) Confirmed customer payment (done)\n"
@@ -4431,6 +4785,15 @@ async def tracking_input_value(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception as e:
             log.info("Could not notify customer %s: %s", order["user_id"], e)
+            uname = f"@{order['username']}" if order.get("username") else "the buyer"
+            try:
+                await reply_target.reply_text(
+                    f"⚠️ Couldn't DM {uname} the confirmation — they may not "
+                    "have pressed Start on the bot. Reach them directly so "
+                    "they know it's confirmed."
+                )
+            except Exception:
+                pass
         if low_alerts:
             await _notify_low_stock(context, order["chat_id"], low_alerts)
     return ConversationHandler.END
@@ -4445,7 +4808,7 @@ async def cb_add_tracking_start(update: Update, context: ContextTypes.DEFAULT_TY
     if not order or not db.is_admin(order["chat_id"], user.id):
         await query.answer("Not allowed", show_alert=True)
         return ConversationHandler.END
-    if order["status"] != "paid":
+    if order["status"] not in ("paid", "shipped"):
         await query.answer("Order must be paid first", show_alert=True)
         return ConversationHandler.END
     context.user_data["confirm_order_id"] = oid
@@ -5778,17 +6141,24 @@ def build_app(token: str | None = None) -> Application:
             ],
             CHECKOUT_NAME: [
                 CallbackQueryHandler(cb_pay_method, pattern=r"^paym:\d+$"),
+                CallbackQueryHandler(cb_use_saved_addr, pattern=r"^useaddr$"),
+                CallbackQueryHandler(cb_new_addr, pattern=r"^newaddr$"),
+                CallbackQueryHandler(cb_ship_edit_field, pattern=r"^shipeditf:(name|addr|notes)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_name),
             ],
             CHECKOUT_ADDRESS: [
+                CallbackQueryHandler(cb_ship_edit_field, pattern=r"^shipeditf:(name|addr|notes)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_address),
             ],
             CHECKOUT_NOTES: [
+                CallbackQueryHandler(cb_ship_edit_field, pattern=r"^shipeditf:(name|addr|notes)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_notes),
             ],
             CHECKOUT_VERIFY: [
                 CallbackQueryHandler(cb_ship_ok, pattern=r"^shipok$"),
                 CallbackQueryHandler(cb_ship_edit, pattern=r"^shipedit$"),
+                CallbackQueryHandler(cb_ship_edit_field, pattern=r"^shipeditf:(name|addr|notes)$"),
+                CallbackQueryHandler(cb_ship_edit_back, pattern=r"^shipeditback$"),
             ],
             PAYMENT_PROOF: [
                 MessageHandler(filters.PHOTO, payment_proof_photo),
@@ -5952,6 +6322,13 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_shops, pattern=r"^shops$"))
     app.add_handler(CallbackQueryHandler(cb_main, pattern=r"^main$"))
     app.add_handler(CallbackQueryHandler(cb_catalog, pattern=r"^cat$"))
+    app.add_handler(CallbackQueryHandler(cb_catalog_page, pattern=r"^catp:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_reorder, pattern=r"^reorder:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_mark_shipped, pattern=r"^markship:\d+$"))
+    app.add_handler(
+        CallbackQueryHandler(cb_adm_confirm_notrack, pattern=r"^admconfirmnt:\d+$"),
+        group=NAV,
+    )
     app.add_handler(CallbackQueryHandler(cb_product, pattern=r"^prod:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_add_to_cart, pattern=r"^add:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_add_kit_to_cart, pattern=r"^addkit:\d+$"))
