@@ -5353,6 +5353,63 @@ async def cmd_backup_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+# ── Order routing approvals (quote-and-suggest) ─────────────────────────────
+
+
+async def cb_route_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await query.answer("Owners only.", show_alert=True)
+        return
+    import order_router
+
+    quote_id = query.data.split(":", 1)[1]
+    ok, msg, quote = order_router.apply_route(quote_id, user.id)
+    if not ok:
+        await query.answer(msg, show_alert=True)
+        return
+    await query.answer("Routed.")
+    vendor_text = order_router.build_vendor_message(quote)
+    sent_note = f"✅ Routed to {quote['shop_title']} — ${quote['total']:.2f}"
+    try:
+        await context.bot.send_message(
+            chat_id=quote["shop_chat_id"],
+            text=vendor_text,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        log.error("vendor_route_message_failed: %s", exc)
+        sent_note += (
+            "\n⚠️ Could not message the vendor (have they opened the bot?). "
+            "Their stock WAS deducted — forward the order manually."
+        )
+    order_router.dismiss_order(quote["order_number"])
+    await safe_edit(
+        query,
+        f"{sent_note}\nOrder: {quote['order_number']}\n"
+        "Their stock was deducted (audit: order_route).",
+    )
+
+
+async def cb_route_dismiss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await query.answer("Owners only.", show_alert=True)
+        return
+    import order_router
+
+    order_number = query.data.split(":", 1)[1]
+    order_router.dismiss_order(order_number)
+    await query.answer("Dismissed.")
+    await safe_edit(
+        query,
+        f"Vendor quotes dismissed for {order_number}. "
+        "Regular supplier flow already ran.",
+    )
+
+
 # ── Vendor web panel + invites ───────────────────────────────────────────────
 
 
@@ -5888,6 +5945,8 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_sitesync, pattern=r"^sitesync:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_siterm, pattern=r"^siterm:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_sitehelp, pattern=r"^sitehelp$"))
+    app.add_handler(CallbackQueryHandler(cb_route_approve, pattern=r"^routeq:[0-9a-f]+$"))
+    app.add_handler(CallbackQueryHandler(cb_route_dismiss, pattern=r"^routeq_x:"))
 
     app.add_handler(CallbackQueryHandler(cb_pickshop, pattern=r"^pickshop:-?\d+$"))
     app.add_handler(CallbackQueryHandler(cb_shops, pattern=r"^shops$"))

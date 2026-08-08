@@ -607,6 +607,29 @@ def handle_notify(payload: dict) -> tuple[int, dict]:
                 }
             )
 
+    # Quote-and-suggest: offer the owner any vendor shop that can fill the
+    # whole order from bot stock. Advisory only — never blocks the response.
+    suggestion_sent = False
+    try:
+        import order_router
+
+        owner = OWNER_TELEGRAM_CHAT_ID or SUPPLIER_TELEGRAM_CHAT_ID
+        if owner:
+            spec = order_router.suggest_for_order(payload)
+            if spec:
+                _telegram_api(
+                    "sendMessage",
+                    {
+                        "chat_id": owner,
+                        "text": spec["text"],
+                        "reply_markup": spec["reply_markup"],
+                        "disable_web_page_preview": True,
+                    },
+                )
+                suggestion_sent = True
+    except Exception as exc:
+        log.warning("route_suggest_failed: %s", exc)
+
     ok = len(results) > 0
     body: dict = {
         "ok": ok,
@@ -614,6 +637,7 @@ def handle_notify(payload: dict) -> tuple[int, dict]:
         "messages_sent": len(results),
         "messages_failed": len(errors),
         "results": results,
+        "vendor_quotes_suggested": suggestion_sent,
     }
     if errors:
         body["errors"] = errors

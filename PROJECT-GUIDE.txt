@@ -30,6 +30,12 @@ WHAT YOU NEED TO KNOW
       how-to doc). Feed contract + rules: SITE-LINKING.txt. Auto-syncs on the
       same interval as the SPBC sync. site_key namespaces: "S:" = env SPBC
       sync, "L<link_id>:" = per-shop links.
+    Quote-and-suggest routing (order_router.py) — on paid site orders the
+      bot quotes every vendor shop (full-basket, stock-gated, kit-aware) and
+      DMs the owner top-3 quotes with approve buttons. Approve → vendor gets
+      fulfillment request at their prices, stock deducts (audit reason
+      'order_route', re-checked at apply). Advisory only; supplier flow
+      unchanged. Master shop (SPBC_SHOP_CHAT_ID) excluded from quoting.
     Vendor web console (webpanel.py) — /webpanel DMs a 3-day magic link to
       <PANEL_BASE_URL>/panel?t=… where admins edit products/stock/prices/
       payments/shipping from a browser (same DB rows Telegram sells from;
