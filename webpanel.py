@@ -81,7 +81,8 @@ def ensure_webpanel_tables() -> None:
 
 def issue_token(chat_id: int, user_id: int, ttl_hours: int = TOKEN_TTL_HOURS) -> str:
     ensure_webpanel_tables()
-    raw = secrets.token_urlsafe(24)
+    # hex, not token_urlsafe: '_' and '-' break Telegram Markdown links
+    raw = secrets.token_hex(16)
     now = _utc_now()
     with db.get_db() as conn:
         conn.execute(
@@ -132,8 +133,9 @@ def panel_url(base_url: str, raw_token: str) -> str:
 
 def create_vendor_invite(created_by: int, note: str = "") -> str:
     ensure_webpanel_tables()
-    # Telegram start payloads are limited to 64 chars, [A-Za-z0-9_-]
-    raw = secrets.token_urlsafe(16)
+    # Telegram start payloads allow [A-Za-z0-9_-] up to 64 chars, but '_'/'-'
+    # break Markdown parsing when the link is rendered — keep it hex.
+    raw = secrets.token_hex(12)
     now = _utc_now()
     with db.get_db() as conn:
         conn.execute(

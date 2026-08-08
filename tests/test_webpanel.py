@@ -64,6 +64,19 @@ class TokenTests(WebPanelBase):
         url = webpanel.panel_url("https://x.example.com/", "abc")
         self.assertEqual(url, "https://x.example.com/panel?t=abc")
 
+    def test_tokens_are_markdown_safe(self):
+        """'_' or '-' in a token breaks Telegram Markdown → message never sends
+        (this silently killed /invitevendor and /webpanel in production)."""
+        for _ in range(200):
+            for tok in (
+                webpanel.issue_token(SHOP, USER),
+                webpanel.create_vendor_invite(USER, "note"),
+            ):
+                self.assertTrue(tok.isalnum(), f"token not markdown-safe: {tok}")
+                self.assertNotIn("_", tok)
+                self.assertNotIn("-", tok)
+                self.assertNotIn("*", tok)
+
 
 class InviteTests(WebPanelBase):
     def test_invite_single_use(self):

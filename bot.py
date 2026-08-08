@@ -317,6 +317,28 @@ async def safe_edit(query, text: str, reply_markup=None) -> None:
         log.warning("reply fallback failed: %s", e3)
 
 
+async def safe_reply(message, text: str, **kwargs):
+    """reply_text with Markdown, falling back to plain text on parse errors.
+
+    Telegram's legacy Markdown chokes on stray '_' / '*' inside dynamic
+    content (tokens, links, usernames, product names). Without this, the
+    reply raises and the user silently sees nothing.
+    """
+    kwargs.setdefault("parse_mode", ParseMode.MARKDOWN)
+    kwargs.setdefault("disable_web_page_preview", True)
+    try:
+        return await message.reply_text(text, **kwargs)
+    except Exception as e:
+        if "parse" not in str(e).lower() and "entit" not in str(e).lower():
+            raise
+        log.warning("markdown reply failed, sending plain: %s", e)
+        kwargs.pop("parse_mode", None)
+        plain = (
+            text.replace("*", "").replace("_", "").replace("`", "")
+        )
+        return await message.reply_text(plain, **kwargs)
+
+
 def main_menu_kb(is_admin: bool = False, can_switch: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [
@@ -447,10 +469,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Have a website? Link its catalog with /linksite — "
                 "tap Admin Panel → 🌐 Site links for the guide.",
             ]
-            await update.message.reply_text(
+            await safe_reply(
+                update.message,
                 "\n".join(lines),
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
                 reply_markup=main_menu_kb(True),
             )
             return
@@ -5968,9 +5989,7 @@ async def cmd_webpanel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "then send /webpanel there."
             )
         return
-    await update.message.reply_text(
-        text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
-    )
+    await safe_reply(update.message, text)
 
 
 async def cmd_invitevendor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5986,15 +6005,14 @@ async def cmd_invitevendor(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     note = " ".join(context.args) if context.args else ""
     token = webpanel.create_vendor_invite(user.id, note)
     link = f"https://t.me/{bot_username}?start=vendor_{token}"
-    await update.message.reply_text(
+    await safe_reply(
+        update.message,
         "🎟 *Vendor invite* — send this to ONE vendor"
         + (f" ({note})" if note else "")
         + ":\n"
         f"{link}\n\n"
         "One click gives them their own shop, admin rights, and a web panel "
         "link to load products from their phone. Single-use, valid 14 days.",
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
     )
 
 
