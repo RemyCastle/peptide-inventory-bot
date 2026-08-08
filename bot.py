@@ -140,7 +140,8 @@ def symbol_for(chat_id: int | None) -> str:
     MASS_EDIT_FILE,
     MIN_ORDER_QTY,
     EDIT_KIT_PRICE,
-) = range(30)
+    EDIT_PHOTO_VALUE,
+) = range(31)
 
 # How long a pending admin/buyer prompt stays open (seconds)
 AWAITING_TTL_SEC = 600
@@ -268,6 +269,26 @@ async def safe_edit(query, text: str, reply_markup=None) -> None:
         .replace("[", "")
         .replace("]", "")
     )
+    # Media messages (photo product cards) can't become text edits — swap them
+    msg = getattr(query, "message", None)
+    if msg is not None and (getattr(msg, "photo", None) or getattr(msg, "document", None)):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        try:
+            await msg.chat.send_message(
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            try:
+                await msg.chat.send_message(plain, reply_markup=reply_markup)
+            except Exception as e_media:
+                log.warning("media swap failed: %s", e_media)
+        return
     try:
         await query.edit_message_text(
             text,
@@ -802,6 +823,14 @@ async def cb_catalog_page(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _send_catalog(update, context, edit=True, page=page)
 
 
+async def cb_catalog_sort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    mode = query.data.split(":")[1]
+    context.user_data["cat_sort"] = "az" if mode == "az" else "pop"
+    await query.answer("Sorted A–Z" if mode == "az" else "Popular first")
+    await _send_catalog(update, context, edit=True, page=0)
+
+
 async def _send_catalog(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -849,11 +878,15 @@ async def _send_catalog(
 
     total_n = len(products)
     page_size = max(1, int(CATALOG_TOP_N))
-    # Rank by paid sales, then page through the FULL catalog
+    sort_mode = context.user_data.get("cat_sort") or "pop"
     sales = db.product_sales_counts(int(sid))
-    ranked = db.rank_products_by_popularity(
-        products, sales, chat_id=int(sid), limit=None
-    )
+    if sort_mode == "az":
+        ranked = sorted(products, key=lambda p: str(p.get("name") or "").lower())
+    else:
+        # Rank by paid sales, then page through the FULL catalog
+        ranked = db.rank_products_by_popularity(
+            products, sales, chat_id=int(sid), limit=None
+        )
     pages = max(1, (total_n + page_size - 1) // page_size)
     page = max(0, min(page, pages - 1))
     page_products = ranked[page * page_size : (page + 1) * page_size]
@@ -870,7 +903,10 @@ async def _send_catalog(
         display_products.append(q)
 
     has_sales = any(int(v) > 0 for v in (sales or {}).values())
-    header = "Popular first" if has_sales else "Catalog"
+    if sort_mode == "az":
+        header = "A–Z"
+    else:
+        header = "Popular first" if has_sales else "Catalog"
     text = (
         f"🧬 *{shop['title']} — {header}*\n"
         f"_{total_n} products"
@@ -889,9 +925,15 @@ async def _send_catalog(
         if page < pages - 1:
             nav.append(InlineKeyboardButton("Next ›", callback_data=f"catp:{page + 1}"))
         footer.append(nav)
+    sort_btn = (
+        InlineKeyboardButton("⭐ Popular", callback_data="catsort:pop")
+        if sort_mode == "az"
+        else InlineKeyboardButton("🔤 A–Z", callback_data="catsort:az")
+    )
     footer.append(
         [
             InlineKeyboardButton("🔍 Search", callback_data="search"),
+            sort_btn,
             InlineKeyboardButton("🛒 Cart", callback_data="cart"),
         ]
     )
@@ -1106,7 +1148,40 @@ async def _render_product_card(query, context, sid, pid: int) -> None:
     stock = int(p["stock"])
     in_cart = db.cart_entry_vials(cart_get_entry(context, pid))
     text = _product_card_text(p, stock, in_cart)
-    await safe_edit(query, text, product_detail_keyboard(p, stock=stock))
+    kb = product_detail_keyboard(p, stock=stock)
+
+    photo_id = (p.get("photo_file_id") or "").strip()
+    msg = getattr(query, "message", None)
+    if photo_id:
+        # Photo card: edit caption in place if we're already on one
+        if msg is not None and getattr(msg, "photo", None):
+            try:
+                await query.edit_message_caption(
+                    caption=text[:1024],
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb,
+                )
+                return
+            except Exception as e:
+                if "not modified" in str(e).lower():
+                    return
+        # Text → photo: swap the message
+        try:
+            if msg is not None:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+                await msg.chat.send_photo(
+                    photo=photo_id,
+                    caption=text[:1024],
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb,
+                )
+                return
+        except Exception as e:
+            log.warning("photo card failed (falling back to text): %s", e)
+    await safe_edit(query, text, kb)
 
 
 async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2492,15 +2567,12 @@ async def _admin_home(
         )
     else:
         text += "\nMin order: OFF"
+    # Daily-driver actions up top; everything else lives in More tools
     kb = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton("📦 Products", callback_data="adm_prods"),
                 InlineKeyboardButton("➕ Add product", callback_data="adm_addprod"),
-            ],
-            [
-                InlineKeyboardButton("📥 Import inventory", callback_data="adm_import"),
-                InlineKeyboardButton("📝 Mass edit", callback_data="adm_massedit"),
             ],
             [
                 InlineKeyboardButton("📋 Orders", callback_data="adm_orders"),
@@ -2511,46 +2583,13 @@ async def _admin_home(
                 InlineKeyboardButton("🚚 Shipping", callback_data="adm_ship"),
             ],
             [
-                InlineKeyboardButton("📦 Min order (vial/kit)", callback_data="adm_minorder"),
-            ],
-            [
-                InlineKeyboardButton("📤 Export Reports", callback_data="adm_export"),
                 InlineKeyboardButton("🌐 Site links", callback_data="adm_sites"),
-            ],
-            [
-                InlineKeyboardButton("👥 Admins", callback_data="adm_admins"),
                 InlineKeyboardButton("🔗 Shop link", callback_data="adm_link"),
             ],
-            [
-                InlineKeyboardButton("🤝 Collaborations", callback_data="adm_collab"),
-            ],
-            [
-                InlineKeyboardButton("✏️ Rename shop", callback_data="adm_rename_shop"),
-                InlineKeyboardButton("🚚 Move to group", callback_data="adm_transfer"),
-            ],
-            [
-                InlineKeyboardButton("📋 Clone shop", callback_data="adm_clone"),
-            ],
+            [InlineKeyboardButton("🧰 More tools", callback_data="adm_more")],
             [InlineKeyboardButton("« Menu", callback_data="main")],
         ]
     )
-    # Master admin (OWNER_IDS) only — never show to shop staff
-    if update.effective_user and db.is_owner(update.effective_user.id):
-        rows = list(kb.inline_keyboard)
-        rows.insert(
-            -1,
-            [InlineKeyboardButton("👑 Master fees / invoices", callback_data="master_home")],
-        )
-        rows.insert(
-            -1,
-            [
-                InlineKeyboardButton(
-                    "🗑 Clear inventory (owner)",
-                    callback_data="owner_clear_inv",
-                )
-            ],
-        )
-        kb = InlineKeyboardMarkup(rows)
     # Note shared inventory on clone shops
     shop_full = shop
     if shop_full.get("inventory_master_chat_id"):
@@ -2562,6 +2601,44 @@ async def _admin_home(
         await safe_edit(update.callback_query, text, kb)
     elif update.message:
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+
+async def cb_adm_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Less-frequent admin tools, incl. owner-only rows."""
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await safe_edit(query, "Admin only.")
+        return
+    rows = [
+        [
+            InlineKeyboardButton("📥 Import inventory", callback_data="adm_import"),
+            InlineKeyboardButton("📝 Mass edit", callback_data="adm_massedit"),
+        ],
+        [
+            InlineKeyboardButton("📦 Min order (vial/kit)", callback_data="adm_minorder"),
+            InlineKeyboardButton("📤 Export Reports", callback_data="adm_export"),
+        ],
+        [
+            InlineKeyboardButton("👥 Admins", callback_data="adm_admins"),
+            InlineKeyboardButton("🤝 Collaborations", callback_data="adm_collab"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Rename shop", callback_data="adm_rename_shop"),
+            InlineKeyboardButton("🚚 Move to group", callback_data="adm_transfer"),
+        ],
+        [InlineKeyboardButton("📋 Clone shop", callback_data="adm_clone")],
+    ]
+    if update.effective_user and db.is_owner(update.effective_user.id):
+        rows.append(
+            [InlineKeyboardButton("👑 Master fees / invoices", callback_data="master_home")]
+        )
+        rows.append(
+            [InlineKeyboardButton("🗑 Clear inventory (owner)", callback_data="owner_clear_inv")]
+        )
+    rows.append([InlineKeyboardButton("« Admin", callback_data="admin")])
+    await safe_edit(query, "🧰 *More tools*", InlineKeyboardMarkup(rows))
 
 
 async def cb_adm_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3848,6 +3925,12 @@ async def cb_adm_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             InlineKeyboardButton("🗑 Clear kit", callback_data=f"clearkit:{pid}"),
         ],
         [InlineKeyboardButton("📄 Set COA (file or link)", callback_data=f"setcoa:{pid}")],
+        [
+            InlineKeyboardButton(
+                ("📷 Change photo" if (p.get("photo_file_id") or "").strip() else "📷 Set photo"),
+                callback_data=f"setphoto:{pid}",
+            )
+        ],
     ]
     if has_file or has_url:
         coa_row = [InlineKeyboardButton("📄 Send COA", callback_data=f"viewcoa:{pid}")]
@@ -3902,6 +3985,69 @@ async def cb_del_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     db.delete_product(pid)
     await query.answer("Deleted")
     await cb_adm_prods(update, context)
+
+
+async def cb_set_photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        return ConversationHandler.END
+    pid = int(query.data.split(":")[1])
+    p = db.get_product(pid)
+    if not p or int(p["chat_id"]) != int(sid):
+        await query.answer("Product not in this shop", show_alert=True)
+        return ConversationHandler.END
+    context.user_data["edit_pid"] = pid
+    set_awaiting(context, "product_photo")
+    await query.message.reply_text(
+        f"📷 *Photo for {p['name']}*\n\n"
+        "Send a *photo* to show on the buyer product card.\n"
+        "Send `-` to remove the current photo.\n/cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply("Photo or - ..."),
+    )
+    return EDIT_PHOTO_VALUE
+
+
+async def edit_photo_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return EDIT_PHOTO_VALUE
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    pid = context.user_data.get("edit_pid")
+    msg = update.message
+    if not msg or pid is None:
+        clear_awaiting(context)
+        return ConversationHandler.END
+    p = db.get_product(int(pid))
+    if not p or int(p["chat_id"]) != int(sid):
+        clear_awaiting(context)
+        await msg.reply_text("Product not in this shop.")
+        return ConversationHandler.END
+    if msg.photo:
+        db.update_product(int(pid), photo_file_id=msg.photo[-1].file_id)
+        body = f"✅ Photo saved for *{p['name']}* — buyers now see it on the product card."
+    elif (msg.text or "").strip() == "-":
+        db.update_product(int(pid), photo_file_id=None)
+        body = f"✅ Photo removed from *{p['name']}*."
+    else:
+        await msg.reply_text("Send a photo, or `-` to remove. /cancel")
+        return EDIT_PHOTO_VALUE
+    clear_awaiting(context)
+    await msg.reply_text(
+        body,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("« Product", callback_data=f"admp:{pid}")],
+                [InlineKeyboardButton("« Products", callback_data="adm_prods")],
+            ]
+        ),
+    )
+    return ConversationHandler.END
 
 
 async def cb_set_coa_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -6104,6 +6250,7 @@ def build_app(token: str | None = None) -> Application:
             CallbackQueryHandler(cb_set_unit_start, pattern=r"^setunit:\d+$"),
             CallbackQueryHandler(cb_set_name_start, pattern=r"^setname:\d+$"),
             CallbackQueryHandler(cb_set_coa_start, pattern=r"^setcoa:\d+$"),
+            CallbackQueryHandler(cb_set_photo_start, pattern=r"^setphoto:\d+$"),
             CallbackQueryHandler(cb_add_pay_start, pattern=r"^adm_addpay$"),
             CallbackQueryHandler(cb_pay_template_start, pattern=r"^paytpl:(cashapp|venmo|crypto|zelle|custom)$"),
             CallbackQueryHandler(cb_ship_fee_start, pattern=r"^ship_fee$"),
@@ -6202,6 +6349,10 @@ def build_app(token: str | None = None) -> Application:
                 MessageHandler(filters.Document.ALL, edit_coa_value),
                 MessageHandler(filters.PHOTO, edit_coa_value),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_coa_value),
+            ],
+            EDIT_PHOTO_VALUE: [
+                MessageHandler(filters.PHOTO, edit_photo_value),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_photo_value),
             ],
             ADD_PAY_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_pay_name),
@@ -6323,6 +6474,8 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_main, pattern=r"^main$"))
     app.add_handler(CallbackQueryHandler(cb_catalog, pattern=r"^cat$"))
     app.add_handler(CallbackQueryHandler(cb_catalog_page, pattern=r"^catp:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_catalog_sort, pattern=r"^catsort:(az|pop)$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_more, pattern=r"^adm_more$"))
     app.add_handler(CallbackQueryHandler(cb_reorder, pattern=r"^reorder:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_mark_shipped, pattern=r"^markship:\d+$"))
     app.add_handler(

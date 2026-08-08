@@ -230,6 +230,9 @@ def init_db() -> None:
         # Kit price = price for KIT_SIZE vials (NULL / 0 = no kit option)
         _ensure_column(conn, "products", "kit_price", "REAL")
 
+        # Product photo shown on the buyer card (Telegram file_id)
+        _ensure_column(conn, "products", "photo_file_id", "TEXT")
+
         # Order payment ref code, proof screenshot, shipping tracking
         _ensure_column(conn, "orders", "payment_code", "TEXT")
         _ensure_column(conn, "orders", "payment_proof_file_id", "TEXT")
@@ -1088,6 +1091,7 @@ def update_product(product_id: int, **fields: Any) -> bool:
         "active",
         "sort_order",
         "kit_price",
+        "photo_file_id",
     }
     cols = ["updated_at = ?"]
     vals: list[Any] = [_utc_now()]

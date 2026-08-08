@@ -145,6 +145,17 @@ class NotifyHandlerTests(unittest.TestCase):
         self.assertIn("111", spbc_notify._sessions)
         self.assertEqual(spbc_notify._sessions["111"]["step"], "await_total")
 
+    def test_quote_only_skips_suppliers(self):
+        payload = dict(PAYLOAD_PAID)
+        payload["quote_only"] = True
+        with mock.patch.object(spbc_notify, "OWNER_TELEGRAM_CHAT_ID", "999"):
+            code, body = spbc_notify.handle_notify(payload)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["kind"], "quote_only")
+        # No supplier messages, no Q&A sessions started
+        self.assertEqual(self.sent, [])
+        self.assertEqual(spbc_notify._sessions, {})
+
     def test_follow_up_skips_owner_chat(self):
         with mock.patch.object(spbc_notify, "OWNER_TELEGRAM_CHAT_ID", "111"):
             out = spbc_notify.start_supplier_follow_up("111", "Acme", "PEP-3", [])

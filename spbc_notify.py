@@ -553,6 +553,36 @@ def handle_notify(payload: dict) -> tuple[int, dict]:
             "status": payload.get("status"),
         }
 
+    # Partner-retail orders: supplier messages are batched (Thursday policy),
+    # but vendor quote-and-suggest still runs so routing works for partners.
+    if payload.get("quote_only"):
+        suggested = False
+        try:
+            import order_router
+
+            owner = OWNER_TELEGRAM_CHAT_ID or SUPPLIER_TELEGRAM_CHAT_ID
+            if owner:
+                spec = order_router.suggest_for_order(payload)
+                if spec:
+                    _telegram_api(
+                        "sendMessage",
+                        {
+                            "chat_id": owner,
+                            "text": spec["text"],
+                            "reply_markup": spec["reply_markup"],
+                            "disable_web_page_preview": True,
+                        },
+                    )
+                    suggested = True
+        except Exception as exc:
+            log.warning("quote_only_suggest_failed: %s", exc)
+        return 200, {
+            "ok": True,
+            "kind": "quote_only",
+            "order_number": order_number,
+            "vendor_quotes_suggested": suggested,
+        }
+
     groups = group_items_by_supplier(payload)
     if not groups:
         return 400, {"error": "no_items", "message": "No line items"}
