@@ -142,7 +142,8 @@ def symbol_for(chat_id: int | None) -> str:
     MIN_ORDER_QTY,
     EDIT_KIT_PRICE,
     EDIT_PHOTO_VALUE,
-) = range(31)
+    ADD_PROD_KIT,
+) = range(32)
 
 # How long a pending admin/buyer prompt stays open (seconds)
 AWAITING_TTL_SEC = 600
@@ -4599,6 +4600,34 @@ async def add_prod_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return ADD_PROD_PRICE
     context.user_data["new_prod"]["price"] = price
+    set_awaiting(context, "add_prod_kit")
+    await update.message.reply_text(
+        f"📦 *Kit price?*\nPrice for a full kit of {KIT_SIZE} — or send `-` "
+        "to sell this by the vial only.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=force_reply(f"Kit of {KIT_SIZE} price, or -"),
+    )
+    return ADD_PROD_KIT
+
+
+async def add_prod_kit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await accept_prompt_message(update, context):
+        return ADD_PROD_KIT
+    raw = (update.message.text or "").replace("$", "").strip()
+    kit = None
+    if raw and raw != "-":
+        try:
+            kit = float(raw)
+            if kit <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                f"Invalid kit price. Send a number, or `-` for vials only.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=force_reply(f"Kit of {KIT_SIZE} price, or -"),
+            )
+            return ADD_PROD_KIT
+    context.user_data["new_prod"]["kit_price"] = kit
     set_awaiting(context, "add_prod_stock")
     await update.message.reply_text(
         "Starting stock quantity? (integer)",
@@ -4665,11 +4694,15 @@ async def add_prod_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         description=desc,
         unit=unit,
     )
+    kit = np.get("kit_price")
+    if kit:
+        db.update_product(pid, kit_price=float(kit))
     context.user_data.pop("new_prod", None)
     clear_awaiting(context)
+    kit_note = f" · kit of {KIT_SIZE} {money(float(kit))}" if kit else ""
     await update.message.reply_text(
-        f"✅ Added *{np['name']}* (#{pid}) — {money(np['price'])} / {unit}, "
-        f"stock {np['stock']}",
+        f"✅ Added *{np['name']}* (#{pid}) — {money(np['price'])} / {unit}"
+        f"{kit_note}, stock {np['stock']}",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(
             [
@@ -6773,6 +6806,9 @@ def build_app(token: str | None = None) -> Application:
             ],
             ADD_PROD_PRICE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_prod_price),
+            ],
+            ADD_PROD_KIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_prod_kit),
             ],
             ADD_PROD_STOCK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_prod_stock),

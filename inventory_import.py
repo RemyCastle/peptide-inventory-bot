@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -18,15 +19,21 @@ DEFAULT_UNIT = "vial"
 
 ImportMode = Literal["add_only", "update_only", "upsert"]
 
-TEMPLATE_TEXT = """# UnicornFartzz inventory import / mass edit
+TEMPLATE_TEXT = """# Inventory import / mass edit
 # One product per line. Preferred format:
 #   name | price | stock | unit | description
+#
+# KIT PRICING: add a kit:PRICE field anywhere after stock, e.g.
+#   BPC-157 10MG | 41 | 10 | kit:294
+#   SEMA 10MG | 60 | 25 | kit:480 | vial | best seller
+# price = per vial · kit:PRICE = price for a full kit
 # Lines starting with # are ignored. Blank lines ignored.
 #
 # Units: vial, bottle, pack, kit, ea, etc. (default: vial)
 #
 # Examples:
 Tren Ace | 45.00 | 10 | vial | acetate blend
+BPC-157 10MG | 41 | 12 | kit:294
 Test E | 30 | 5 | bottle |
 HCG 5000 | 55.00 | 0 | kit | fridge item
 #
@@ -45,6 +52,32 @@ class ParsedRow:
     line_no: int = 0
     # True when file explicitly included a unit column (5+ fields)
     unit_explicit: bool = False
+    # Price for a full kit (KIT_SIZE vials); None = no kit option
+    kit_price: float | None = None
+
+
+_KIT_TOKEN = re.compile(r"^kit\s*[:=]\s*\$?\s*([\d,]*\.?\d+)$", re.IGNORECASE)
+
+
+def extract_kit_price(parts: list[str]) -> tuple[list[str], float | None]:
+    """Pull a `kit:290` / `kit=290` token out of the fields after stock.
+
+    Position-independent so it never disturbs the existing
+    name | price | stock | unit | description layout.
+    """
+    kept: list[str] = []
+    kit: float | None = None
+    for p in parts:
+        m = _KIT_TOKEN.match(p.strip())
+        if m and kit is None:
+            try:
+                kit = float(m.group(1).replace(",", ""))
+            except ValueError:
+                kit = None
+                kept.append(p)
+        else:
+            kept.append(p)
+    return kept, kit
 
 
 @dataclass
@@ -123,6 +156,11 @@ def parse_inventory_text(text: str) -> ParseResult:
         description = ""
         unit_explicit = False
 
+        # `kit:290` may sit anywhere after stock — pull it out first so the
+        # remaining fields keep their historic meaning
+        tail, kit_price = extract_kit_price(parts[3:])
+        parts = parts[:3] + tail
+
         if len(parts) == 3:
             pass
         elif len(parts) == 4:
@@ -182,6 +220,7 @@ def parse_inventory_text(text: str) -> ParseResult:
                 description=description,
                 line_no=line_no,
                 unit_explicit=unit_explicit,
+                kit_price=kit_price,
             )
         )
 
@@ -250,6 +289,8 @@ def import_products(
                     description=row.description or "",
                     unit=unit,
                 )
+                if row.kit_price is not None:
+                    db.update_product(pid, kit_price=row.kit_price)
                 out.created.append(row.name)
                 batch_seen.add(key)
                 existing[key] = {
@@ -276,6 +317,8 @@ def import_products(
                 "description": row.description or "",
                 "unit": unit,
             }
+            if row.kit_price is not None:
+                fields["kit_price"] = row.kit_price
             ok = db.update_product(pid, **fields)
             if not ok:
                 out.errors.append(f"L{row.line_no}: failed to update {row.name}")

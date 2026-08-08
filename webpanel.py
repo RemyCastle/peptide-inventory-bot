@@ -849,14 +849,17 @@ function render(){
     <div id="plist">${S.products.map(prodRow).join('')}</div>
     <div class="prod"><div class="row">
       <div class="name"><label>New product</label><input id="np-name" placeholder="BPC-157 10MG"></div>
-      <div class="num"><label>Price</label><input id="np-price" type="number" step="0.01" min="0"></div>
+      <div class="num"><label>Price / vial</label><input id="np-price" type="number" step="0.01" min="0"></div>
+      <div class="num"><label>Kit price</label><input id="np-kit" type="number" step="0.01" min="0" placeholder="—"></div>
       <div class="num"><label>Stock</label><input id="np-stock" type="number" step="1" min="0" value="0"></div>
-      <div><button id="np-add">Add</button></div></div></div>
+      <div><button id="np-add">Add</button></div></div>
+      <span class="tag">Kit price optional — leave blank to sell vials only.</span></div>
     <div class="prod"><label>Bulk add / update — one per line:
-      name | price | stock</label>
-      <textarea id="bulk" placeholder="BPC-157 10MG | 41 | 10&#10;TB-500 10MG | 47 | 5"></textarea>
+      name | price | stock | kit:PRICE</label>
+      <textarea id="bulk" placeholder="BPC-157 10MG | 41 | 10 | kit:294&#10;TB-500 10MG | 47 | 5"></textarea>
       <div class="flex" style="margin-top:8px">
-        <span class="tag grow">Existing names update; new names are created.</span>
+        <span class="tag grow">Existing names update; new names are created.
+          Add <b>kit:294</b> for kit pricing.</span>
         <button class="sub" id="bulk-go">Import</button></div></div>
   </div>
   <div class="card"><h2>Payment methods</h2>
@@ -977,7 +980,8 @@ function wire(){
       if(d.ok)toast('Saved');};});
   $('#np-add').onclick=async()=>{
     const d=await api('product',{name:$('#np-name').value,
-      price:$('#np-price').value,stock:$('#np-stock').value||0});
+      price:$('#np-price').value,stock:$('#np-stock').value||0,
+      kit_price:$('#np-kit').value||null});
     if(d.ok){toast('Product added');load();}};
   $('#bulk-go').onclick=async()=>{
     const d=await api('bulk',{text:$('#bulk').value});
