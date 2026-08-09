@@ -50,11 +50,9 @@ from telegram.ext import (
 )
 
 import db
-from config import Config
+from config import KIT_SIZE
 
 log = logging.getLogger("vendor_stores")
-
-KIT_SIZE = int(getattr(Config, "KIT_SIZE", 10))
 
 
 # ── configuration ────────────────────────────────────────────────────────────
