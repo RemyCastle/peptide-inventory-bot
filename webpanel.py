@@ -244,6 +244,16 @@ def panel_url(base_url: str, raw_token: str, mode: str = "") -> str:
 
 # ── Vendor invites ───────────────────────────────────────────────────────────
 
+def normalize_invite_token(raw_invite: str) -> str:
+    """Strip handoff/storefront prefixes → 24-char hex invite body."""
+    raw = (raw_invite or "").strip()
+    if raw.startswith("vendor_"):
+        raw = raw[len("vendor_") :]
+    elif raw.startswith("vendor"):
+        raw = raw[len("vendor") :]
+    return raw.strip()
+
+
 def create_vendor_invite(
     created_by: int, note: str = "", shop_chat_id: int | None = None
 ) -> str:
@@ -274,6 +284,7 @@ def redeem_vendor_invite(
 ) -> tuple[bool, str, Optional[int]]:
     """One-time redemption. Returns (ok, message, pre_built_shop_chat_id)."""
     ensure_webpanel_tables()
+    raw = normalize_invite_token(raw)
     with db.get_db() as conn:
         row = conn.execute(
             "SELECT * FROM vendor_invites WHERE token_hash = ?", (_hash(raw),)
@@ -292,6 +303,140 @@ def redeem_vendor_invite(
     return True, str(row["note"] or ""), (int(shop_id) if shop_id else None)
 
 
+def _shop_product_count(chat_id: int) -> int:
+    try:
+        return len(db.list_products(int(chat_id), active_only=True))
+    except Exception:
+        return 0
+
+
+def _find_shop_for_miniapp(
+    shop_chat_id: int | None = None,
+    title_hints: list[str] | None = None,
+) -> Optional[dict]:
+    """Pick the pre-built vendor shop that should back a mini-app catalog."""
+    if shop_chat_id:
+        shop = db.get_shop(int(shop_chat_id))
+        if shop:
+            return shop
+
+    hints = [h.lower() for h in (title_hints or []) if h and h.strip()]
+    shops = db.list_shops() if hasattr(db, "list_shops") else None
+    if shops is None:
+        with db.get_db() as conn:
+            shops = [dict(r) for r in conn.execute("SELECT * FROM shops").fetchall()]
+
+    if not shops:
+        return None
+
+    # Prefer pre-built virtual vendor shops (/newvendor) when present.
+    virtual = [s for s in shops if int(s["chat_id"]) >= db.VIRTUAL_SHOP_BASE]
+    pool = virtual or shops
+
+    scored: list[tuple[int, int, dict]] = []
+    for s in pool:
+        title = (s.get("title") or "").lower()
+        hint_hits = sum(1 for h in hints if h in title)
+        n = _shop_product_count(int(s["chat_id"]))
+        # title match first, then product count
+        scored.append((hint_hits, n, s))
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    best = scored[0]
+    # Require either a title hint hit or at least one product
+    if best[0] > 0 or best[1] > 0:
+        return best[2]
+    return best[2]
+
+
+def ensure_miniapp_storefront(
+    raw_invite: str,
+    *,
+    shop_chat_id: int | None = None,
+    title_hints: list[str] | None = None,
+    created_by: int = 0,
+    note: str = "",
+) -> dict[str, Any]:
+    """Idempotently bind a fixed invite token to a stocked shop for /storefront.
+
+    Claim is NOT required for the mini-app catalog. We only need vendor_invites
+    row: token_hash + shop_chat_id. Used by cloud boot so Pages demos keep
+    working after a suspended service or regenerated handoff link.
+    """
+    ensure_webpanel_tables()
+    raw = normalize_invite_token(raw_invite)
+    if not re.fullmatch(r"[0-9a-fA-F]{24}", raw):
+        return {"ok": False, "error": "bad_invite_token", "invite": raw_invite}
+
+    # Already bound with a real shop?
+    with db.get_db() as conn:
+        existing = conn.execute(
+            "SELECT * FROM vendor_invites WHERE token_hash = ?", (_hash(raw),)
+        ).fetchone()
+    if existing and existing["shop_chat_id"]:
+        sid = int(existing["shop_chat_id"])
+        shop = db.get_shop(sid)
+        n = _shop_product_count(sid)
+        if shop and n > 0:
+            return {
+                "ok": True,
+                "action": "already_bound",
+                "shop_chat_id": sid,
+                "title": shop.get("title"),
+                "products": n,
+            }
+
+    shop = _find_shop_for_miniapp(shop_chat_id, title_hints)
+    if not shop:
+        return {"ok": False, "error": "no_shop_found"}
+
+    sid = int(shop["chat_id"])
+    title = (note or shop.get("title") or "Vendor shop").strip()[:80]
+    now = _utc_now()
+    # Long-lived for storefront binding; claim still one-shot via used_by.
+    expires = now + timedelta(days=3650)
+    with db.get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM vendor_invites WHERE token_hash = ?", (_hash(raw),)
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE vendor_invites SET shop_chat_id = ?, note = ?, "
+                "expires_at = ? WHERE token_hash = ?",
+                (sid, title, _ts(expires), _hash(raw)),
+            )
+            action = "updated"
+        else:
+            conn.execute(
+                "INSERT INTO vendor_invites (token_hash, note, created_by, "
+                "created_at, expires_at, shop_chat_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    _hash(raw),
+                    title,
+                    int(created_by),
+                    _ts(now),
+                    _ts(expires),
+                    sid,
+                ),
+            )
+            action = "created"
+
+    n = _shop_product_count(sid)
+    log.info(
+        "miniapp storefront %s invite→shop %s (%s) products=%s",
+        action,
+        sid,
+        title,
+        n,
+    )
+    return {
+        "ok": True,
+        "action": action,
+        "shop_chat_id": sid,
+        "title": title,
+        "products": n,
+    }
+
+
 # ── JSON API (pure functions; HTTP layer is a thin wrapper) ─────────────────
 
 def _err(code: int, msg: str) -> tuple[int, dict]:
@@ -307,9 +452,7 @@ def api_storefront(raw_invite: str) -> tuple[int, dict]:
     shipping terms and payment-method names. No instructions, no admin data.
     """
     ensure_webpanel_tables()
-    raw = (raw_invite or "").strip()
-    if raw.startswith("vendor"):
-        raw = raw[len("vendor"):]
+    raw = normalize_invite_token(raw_invite)
     if not re.fullmatch(r"[0-9a-fA-F]{24}", raw):
         return _err(404, "unknown storefront")
     with db.get_db() as conn:

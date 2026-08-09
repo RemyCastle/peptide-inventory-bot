@@ -111,6 +111,30 @@ class InviteTests(WebPanelBase):
         self.assertFalse(db.is_virtual_shop(6086230967))
         self.assertFalse(db.is_virtual_shop(-1001234567890))
 
+    def test_ensure_miniapp_storefront_binds_invite_without_claim(self):
+        shop = db.create_virtual_shop("Unicorn Magic Factory", created_by=1)
+        sid = int(shop["chat_id"])
+        db.add_product(sid, "SEMA 5mg", 55.0, 12)
+        fixed = "3a9eee77166edc67b4cbb94d"
+        result = webpanel.ensure_miniapp_storefront(
+            f"vendor{fixed}",
+            title_hints=["unicorn", "magic factory"],
+            note="Unicorn Magic Factory",
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["shop_chat_id"], sid)
+        self.assertGreaterEqual(result["products"], 1)
+        # Mini-app catalog works before anyone claims the handoff link
+        code, body = webpanel.api_storefront(f"vendor{fixed}")
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["shop"]["title"], "Unicorn Magic Factory")
+        self.assertEqual(len(body["products"]), 1)
+        # Idempotent
+        again = webpanel.ensure_miniapp_storefront(f"vendor{fixed}")
+        self.assertTrue(again["ok"])
+        self.assertEqual(again["action"], "already_bound")
+
 
 class RestockTests(WebPanelBase):
     def test_restock_adds_and_audits(self):

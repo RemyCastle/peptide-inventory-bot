@@ -108,11 +108,10 @@ def _resolve_shop(v: dict) -> int:
     if explicit.lstrip("-").isdigit() and int(explicit) != 0:
         return int(db.resolve_shop_chat_id(int(explicit)))
     raw = str(v.get("invite") or "").strip()
-    if raw.startswith("vendor"):
-        raw = raw[len("vendor"):]
     if raw:
         import webpanel
 
+        raw = webpanel.normalize_invite_token(raw)
         webpanel.ensure_webpanel_tables()
         with db.get_db() as conn:
             row = conn.execute(
