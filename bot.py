@@ -6231,6 +6231,110 @@ async def cmd_webpanel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await safe_reply(update.message, text)
 
 
+def build_rescue_kit(bot_username: str, shops: list[dict]) -> str:
+    """Everything needed to bring the network back on a new bot token."""
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    tokens = resolve_bot_tokens()
+    lines = [
+        "=" * 64,
+        "  BOT RECOVERY KIT",
+        f"  Generated: {stamp}",
+        f"  Active bot: @{bot_username}",
+        "=" * 64,
+        "",
+        "READINESS",
+        f"  Standby tokens configured : {len(tokens)}"
+        + ("  (add more with BOT_TOKENS)" if len(tokens) < 2 else ""),
+        f"  Automatic failover        : {'ON' if TOKEN_FAILOVER else 'OFF'}",
+        f"  Encrypted backups         : {'ON' if BACKUP_PASSPHRASE else 'OFF — set BACKUP_PASSPHRASE'}",
+        "",
+        "WHAT A BAN CHANGES",
+        "  Your data is safe — shops, products, stock, orders and uploads",
+        "  live on the server disk, not in Telegram.",
+        "  What breaks: the bot's @username. Old t.me links stop working,",
+        "  and a new bot CANNOT message anyone until they open it and press",
+        "  Start. That last part is the real work — the lists below are who",
+        "  to reach and what to send them.",
+        "",
+        "STEP 1 — swap the token",
+        "  Render > Environment > TELEGRAM_BOT_TOKEN = the new BotFather token",
+        "  (or put spares in BOT_TOKENS and it fails over on its own).",
+        "",
+        "STEP 2 — update your websites",
+        f"  Replace any t.me/... links with: https://t.me/{bot_username}",
+        "",
+        "STEP 3 — message each person below so they press Start",
+        "",
+    ]
+    total_people = 0
+    for s in shops:
+        sid = int(s["chat_id"])
+        link = f"https://t.me/{bot_username}?start=shop_{sid}"
+        admins = db.list_admins(sid)
+        n_prod = len(db.list_products(sid, active_only=False))
+        lines += [
+            "-" * 64,
+            f"SHOP: {s['title']}   (id {sid})",
+            f"  Customer link : {link}",
+            f"  Products      : {n_prod}",
+        ]
+        if admins:
+            who = ", ".join(
+                (f"@{a['username']}" if a.get("username") else f"id {a['user_id']}")
+                for a in admins
+            )
+            lines.append(f"  Must press Start: {who}")
+            total_people += len(admins)
+        else:
+            lines.append("  Must press Start: (no admins recorded)")
+        lines += [
+            "",
+            "  Send them:",
+            f'  "Our shop bot moved to a new address: {link}',
+            "   Tap it and press Start so you keep getting order alerts.",
+            '   Your products, prices and stock are all unchanged."',
+            "",
+        ]
+    lines += [
+        "=" * 64,
+        f"  {len(shops)} shop(s), {total_people} person(s) to re-contact.",
+        "  Customers simply use the new customer link — nothing else to do.",
+        "=" * 64,
+    ]
+    return "\n".join(lines)
+
+
+async def cmd_rescue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: recovery kit for getting everyone back after a ban/token swap."""
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await update.message.reply_text("Owners only.")
+        return
+    bot_username = (context.bot.username or "unknown").lstrip("@")
+    with db.get_db() as conn:
+        rows = conn.execute("SELECT * FROM shops ORDER BY title").fetchall()
+    shops = [dict(r) for r in rows]
+    kit = build_rescue_kit(bot_username, shops)
+
+    n_people = kit.count("Must press Start:")
+    summary = (
+        f"🆘 *Recovery kit — @{bot_username}*\n"
+        f"{len(shops)} shop(s) · {n_people} contact list(s)\n\n"
+        "The file below has fresh links for every shop, who needs to press "
+        "Start on the new bot, and a message you can copy to each of them."
+    )
+    await safe_reply(update.message, summary)
+    try:
+        await update.message.reply_document(
+            document=io.BytesIO(kit.encode("utf-8")),
+            filename=f"recovery-kit-{bot_username}.txt",
+            caption="Keep this handy — regenerate any time with /rescue.",
+        )
+    except Exception as exc:
+        log.error("rescue kit send failed: %s", exc)
+        await update.message.reply_text(kit[:3900])
+
+
 async def cmd_restock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin: add received stock. `/restock BPC 10, TB-500 5` or one per line."""
     user = update.effective_user
@@ -6628,6 +6732,7 @@ async def post_init(app: Application) -> None:
         BotCommand("invitevendor", "Invite a vendor (owner)"),
         BotCommand("newvendor", "Build a vendor's shop (owner)"),
         BotCommand("handover", "Hand a built shop to its vendor (owner)"),
+        BotCommand("rescue", "Recovery kit after a ban (owner)"),
         BotCommand("syncsite", "Pull the SPBC site catalog (owner)"),
         BotCommand("master", "Master fees/invoices (owner)"),
         BotCommand("backup", "Encrypted DB snapshot (owner)"),
@@ -6954,6 +7059,7 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("newvendor", cmd_newvendor))
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("restock", cmd_restock))
+    app.add_handler(CommandHandler("rescue", cmd_rescue))
     app.add_handler(CallbackQueryHandler(cb_adm_sites, pattern=r"^adm_sites$"))
     app.add_handler(CallbackQueryHandler(cb_sitesync, pattern=r"^sitesync:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_siterm, pattern=r"^siterm:\d+$"))
