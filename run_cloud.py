@@ -27,11 +27,21 @@ def _bind_vendor_miniapps() -> None:
     """
     import webpanel
 
-    # Legacy single-vendor env (Unicorn first)
+    # Legacy single-vendor env (Unicorn first). Panel handoff lives on the
+    # service that has PANEL_BASE_URL = spbc-supplier-bot (virtual shop 9.1e12).
     claim = (os.getenv("UNICORN_CLAIM_TOKEN") or "").strip()
+    shop_raw = (os.getenv("UNICORN_SHOP_CHAT_ID") or "").strip().strip("\"'")
+    token_set = bool((os.getenv("UNICORN_BOT_TOKEN") or "").strip())
+    print(
+        f"[run_cloud] unicorn env: claim={bool(claim)} shop={shop_raw!r} "
+        f"bot_token_set={token_set}",
+        flush=True,
+    )
     if claim:
-        shop_raw = (os.getenv("UNICORN_SHOP_CHAT_ID") or "").strip()
-        shop_id = int(shop_raw) if shop_raw.lstrip("-").isdigit() else None
+        try:
+            shop_id = int(shop_raw) if shop_raw else None
+        except ValueError:
+            shop_id = None
         result = webpanel.ensure_miniapp_storefront(
             claim,
             shop_chat_id=shop_id,
@@ -40,10 +50,12 @@ def _bind_vendor_miniapps() -> None:
                 "magic factory",
                 "unicorn magic",
                 "unicorn fancy",
+                "@unicornmagicfactory",
             ],
-            note="Unicorn Magic Factory",
+            note="@unicornmagicfactory",
         )
         log.info("unicorn storefront bind: %s", result)
+        print(f"[run_cloud] unicorn storefront bind: {result}", flush=True)
 
     # Optional multi-vendor JSON: each entry may include invite + shop_chat_id + name
     raw = (os.getenv("VENDOR_STORES_JSON") or "").strip()

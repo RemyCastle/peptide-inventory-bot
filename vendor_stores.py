@@ -103,23 +103,45 @@ def load_vendor_configs() -> list[dict]:
     return unique
 
 
+def _parse_chat_id(raw) -> int:
+    s = str(raw or "").strip().strip("\"'")
+    if not s:
+        return 0
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _resolve_shop(v: dict) -> int:
-    explicit = str(v.get("shop_chat_id") or "").strip()
-    if explicit.lstrip("-").isdigit() and int(explicit) != 0:
-        return int(db.resolve_shop_chat_id(int(explicit)))
+    name = v.get("name") or "vendor"
+    explicit = _parse_chat_id(v.get("shop_chat_id"))
+    if explicit:
+        resolved = int(db.resolve_shop_chat_id(explicit))
+        log.info("[%s] shop from shop_chat_id env/config → %s", name, resolved)
+        return resolved
     raw = str(v.get("invite") or "").strip()
     if raw:
         import webpanel
 
-        raw = webpanel.normalize_invite_token(raw)
+        token = webpanel.normalize_invite_token(raw)
         webpanel.ensure_webpanel_tables()
         with db.get_db() as conn:
             row = conn.execute(
                 "SELECT shop_chat_id FROM vendor_invites WHERE token_hash = ?",
-                (webpanel._hash(raw),),
+                (webpanel._hash(token),),
             ).fetchone()
         if row and row["shop_chat_id"]:
-            return int(db.resolve_shop_chat_id(int(row["shop_chat_id"])))
+            resolved = int(db.resolve_shop_chat_id(int(row["shop_chat_id"])))
+            log.info("[%s] shop from invite → %s", name, resolved)
+            return resolved
+        log.warning(
+            "[%s] invite present but no vendor_invites.shop_chat_id (token body len=%s)",
+            name,
+            len(token),
+        )
+    else:
+        log.warning("[%s] no shop_chat_id and no invite configured", name)
     return 0
 
 
