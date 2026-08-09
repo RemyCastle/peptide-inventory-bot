@@ -538,20 +538,26 @@ def confirm_payment_multi(
             "SELECT * FROM order_items WHERE order_id = ?", (order_id,)
         ).fetchall()
 
+        # Aggregate need per product_id so duplicate lines cannot oversell
+        need_by_pid: dict[int, int] = {}
         for it in items:
             if it["product_id"] is None:
                 continue
+            pid = int(it["product_id"])
+            need_by_pid[pid] = need_by_pid.get(pid, 0) + int(it["quantity"])
+
+        for pid, need in need_by_pid.items():
             prod = conn.execute(
                 "SELECT stock, name FROM products WHERE id = ?",
-                (it["product_id"],),
+                (pid,),
             ).fetchone()
             if not prod:
-                return False, f"Product missing: {it['product_name']}", []
-            if int(prod["stock"]) < int(it["quantity"]):
+                return False, f"Product missing: id {pid}", []
+            if int(prod["stock"]) < need:
                 return (
                     False,
                     f"Insufficient stock for {prod['name']}: "
-                    f"need {it['quantity']}, have {prod['stock']}.",
+                    f"need {need}, have {prod['stock']}.",
                     [],
                 )
 

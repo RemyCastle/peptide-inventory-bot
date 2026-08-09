@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -10,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator, Iterable, Optional
+
+log = logging.getLogger(__name__)
 
 from config import (
     BRAND_NAME,
@@ -1865,7 +1868,13 @@ def create_order(
                 or shop
             )
             shipping, hidden_fee = customer_shipping_total(shop_live, subtotal)
-        except Exception:
+        except Exception as e:
+            log.warning(
+                "create_order hidden_fee fallback chat_id=%s subtotal=%s: %s",
+                chat_id,
+                subtotal,
+                e,
+            )
             shipping = calc_shipping(shop, subtotal)
             hidden_fee = 0.0
         total = subtotal + shipping
@@ -2212,7 +2221,9 @@ def confirm_order_payment(
             "SELECT * FROM order_items WHERE order_id = ?", (order_id,)
         ).fetchall()
 
-        # Verify stock still available (resolve clone → master inventory)
+        # Aggregate need per root stock_id (mini-app sends vials + kit lines
+        # for the same product). Per-line checks can pass while the total oversells.
+        need_by_stock_id: dict[int, int] = {}
         for it in items:
             if it["product_id"] is None:
                 continue
@@ -2223,16 +2234,21 @@ def confirm_order_payment(
             if not prod:
                 return False, f"Product missing for line: {it['product_name']}", []
             stock_id = int(prod["linked_product_id"] or prod["id"])
+            need_by_stock_id[stock_id] = need_by_stock_id.get(stock_id, 0) + int(
+                it["quantity"]
+            )
+
+        for stock_id, need in need_by_stock_id.items():
             stock_row = conn.execute(
                 "SELECT stock, name FROM products WHERE id = ?", (stock_id,)
             ).fetchone()
             if not stock_row:
-                return False, f"Inventory missing for: {prod['name']}", []
-            if int(stock_row["stock"]) < int(it["quantity"]):
+                return False, f"Inventory missing for product id {stock_id}", []
+            if int(stock_row["stock"]) < need:
                 return (
                     False,
                     f"Insufficient stock for {stock_row['name']}: "
-                    f"need {it['quantity']}, have {stock_row['stock']}.",
+                    f"need {need}, have {stock_row['stock']}.",
                     [],
                 )
 

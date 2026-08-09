@@ -119,6 +119,78 @@ class StockConfirmAuditTests(unittest.TestCase):
         self.assertIn("currency_symbol", display)
         self.assertEqual(int(display["low_stock_threshold"]), 2)
 
+    def test_confirm_rejects_oversell_by_duplicate_lines(self) -> None:
+        """Mini-app can send vials + kit lines for same product; aggregate must win.
+
+        Stock=5. Two lines of qty 3 each (total 6) would pass per-line checks
+        but oversell. Confirm must abort and leave stock untouched.
+        """
+        pm = db.list_payment_methods(self.shop_id)[0]
+        order = db.create_order(
+            chat_id=self.shop_id,
+            user_id=self.buyer_id,
+            username="buyer",
+            full_name="Buyer",
+            items=[
+                {"product_id": self.pid, "quantity": 3},
+                {"product_id": self.pid, "quantity": 3},
+            ],
+            payment_method=pm,
+            ship_name="Buyer",
+            ship_address="123 Test St",
+        )
+        # create_order also aggregates — so this should be rejected at create
+        # if stock is only 5. Force the oversell path by inserting a second line
+        # after a valid single-line order (simulates race / legacy rows).
+        if order is not None:
+            # Stock was 5; 3+3=6 should have been rejected at create
+            self.assertIsNone(
+                order,
+                "create_order should reject aggregate oversell at creation",
+            )
+
+        # Valid order for 3, then inject an extra line so confirm sees 3+3=6
+        order = self._create_order(qty=3)
+        with db.get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO order_items (
+                    order_id, product_id, product_name, unit_price, quantity, line_total
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (order["id"], self.pid, "Test Vial", 50.0, 3, 150.0),
+            )
+        ok, msg, _ = db.confirm_order_payment(order["id"], self.admin_id)
+        self.assertFalse(ok, msg)
+        self.assertIn("Insufficient", msg)
+        prod = db.get_product(self.pid)
+        self.assertEqual(int(prod["stock"]), 5)
+        self.assertEqual(db.list_stock_audit(product_id=self.pid), [])
+        unpaid = db.get_order(order["id"])
+        self.assertNotEqual(unpaid["status"], "paid")
+
+    def test_confirm_allows_aggregate_within_stock(self) -> None:
+        """Two lines totaling exactly stock should confirm and zero inventory."""
+        pm = db.list_payment_methods(self.shop_id)[0]
+        order = db.create_order(
+            chat_id=self.shop_id,
+            user_id=self.buyer_id,
+            username="buyer",
+            full_name="Buyer",
+            items=[
+                {"product_id": self.pid, "quantity": 2},
+                {"product_id": self.pid, "quantity": 3},
+            ],
+            payment_method=pm,
+            ship_name="Buyer",
+            ship_address="123 Test St",
+        )
+        self.assertIsNotNone(order)
+        ok, msg, _ = db.confirm_order_payment(order["id"], self.admin_id)
+        self.assertTrue(ok, msg)
+        prod = db.get_product(self.pid)
+        self.assertEqual(int(prod["stock"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
