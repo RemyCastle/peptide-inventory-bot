@@ -21,6 +21,17 @@ def main() -> None:
     threading.Thread(
         target=spbc_notify.serve_http, args=(port,), name="notify-http", daemon=True
     ).start()
+
+    # Optional: vendor mini-app order receiver (@UnicornMagicFactoryBot).
+    # Only starts when UNICORN_BOT_TOKEN is set; a crash logs and never takes
+    # down the main bot.
+    if (os.environ.get("UNICORN_BOT_TOKEN") or "").strip():
+        import unicorn_store_bot
+
+        threading.Thread(
+            target=unicorn_store_bot.run_threaded, name="unicorn-store", daemon=True
+        ).start()
+
     import bot
 
     bot.main()

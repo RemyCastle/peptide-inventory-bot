@@ -298,6 +298,55 @@ def _err(code: int, msg: str) -> tuple[int, dict]:
     return code, {"ok": False, "error": msg}
 
 
+def api_storefront(raw_invite: str) -> tuple[int, dict]:
+    """Public, read-only catalog for a vendor's mini-app storefront.
+
+    Keyed by the vendor invite token from the t.me handoff link (works before
+    AND after the invite is redeemed — the shop mapping persists). Exposes only
+    what a customer-facing store needs: names, prices, kit prices, stock,
+    shipping terms and payment-method names. No instructions, no admin data.
+    """
+    ensure_webpanel_tables()
+    raw = (raw_invite or "").strip()
+    if raw.startswith("vendor"):
+        raw = raw[len("vendor"):]
+    if not re.fullmatch(r"[0-9a-fA-F]{24}", raw):
+        return _err(404, "unknown storefront")
+    with db.get_db() as conn:
+        row = conn.execute(
+            "SELECT shop_chat_id FROM vendor_invites WHERE token_hash = ?",
+            (_hash(raw),),
+        ).fetchone()
+    if not row or not row["shop_chat_id"]:
+        return _err(404, "unknown storefront")
+    chat_id = db.resolve_shop_chat_id(int(row["shop_chat_id"]))
+    shop = db.get_shop(chat_id) or db.ensure_shop(chat_id)
+    products = db.list_products(chat_id, active_only=True)
+    payments = db.list_payment_methods(chat_id, active_only=True)
+    return 200, {
+        "ok": True,
+        "shop": {
+            "title": shop["title"],
+            "shipping_enabled": int(shop.get("shipping_enabled") or 0),
+            "shipping_fee": float(shop.get("shipping_fee") or 0),
+            "free_shipping_above": float(shop.get("free_shipping_above") or 0),
+        },
+        "products": [
+            {
+                "id": int(p["id"]),
+                "name": p["name"],
+                "price": float(p["price"]),
+                "kit_price": (float(p["kit_price"]) if p.get("kit_price") else None),
+                "stock": int(p.get("stock") or 0),
+                "photo_url": ((p.get("photo_file_id") or "").strip()
+                              if (p.get("photo_file_id") or "").startswith("http") else ""),
+            }
+            for p in products
+        ],
+        "payments": [m["name"] for m in payments],
+    }
+
+
 def _audit_stock(
     chat_id: int, product: dict, before: int, after: int, actor_id: int
 ) -> None:

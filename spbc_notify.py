@@ -823,6 +823,23 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(blob)
             return
+        if path == "/storefront":
+            # Public read-only catalog for vendor mini-app stores (CORS: the
+            # store is served from a different origin, e.g. *.pages.dev).
+            import webpanel
+
+            query = urllib.parse.parse_qs(parsed.query)
+            invite = (query.get("invite") or [""])[0]
+            code, body_obj = webpanel.api_storefront(invite)
+            raw = json.dumps(body_obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if path.startswith("/panel"):
             import webpanel
 
