@@ -35,3 +35,8 @@ Append-only log. Newest at bottom.
 - Decision: FIX BRIEF #3 vendor order-path majors — (1) wrap web_app_data parse+normalize in try/except + coerce helper for non-finite; (2) Markdown-escape product/pay strings + try/except so owner notify always runs after create_order; (3) confirm_order_payment / confirm_payment_multi aggregate need_by_stock_id before deduct; (4) invoices count paid|shipped|complete, never downgrade open totals, week_offset + current+previous path; (5) log.warning on hidden_fee fallback; (6) hmac.compare_digest for NOTIFY_SECRET. Did not touch storefront_keys, fail-closed bind, or run_cloud payment-seeding.
 - Why: Adversarial review: silent lost orders, post-commit Telegram 400, oversell via vials+kit lines, mid-week fee underbill, silent fee loss, timing-unsafe secret compare
 - Tests: 269 pass on scratch DB_PATH (temp file); new tests for cart/md, oversell-by-duplicate-line, invoice status/no-downgrade/prev-week, compare_digest
+
+### 2026-08-09
+- Decision: Vendor web panel Orders section — confirm payment, set tracking + ship, date-range .txt export. Customer DMs via vendor_stores.get_bot_token_for_shop + telegram_send_with_token (never main SPBC bot). Cross-shop rejected by tok["chat_id"]. Reused db.confirm_order_payment / set_order_tracking / mark_order_shipped / list_orders. Did not touch storefront_keys, fail-closed bind, run_cloud payment seeding, store HTML, or vendor order-receiver logic beyond the new token helper.
+- Why: Feature brief for magic-link panel order ops
+- Tests: 282 pass on scratch DB; tests/test_panel_orders.py
