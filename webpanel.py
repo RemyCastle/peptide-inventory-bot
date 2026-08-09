@@ -1057,6 +1057,346 @@ def api_shop(tok: dict, payload: dict) -> tuple[int, dict]:
     return 200, {"ok": True}
 
 
+# ── Orders (panel) ───────────────────────────────────────────────────────────
+
+_ACTIONABLE_STATUSES = ("pending_payment", "awaiting_confirmation")
+_TRACKING_URLS = {
+    "ups": "https://www.ups.com/track?tracknum={tn}",
+    "usps": "https://tools.usps.com/go/TrackConfirmAction?tLabels={tn}",
+    "fedex": "https://www.fedex.com/fedextrack/?trknbr={tn}",
+    "dhl": "https://www.dhl.com/en/express/tracking.html?AWB={tn}",
+}
+
+
+def tracking_url(carrier: str | None, tracking_number: str | None) -> str | None:
+    """Known-carrier tracking page URL, or None."""
+    tn = urllib.parse.quote((tracking_number or "").strip())
+    if not tn:
+        return None
+    key = re.sub(r"[^a-z]", "", (carrier or "").strip().lower())
+    tmpl = _TRACKING_URLS.get(key)
+    if not tmpl:
+        return None
+    return tmpl.format(tn=tn)
+
+
+def telegram_send_with_token(
+    bot_token: str,
+    chat_id: int | str,
+    text: str,
+    *,
+    parse_mode: str | None = "HTML",
+) -> bool:
+    """POST sendMessage with an explicit bot token (vendor storefront bot).
+
+    Mirrors spbc_notify._telegram_api but never uses the main SPBC token —
+    customers only started the vendor bot.
+    """
+    import urllib.error
+    import urllib.request
+
+    token = (bot_token or "").strip()
+    if not token or not chat_id:
+        return False
+    body: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text if len(text) <= 4000 else text[:3990] + "\n…",
+        "disable_web_page_preview": False,
+    }
+    if parse_mode:
+        body["parse_mode"] = parse_mode
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            payload = json.loads(res.read().decode("utf-8"))
+        return bool(payload.get("ok"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+            log.warning(
+                "customer DM telegram HTTP %s: %s",
+                exc.code,
+                payload.get("description") or payload,
+            )
+        except Exception:
+            log.warning("customer DM telegram HTTP %s", exc.code)
+        return False
+    except Exception as exc:
+        log.warning("customer DM send failed: %s", exc)
+        return False
+
+
+def notify_order_customer(
+    shop_chat_id: int, customer_user_id: int, text: str
+) -> bool:
+    """DM the buyer via their vendor storefront bot. Never the main SPBC bot."""
+    try:
+        import vendor_stores
+    except Exception as exc:
+        log.warning("vendor_stores import failed for customer DM: %s", exc)
+        return False
+    token = vendor_stores.get_bot_token_for_shop(int(shop_chat_id))
+    if not token:
+        log.warning(
+            "no vendor bot token for shop %s — customer %s not notified",
+            shop_chat_id,
+            customer_user_id,
+        )
+        return False
+    ok = telegram_send_with_token(token, int(customer_user_id), text)
+    if not ok:
+        log.warning(
+            "customer DM failed shop=%s user=%s", shop_chat_id, customer_user_id
+        )
+    return ok
+
+
+def _order_belongs(order: dict | None, shop_chat_id: int) -> bool:
+    if not order:
+        return False
+    return int(order.get("chat_id") or 0) == int(shop_chat_id)
+
+
+def _item_summary(items: list[dict]) -> str:
+    parts = []
+    for it in items:
+        name = (it.get("product_name") or "item").strip()
+        qty = int(it.get("quantity") or 0)
+        parts.append(f"{name} × {qty}")
+    return ", ".join(parts) if parts else "—"
+
+
+def _order_public(order: dict) -> dict:
+    oid = int(order["id"])
+    items = db.get_order_items(oid)
+    uname = (order.get("username") or "").strip()
+    full = (order.get("full_name") or "").strip()
+    return {
+        "id": oid,
+        "payment_code": order.get("payment_code") or "",
+        "customer": {
+            "user_id": int(order.get("user_id") or 0),
+            "username": uname,
+            "full_name": full,
+            "display": full
+            or (f"@{uname}" if uname else f"id:{order.get('user_id') or '?'}"),
+        },
+        "items_summary": _item_summary(items),
+        "items": [
+            {
+                "name": it.get("product_name") or "",
+                "quantity": int(it.get("quantity") or 0),
+                "unit_price": float(it.get("unit_price") or 0),
+                "line_total": float(it.get("line_total") or 0),
+            }
+            for it in items
+        ],
+        "subtotal": float(order.get("subtotal") or 0),
+        "shipping_fee": float(order.get("shipping_fee") or 0),
+        "total": float(order.get("total") or 0),
+        "status": order.get("status") or "",
+        "created_at": order.get("created_at") or "",
+        "tracking_number": (order.get("tracking_number") or "").strip(),
+        "tracking_carrier": (order.get("tracking_carrier") or "").strip(),
+        "tracking_url": tracking_url(
+            order.get("tracking_carrier"), order.get("tracking_number")
+        ),
+    }
+
+
+def api_orders(tok: dict, payload: dict | None = None) -> tuple[int, dict]:
+    """List this shop's orders: actionable first, then recent paid/shipped."""
+    chat_id = int(tok["chat_id"])
+    # Pull enough rows; group in Python so actionable always surfaces first
+    rows = db.list_orders(chat_id, status=None, limit=80)
+    actionable: list[dict] = []
+    rest: list[dict] = []
+    for o in rows:
+        st = str(o.get("status") or "")
+        if st in _ACTIONABLE_STATUSES:
+            actionable.append(o)
+        elif st in ("paid", "shipped", "complete"):
+            rest.append(o)
+        # cancelled/rejected still useful briefly — keep a few
+        elif st in ("cancelled", "rejected"):
+            rest.append(o)
+    # list_orders is already newest-first (id DESC)
+    combined = actionable + rest
+    return 200, {
+        "ok": True,
+        "orders": [_order_public(o) for o in combined],
+    }
+
+
+def api_confirm_payment(tok: dict, payload: dict) -> tuple[int, dict]:
+    chat_id = int(tok["chat_id"])
+    try:
+        order_id = int(payload.get("order_id"))
+    except (TypeError, ValueError):
+        return _err(400, "Bad order id")
+    order = db.get_order(order_id)
+    if not _order_belongs(order, chat_id):
+        return _err(404, "Order not found in your shop")
+    ok, msg, _alerts = db.confirm_order_payment(order_id, int(tok["user_id"]))
+    if not ok:
+        return _err(400, msg or "Could not confirm payment")
+    order = db.get_order(order_id) or order
+    code = (order.get("payment_code") or str(order_id)).strip()
+    text = (
+        f"✅ Payment received for order <code>{code}</code>! "
+        "It's being prepared — you'll get tracking here when it ships."
+    )
+    notified = notify_order_customer(chat_id, int(order["user_id"]), text)
+    return 200, {
+        "ok": True,
+        "status": order.get("status") or "paid",
+        "message": msg,
+        "customer_notified": bool(notified),
+    }
+
+
+def api_set_tracking(tok: dict, payload: dict) -> tuple[int, dict]:
+    chat_id = int(tok["chat_id"])
+    try:
+        order_id = int(payload.get("order_id"))
+    except (TypeError, ValueError):
+        return _err(400, "Bad order id")
+    carrier = str(payload.get("carrier") or "").strip()
+    tracking_number = str(payload.get("tracking_number") or "").strip()
+    if not tracking_number:
+        return _err(400, "Tracking number required")
+    order = db.get_order(order_id)
+    if not _order_belongs(order, chat_id):
+        return _err(404, "Order not found in your shop")
+    status = str(order.get("status") or "")
+    if status not in ("paid", "shipped", "complete"):
+        return _err(
+            400,
+            f"Order must be paid before shipping (status: {status or 'unknown'}).",
+        )
+    if not db.set_order_tracking(order_id, tracking_number, carrier or None):
+        return _err(400, "Could not save tracking")
+    if status == "paid":
+        ship_ok, ship_msg = db.mark_order_shipped(order_id)
+        if not ship_ok and "already" not in (ship_msg or "").lower():
+            # Tracking is already saved; still report the ship-mark failure
+            log.warning(
+                "set_tracking: mark_order_shipped failed order=%s: %s",
+                order_id,
+                ship_msg,
+            )
+            return _err(400, ship_msg or "Could not mark shipped")
+    order = db.get_order(order_id) or order
+    code = (order.get("payment_code") or str(order_id)).strip()
+    car = (order.get("tracking_carrier") or carrier or "").strip() or "—"
+    tn = (order.get("tracking_number") or tracking_number).strip()
+    url = tracking_url(car if car != "—" else None, tn)
+    text = (
+        f"📦 Your order <code>{code}</code> has shipped! "
+        f"Carrier: {car} · Tracking: {tn}"
+    )
+    if url:
+        text += f"\n🔗 {url}"
+    notified = notify_order_customer(chat_id, int(order["user_id"]), text)
+    return 200, {
+        "ok": True,
+        "status": order.get("status") or "shipped",
+        "tracking_number": tn,
+        "tracking_carrier": "" if car == "—" else car,
+        "tracking_url": url,
+        "customer_notified": bool(notified),
+    }
+
+
+def _parse_ymd(s: str | None) -> str | None:
+    raw = (s or "").strip()
+    if not raw:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return None
+    return raw
+
+
+def _created_day(created_at: str | None) -> str:
+    """First 10 chars of created_at (YYYY-MM-DD) for inclusive date compare."""
+    s = (created_at or "").strip()
+    return s[:10] if len(s) >= 10 else s
+
+
+def api_order_history_txt(
+    tok: dict,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> tuple[str, str]:
+    """Plain-text order export for the shop. Returns (text, filename)."""
+    chat_id = int(tok["chat_id"])
+    today = _utc_now().date()
+    end_s = _parse_ymd(end_date) or today.isoformat()
+    start_s = _parse_ymd(start_date) or (today - timedelta(days=30)).isoformat()
+    if start_s > end_s:
+        start_s, end_s = end_s, start_s
+
+    with db.get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM orders
+            WHERE chat_id = ?
+              AND substr(created_at, 1, 10) >= ?
+              AND substr(created_at, 1, 10) <= ?
+            ORDER BY id DESC
+            """,
+            (chat_id, start_s, end_s),
+        ).fetchall()
+        orders = [dict(r) for r in rows]
+
+    blocks: list[str] = []
+    header = (
+        f"Order history — shop {chat_id}\n"
+        f"Range: {start_s} to {end_s} (inclusive)\n"
+        f"Orders: {len(orders)}\n"
+        f"{'=' * 48}"
+    )
+    blocks.append(header)
+    for o in orders:
+        items = db.get_order_items(int(o["id"]))
+        uname = (o.get("username") or "").strip()
+        full = (o.get("full_name") or "").strip()
+        cust = full or (f"@{uname}" if uname else f"user_id={o.get('user_id')}")
+        if full and uname:
+            cust = f"{full} (@{uname})"
+        lines = [
+            "",
+            f"Date:    {o.get('created_at') or '—'}",
+            f"Code:    {o.get('payment_code') or '—'}",
+            f"Status:  {o.get('status') or '—'}",
+            f"Customer:{cust}",
+            "Items:",
+        ]
+        for it in items:
+            name = it.get("product_name") or "item"
+            qty = int(it.get("quantity") or 0)
+            lt = float(it.get("line_total") or 0)
+            lines.append(f"  · {name} × {qty} — ${lt:,.2f}")
+        if not items:
+            lines.append("  (no line items)")
+        lines.append(f"Shipping: ${float(o.get('shipping_fee') or 0):,.2f}")
+        lines.append(f"Total:    ${float(o.get('total') or 0):,.2f}")
+        tn = (o.get("tracking_number") or "").strip()
+        if tn:
+            car = (o.get("tracking_carrier") or "").strip()
+            lines.append(f"Tracking: {car + ' · ' if car else ''}{tn}")
+        lines.append("-" * 48)
+        blocks.append("\n".join(lines))
+
+    text = "\n".join(blocks) + "\n"
+    filename = f"orders_{chat_id}_{start_s}_{end_s}.txt"
+    return text, filename
+
+
 _API_POST = {
     "product": api_product,
     "media": api_media,
@@ -1065,13 +1405,21 @@ _API_POST = {
     "payment": api_payment,
     "shipping": api_shipping,
     "shop": api_shop,
+    "orders": api_orders,
+    "confirm_payment": api_confirm_payment,
+    "set_tracking": api_set_tracking,
 }
 
 
 # ── HTTP layer (called from spbc_notify's request handler) ──────────────────
 
 def handle_panel_get(path: str, query: dict) -> tuple[int, str, bytes]:
-    """Returns (status, content_type, body)."""
+    """Returns (status, content_type, body).
+
+    For attachment downloads, content_type may be prefixed with a disposition
+    hint encoded as ``text/plain; charset=utf-8`` and the caller may set
+    Content-Disposition separately (see spbc_notify /panel/api/orders.txt).
+    """
     if path == "/panel":
         return 200, "text/html; charset=utf-8", PANEL_HTML.encode("utf-8")
     if path == "/panel/api/state":
@@ -1081,6 +1429,19 @@ def handle_panel_get(path: str, query: dict) -> tuple[int, str, bytes]:
             return 401, "application/json", body.encode("utf-8")
         code, data = api_state(tok)
         return code, "application/json", json.dumps(data).encode("utf-8")
+    if path == "/panel/api/orders.txt":
+        tok = resolve_token((query.get("t") or [""])[0])
+        if not tok:
+            body = json.dumps({"ok": False, "error": "invalid_or_expired_link"})
+            return 401, "application/json", body.encode("utf-8")
+        start = (query.get("start") or [""])[0]
+        end = (query.get("end") or [""])[0]
+        text, filename = api_order_history_txt(tok, start, end)
+        # filename stashed after a NUL for the HTTP layer (orders.txt route)
+        body = text.encode("utf-8")
+        # content type + special marker so spbc_notify can attach Content-Disposition
+        ctype = f"text/plain; charset=utf-8; name={filename}"
+        return 200, ctype, body
     return 404, "application/json", b'{"error":"not_found"}'
 
 
@@ -1153,6 +1514,18 @@ PANEL_HTML = """<!doctype html>
   .media{margin-top:8px;flex-wrap:wrap}
   .media button{padding:6px 10px;font-size:.85rem}
   .media a{color:var(--accent)}
+  .tabs{display:flex;gap:6px;flex-wrap:wrap;margin:0 4px 12px}
+  .tabs button{background:transparent;color:var(--ink);border:1px solid var(--line);
+               padding:8px 12px;border-radius:999px;font-size:.9rem}
+  .tabs button.on{background:var(--accent);color:#fff;border-color:transparent}
+  .status{display:inline-block;font-size:.72rem;padding:2px 8px;border-radius:999px;
+          border:1px solid var(--line);color:var(--mut)}
+  .status.act{color:var(--go);border-color:var(--go)}
+  .status.warn{color:#a15c00;border-color:#e0b46a}
+  .ord{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}
+  .ord:first-child{border-top:0;padding-top:0;margin-top:0}
+  .ord h3{font-size:.95rem;margin:0 0 4px}
+  .hide{display:none!important}
 </style>
 </head>
 <body>
@@ -1173,15 +1546,21 @@ try{
 }catch(e){/* private mode: token simply stays in the URL */}
 const $=s=>document.querySelector(s);
 let S=null;
+let ORDERS=[];
+let TAB=(MODE==='restock')?'catalog':'orders';
 function toast(t,bad){const m=$('#msg');m.textContent=t;
   m.style.background=bad?'#b4231f':'';m.classList.add('show');
   setTimeout(()=>m.classList.remove('show'),2600);}
 async function api(name,body){
   const r=await fetch('panel/api/'+name,{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(Object.assign({t:T},body))});
+    body:JSON.stringify(Object.assign({t:T},body||{}))});
   const d=await r.json().catch(()=>({ok:false,error:'network'}));
   if(!d.ok)toast(d.error||'Failed',true);
+  return d;}
+async function loadOrders(){
+  const d=await api('orders',{});
+  if(d&&d.ok)ORDERS=d.orders||[];
   return d;}
 async function load(){
   const r=await fetch('panel/api/state?t='+encodeURIComponent(T));
@@ -1189,9 +1568,52 @@ async function load(){
   if(!d||!d.ok){$('#app').innerHTML='<div class="card">This link is invalid '+
     'or expired.<br><br>Open Telegram and send <b>/webpanel</b> to the bot '+
     'to get a fresh link.</div>';return;}
-  S=d;render();}
+  S=d;
+  await loadOrders();
+  render();}
 function esc(x){const d=document.createElement('div');
   d.textContent=x==null?'':String(x);return d.innerHTML;}
+function money(n){const x=Number(n||0);return '$'+x.toFixed(2);}
+function statusClass(st){
+  if(st==='awaiting_confirmation'||st==='pending_payment')return 'act';
+  if(st==='paid')return 'warn';
+  return '';}
+function ymd(d){return d.toISOString().slice(0,10);}
+function defaultRange(){
+  const end=new Date();const start=new Date();start.setDate(end.getDate()-30);
+  return {start:ymd(start),end:ymd(end)};}
+function orderCard(o){
+  const st=o.status||'';
+  const canConfirm=st==='pending_payment'||st==='awaiting_confirmation';
+  const canShip=st==='paid'||st==='shipped'||st==='awaiting_confirmation';
+  // tracking only after paid (server also enforces)
+  const showTrack=st==='paid'||st==='shipped'||st==='complete';
+  const cust=esc((o.customer&&o.customer.display)||'—');
+  const code=esc(o.payment_code||('#'+o.id));
+  return `<div class="ord" data-oid="${o.id}">
+    <div class="flex" style="align-items:flex-start;gap:8px;flex-wrap:wrap">
+      <div class="grow">
+        <h3><code>${code}</code>
+          <span class="status ${statusClass(st)}">${esc(st)}</span></h3>
+        <div class="tag">${esc(o.created_at||'')} · ${cust}</div>
+        <div style="margin:4px 0">${esc(o.items_summary||'—')}</div>
+        <div><b>${money(o.total)}</b>
+          ${o.shipping_fee?`<span class="tag">ship ${money(o.shipping_fee)}</span>`:''}
+        </div>
+      </div>
+      ${canConfirm?`<button class="b-confirm" data-oid="${o.id}">Confirm payment</button>`:''}
+    </div>
+    ${showTrack?`<div class="row" style="margin-top:10px">
+      <div class="num" style="max-width:120px"><label>Carrier</label>
+        <input class="f-carrier" list="carriers" value="${esc(o.tracking_carrier||'')}"
+          placeholder="USPS"></div>
+      <div class="name"><label>Tracking #</label>
+        <input class="f-track" value="${esc(o.tracking_number||'')}"
+          placeholder="9400…"></div>
+      <div><button class="sub b-ship" data-oid="${o.id}">Save &amp; notify customer</button></div>
+    </div>`:''}
+    ${o.tracking_number&&!showTrack?`<div class="tag">Tracking: ${esc(o.tracking_carrier||'')} ${esc(o.tracking_number)}</div>`:''}
+  </div>`;}
 function prodRow(p){
   const low=p.active&&p.stock<=2?' low':'';
   const thumb=p.photo_url
@@ -1232,12 +1654,43 @@ function prodRow(p){
 function render(){
   $('#title').textContent=S.shop.title;
   const sh=S.shop;
+  const range=defaultRange();
+  const actionable=ORDERS.filter(o=>o.status==='pending_payment'||o.status==='awaiting_confirmation').length;
   $('#app').innerHTML=`
-  <div class="card"><h2>Shop</h2>
-    <div class="row"><div class="name"><label>Shop name</label>
-      <input id="shop-title" value="${esc(sh.title)}"></div>
-      <div><button class="sub" id="shop-save">Save</button></div></div>
+  <div class="tabs">
+    <button type="button" data-tab="orders" class="${TAB==='orders'?'on':''}">
+      Orders${actionable?` (${actionable})`:''}</button>
+    <button type="button" data-tab="catalog" class="${TAB==='catalog'?'on':''}">
+      Catalog</button>
+    <button type="button" data-tab="settings" class="${TAB==='settings'?'on':''}">
+      Settings</button>
   </div>
+  <div id="tab-orders" class="${TAB==='orders'?'':'hide'}">
+  <div class="card"><h2>Orders</h2>
+    <p class="tag" style="margin:0 0 10px">Confirm payments and add tracking.
+      The customer is messaged on your storefront bot automatically.</p>
+    <datalist id="carriers">
+      <option value="USPS"><option value="UPS"><option value="FedEx"><option value="DHL">
+    </datalist>
+    <div id="olist">${ORDERS.length?ORDERS.map(orderCard).join(''):
+      '<p class="tag">No orders yet.</p>'}</div>
+    <div class="flex" style="margin-top:12px">
+      <button class="sub" id="ord-refresh">Refresh</button>
+      <span class="grow"></span>
+    </div>
+  </div>
+  <div class="card"><h2>Export history</h2>
+    <div class="row">
+      <div class="num" style="max-width:160px"><label>From</label>
+        <input id="ex-start" type="date" value="${range.start}"></div>
+      <div class="num" style="max-width:160px"><label>To</label>
+        <input id="ex-end" type="date" value="${range.end}"></div>
+      <div><button class="sub" id="ex-go">Download .txt</button></div>
+    </div>
+    <span class="tag">One readable block per order in the date range.</span>
+  </div>
+  </div>
+  <div id="tab-catalog" class="${TAB==='catalog'?'':'hide'}">
   <div class="card"><h2>Products (${S.products.length})</h2>
     <div class="flex" style="margin-bottom:10px">
       <button id="restock-on">📦 Received a shipment</button>
@@ -1331,6 +1784,13 @@ function render(){
       <span class="tag">You can change any method anytime — just edit and Save.</span>
     </div>
   </div>
+  </div>
+  <div id="tab-settings" class="${TAB==='settings'?'':'hide'}">
+  <div class="card"><h2>Shop</h2>
+    <div class="row"><div class="name"><label>Shop name</label>
+      <input id="shop-title" value="${esc(sh.title)}"></div>
+      <div><button class="sub" id="shop-save">Save</button></div></div>
+  </div>
   <div class="card"><h2>Shipping</h2>
     <div class="row">
       <div><label>&nbsp;</label><label class="flex" style="margin:0">
@@ -1342,6 +1802,7 @@ function render(){
         <input id="sh-free" type="number" step="0.01" min="0" value="${sh.free_shipping_above}"></div>
       <div><button class="sub" id="sh-save">Save</button></div></div>
     <span class="tag">Changes apply to new checkouts immediately.</span>
+  </div>
   </div>`;
   wire();}
 // Read a file, shrinking images client-side so phone photos upload fast
@@ -1377,12 +1838,49 @@ function pickFile(accept,resize){
 async function media(body){const d=await api('media',body);if(d.ok)load();return d;}
 
 function wire(){
+  document.querySelectorAll('.tabs button').forEach(btn=>{
+    btn.onclick=()=>{TAB=btn.dataset.tab;render();};});
+  const ordRefresh=$('#ord-refresh');
+  if(ordRefresh)ordRefresh.onclick=async()=>{
+    toast('Refreshing…');await loadOrders();render();};
+  document.querySelectorAll('.b-confirm').forEach(btn=>{
+    btn.onclick=async()=>{
+      if(!confirm('Mark this payment as received and deduct stock?'))return;
+      const d=await api('confirm_payment',{order_id:btn.dataset.oid});
+      if(!d.ok)return;
+      const note=d.customer_notified===false
+        ? 'Payment confirmed (could not message customer)'
+        : 'Payment confirmed — customer notified';
+      toast(note);await loadOrders();render();};});
+  document.querySelectorAll('.b-ship').forEach(btn=>{
+    btn.onclick=async()=>{
+      const card=btn.closest('.ord');
+      const carrier=(card.querySelector('.f-carrier')||{}).value||'';
+      const tracking_number=(card.querySelector('.f-track')||{}).value||'';
+      if(!String(tracking_number).trim()){toast('Tracking number required',true);return;}
+      const d=await api('set_tracking',{order_id:btn.dataset.oid,carrier,tracking_number});
+      if(!d.ok)return;
+      const note=d.customer_notified===false
+        ? 'Saved, but could not message the customer'
+        : 'Shipped — customer notified with tracking';
+      toast(note);await loadOrders();render();};});
+  const exGo=$('#ex-go');
+  if(exGo)exGo.onclick=()=>{
+    const start=$('#ex-start').value||'';
+    const end=$('#ex-end').value||'';
+    const q=new URLSearchParams({t:T});
+    if(start)q.set('start',start);
+    if(end)q.set('end',end);
+    // open attachment download (token in query; one-shot browser GET)
+    window.location.href='panel/api/orders.txt?'+q.toString();
+  };
   const rs=$('#restock'),pl=$('#plist');
+  if(rs&&pl){
   const openRestock=()=>{rs.style.display='';pl.style.display='none';
     $('#restock-on').style.display='none';
     rs.scrollIntoView({behavior:'smooth',block:'start'});};
   $('#restock-on').onclick=openRestock;
-  if(MODE==='restock')openRestock();
+  if(MODE==='restock'){TAB='catalog';openRestock();}
   $('#restock-off').onclick=()=>{rs.style.display='none';pl.style.display='';
     $('#restock-on').style.display='';};
   $('#restock-go').onclick=async()=>{
@@ -1393,7 +1891,9 @@ function wire(){
     const d=await api('restock',{items});
     if(d.ok){toast(`Stock added to ${d.count} product${d.count===1?'':'s'} ✅`);
       load();}};
-  $('#shop-save').onclick=async()=>{
+  }
+  const shopSave=$('#shop-save');
+  if(shopSave)shopSave.onclick=async()=>{
     const d=await api('shop',{title:$('#shop-title').value});
     if(d.ok){toast('Shop name saved');S.shop.title=$('#shop-title').value;
       $('#title').textContent=S.shop.title;}};

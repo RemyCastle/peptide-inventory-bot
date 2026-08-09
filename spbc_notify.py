@@ -847,6 +847,31 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(raw)
             return
+        if path == "/panel/api/orders.txt":
+            # Plain-text order history download (attachment). Token required.
+            import webpanel
+
+            query = urllib.parse.parse_qs(parsed.query)
+            tok = webpanel.resolve_token((query.get("t") or [""])[0])
+            if not tok:
+                self._json(401, {"ok": False, "error": "invalid_or_expired_link"})
+                return
+            start = (query.get("start") or [""])[0]
+            end = (query.get("end") or [""])[0]
+            text, filename = webpanel.api_order_history_txt(tok, start, end)
+            raw = text.encode("utf-8")
+            safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename) or "orders.txt"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header(
+                "Content-Disposition", f'attachment; filename="{safe_name}"'
+            )
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Robots-Tag", "noindex")
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if path.startswith("/panel"):
             import webpanel
 
