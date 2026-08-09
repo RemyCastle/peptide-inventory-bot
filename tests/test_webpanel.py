@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -163,16 +164,23 @@ class InviteTests(WebPanelBase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["shop_chat_id"], sid)
         self.assertGreaterEqual(result["products"], 1)
-        # Mini-app catalog works before anyone claims the handoff link
-        code, body = webpanel.api_storefront(f"vendor{fixed}")
+        sf_key = result["storefront_key"]
+        self.assertTrue(sf_key)
+        self.assertNotEqual(sf_key, fixed)
+        # Catalog is keyed by storefront_key, not the claim token
+        code, body = webpanel.api_storefront(f"vendor{sf_key}")
         self.assertEqual(code, 200, body)
         self.assertTrue(body["ok"])
         self.assertEqual(body["shop"]["title"], "Unicorn Magic Factory")
         self.assertEqual(len(body["products"]), 1)
-        # Idempotent
+        # Claim token must NOT open the public catalog
+        code_claim, body_claim = webpanel.api_storefront(f"vendor{fixed}")
+        self.assertEqual(code_claim, 404, body_claim)
+        # Idempotent bind + same storefront key
         again = webpanel.ensure_miniapp_storefront(f"vendor{fixed}")
         self.assertTrue(again["ok"])
         self.assertEqual(again["action"], "already_bound")
+        self.assertEqual(again["storefront_key"], sf_key)
 
     def test_ensure_miniapp_does_not_steal_unrelated_stocked_shop(self):
         # Large main catalog should not become Unicorn's mini-app just because it's biggest
@@ -188,9 +196,121 @@ class InviteTests(WebPanelBase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["shop_chat_id"], int(empty["chat_id"]))
         self.assertEqual(result["products"], 0)
-        code, body = webpanel.api_storefront(f"vendor{fixed}")
+        code, body = webpanel.api_storefront(result["storefront_key"])
         self.assertEqual(code, 200, body)
         self.assertEqual(body["products"], [])
+
+    def test_storefront_key_cannot_be_redeemed_as_claim(self):
+        """CRIT1: public catalog key must never grant shop admin."""
+        shop = db.create_virtual_shop("Unicorn Magic Factory", created_by=1)
+        sid = int(shop["chat_id"])
+        db.add_product(sid, "SEMA 5mg", 55.0, 12)
+        claim = "bbbbbbbbbbbbbbbbbbbbbbbb"
+        result = webpanel.ensure_miniapp_storefront(
+            f"vendor{claim}",
+            title_hints=["unicorn"],
+            note="Unicorn Magic Factory",
+        )
+        self.assertTrue(result["ok"], result)
+        sf_key = result["storefront_key"]
+        self.assertNotEqual(sf_key, claim)
+        # Storefront key is not a vendor_invites row → redeem fails
+        ok, msg, pre = webpanel.redeem_vendor_invite(sf_key, USER)
+        self.assertFalse(ok)
+        self.assertIsNone(pre)
+        self.assertIn("not found", msg.lower())
+        # Real claim token still redeems
+        ok2, note, pre2 = webpanel.redeem_vendor_invite(f"vendor{claim}", USER)
+        self.assertTrue(ok2, note)
+        self.assertEqual(pre2, sid)
+
+    def test_claim_token_rejected_by_api_storefront(self):
+        """CRIT1: claim credential must not serve as catalog key."""
+        shop = db.create_virtual_shop("Unicorn Magic Factory", created_by=1)
+        db.add_product(int(shop["chat_id"]), "SEMA 5mg", 55.0, 1)
+        claim = "cccccccccccccccccccccccc"
+        result = webpanel.ensure_miniapp_storefront(
+            claim, title_hints=["unicorn"]
+        )
+        self.assertTrue(result["ok"], result)
+        code, body = webpanel.api_storefront(claim)
+        self.assertEqual(code, 404, body)
+        code2, body2 = webpanel.api_storefront(result["storefront_key"])
+        self.assertEqual(code2, 200, body2)
+
+    def test_bind_refuses_two_virtual_shops_with_no_hint_match(self):
+        """CRIT2: never pick a wrong vendor when hints match neither shop."""
+        a = db.create_virtual_shop("Alpha Peptides", created_by=1)
+        b = db.create_virtual_shop("Beta Research", created_by=1)
+        db.add_product(int(a["chat_id"]), "A", 10.0, 5)
+        db.add_product(int(b["chat_id"]), "B", 20.0, 5)
+        fixed = "dddddddddddddddddddddddd"
+        result = webpanel.ensure_miniapp_storefront(
+            f"vendor{fixed}",
+            title_hints=["unicorn", "magic factory"],
+            note="Unicorn",
+        )
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result.get("error"), "no_shop_found")
+
+    def test_bind_hint_matches_exactly_one_of_two_virtual_shops(self):
+        """CRIT2: title hint selects the correct shop among several virtuals."""
+        a = db.create_virtual_shop("Alpha Peptides", created_by=1)
+        b = db.create_virtual_shop("Unicorn Magic Factory", created_by=1)
+        db.add_product(int(a["chat_id"]), "A", 10.0, 50)
+        db.add_product(int(b["chat_id"]), "U", 55.0, 3)
+        fixed = "eeeeeeeeeeeeeeeeeeeeeeee"
+        result = webpanel.ensure_miniapp_storefront(
+            f"vendor{fixed}",
+            title_hints=["unicorn", "magic factory"],
+            note="Unicorn",
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["shop_chat_id"], int(b["chat_id"]))
+
+    def test_explicit_shop_chat_id_miss_does_not_guess(self):
+        """CRIT2: missing explicit shop id → no-shop, not heuristic fallthrough."""
+        db.create_virtual_shop("Unicorn Magic Factory", created_by=1)
+        fixed = "ffffffffffffffffffffffff"
+        result = webpanel.ensure_miniapp_storefront(
+            f"vendor{fixed}",
+            shop_chat_id=999_999_999_999,  # does not exist
+            title_hints=["unicorn"],
+        )
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result.get("error"), "no_shop_found")
+
+    def test_rebind_rejects_wrong_virtual_bind_when_hints_given(self):
+        """CRIT2: wrong prior virtual bind must not stick when title hints fail."""
+        wrong = db.create_virtual_shop("Other Vendor Stocked", created_by=1)
+        right = db.create_virtual_shop("Unicorn Magic Factory", created_by=1)
+        db.add_product(int(wrong["chat_id"]), "X", 1.0, 9)
+        db.add_product(int(right["chat_id"]), "U", 55.0, 3)
+        claim = "111111111111111111111111"
+        # Force a bad prior bind to the wrong stocked virtual shop
+        webpanel.ensure_webpanel_tables()
+        now = webpanel._utc_now()
+        with db.get_db() as conn:
+            conn.execute(
+                "INSERT INTO vendor_invites (token_hash, note, created_by, "
+                "created_at, expires_at, shop_chat_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    webpanel._hash(claim),
+                    "bad",
+                    0,
+                    webpanel._ts(now),
+                    webpanel._ts(now + timedelta(days=3650)),
+                    int(wrong["chat_id"]),
+                ),
+            )
+        result = webpanel.ensure_miniapp_storefront(
+            claim,
+            title_hints=["unicorn", "magic factory"],
+            note="Unicorn",
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["shop_chat_id"], int(right["chat_id"]))
+        self.assertNotEqual(result["shop_chat_id"], int(wrong["chat_id"]))
 
 
 class RestockTests(WebPanelBase):
