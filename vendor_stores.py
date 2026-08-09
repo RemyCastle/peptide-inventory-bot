@@ -89,6 +89,7 @@ def load_vendor_configs() -> list[dict]:
             "store_url": (os.getenv("UNICORN_STORE_URL")
                           or "https://remy-miniapp-demos.pages.dev/unicorn/").strip(),
             "notify_ids": legacy_notify,
+            "order_fee": 1.0,  # unicornfartzz pays $1/order; other vendors default $2
         })
 
     # de-dupe by token (JSON entry wins over legacy)
@@ -263,6 +264,40 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
     return app
 
 
+DEFAULT_ORDER_FEE = 2.0  # per-order platform fee folded into customer shipping
+
+
+def _ensure_order_fee(v: dict, shop_chat_id: int) -> None:
+    """Seed the shop's per-order platform fee if it has never been set.
+
+    Config key "order_fee" (per vendor entry) overrides DEFAULT_ORDER_FEE.
+    A fee already set on the shop (manually or previously) is never touched,
+    so owner adjustments in Telegram always win.
+    """
+    fee = v.get("order_fee")
+    fee = DEFAULT_ORDER_FEE if fee is None else float(fee)
+    try:
+        from franchise import ensure_franchise_tables
+
+        ensure_franchise_tables()
+        with db.get_db() as conn:
+            row = conn.execute(
+                "SELECT hidden_service_fee FROM shops WHERE chat_id = ?",
+                (shop_chat_id,),
+            ).fetchone()
+            current = float(row["hidden_service_fee"] or 0) if row else 0.0
+            if row and current == 0.0 and fee > 0:
+                conn.execute(
+                    "UPDATE shops SET hidden_service_fee = ? WHERE chat_id = ?",
+                    (fee, shop_chat_id),
+                )
+                log.info("[%s] per-order fee seeded: $%.2f", v.get("name"), fee)
+            else:
+                log.info("[%s] per-order fee already set: $%.2f", v.get("name"), current)
+    except Exception:
+        log.exception("[%s] could not seed order fee", v.get("name"))
+
+
 def _run_vendor(v: dict) -> None:
     name = v.get("name") or "vendor"
     try:
@@ -271,6 +306,7 @@ def _run_vendor(v: dict) -> None:
         if not shop_chat_id:
             log.error("[%s] could not resolve shop (invite/shop_chat_id) - not starting", name)
             return
+        _ensure_order_fee(v, shop_chat_id)
         app = _build_app(v, shop_chat_id)
         log.info("[%s] store receiver polling (shop %s)", name, shop_chat_id)
         app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
