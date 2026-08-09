@@ -30,3 +30,8 @@ Append-only log. Newest at bottom.
 - Decision: Overnight vendor mini-app cleanup — /invoices master command, VENDOR-ONBOARDING.md, fee seed default Unicorn=$1 when JSON omits order_fee
 - Why: Ship brief so Render resume + vendor N+1 playbook are complete; integrate Claude fee seeding with prior invite rebinding
 - Tests: full suite 237 pass on scratch DB_PATH; import run_cloud clean
+
+### 2026-08-09
+- Decision: FIX BRIEF #3 vendor order-path majors — (1) wrap web_app_data parse+normalize in try/except + coerce helper for non-finite; (2) Markdown-escape product/pay strings + try/except so owner notify always runs after create_order; (3) confirm_order_payment / confirm_payment_multi aggregate need_by_stock_id before deduct; (4) invoices count paid|shipped|complete, never downgrade open totals, week_offset + current+previous path; (5) log.warning on hidden_fee fallback; (6) hmac.compare_digest for NOTIFY_SECRET. Did not touch storefront_keys, fail-closed bind, or run_cloud payment-seeding.
+- Why: Adversarial review: silent lost orders, post-commit Telegram 400, oversell via vials+kit lines, mid-week fee underbill, silent fee loss, timing-unsafe secret compare
+- Tests: 269 pass on scratch DB_PATH (temp file); new tests for cart/md, oversell-by-duplicate-line, invoice status/no-downgrade/prev-week, compare_digest
