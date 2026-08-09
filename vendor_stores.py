@@ -267,15 +267,28 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
 DEFAULT_ORDER_FEE = 2.0  # per-order platform fee folded into customer shipping
 
 
+def _resolved_order_fee(v: dict) -> float:
+    """Per-vendor platform fee from config; default $2 (legacy Unicorn $1)."""
+    if v.get("order_fee") is not None:
+        return float(v["order_fee"])
+    # Legacy single-vendor path hardcodes order_fee=1.0; if a JSON entry for
+    # Unicorn omits order_fee, keep the $1 policy instead of jumping to $2.
+    name = (v.get("name") or "").lower()
+    if "unicorn" in name:
+        return 1.0
+    return DEFAULT_ORDER_FEE
+
+
 def _ensure_order_fee(v: dict, shop_chat_id: int) -> None:
     """Seed the shop's per-order platform fee if it has never been set.
 
-    Config key "order_fee" (per vendor entry) overrides DEFAULT_ORDER_FEE.
+    Config key "order_fee" (per vendor entry) overrides the default.
     A fee already set on the shop (manually or previously) is never touched,
-    so owner adjustments in Telegram always win.
+    so owner adjustments in Telegram always win — except that 0 looks the
+    same as "never set". To permanently disable a shop's fee, set
+    ``"order_fee": 0`` in VENDOR_STORES_JSON (explicit 0 skips seeding).
     """
-    fee = v.get("order_fee")
-    fee = DEFAULT_ORDER_FEE if fee is None else float(fee)
+    fee = _resolved_order_fee(v)
     try:
         from franchise import ensure_franchise_tables
 
@@ -285,15 +298,27 @@ def _ensure_order_fee(v: dict, shop_chat_id: int) -> None:
                 "SELECT hidden_service_fee FROM shops WHERE chat_id = ?",
                 (shop_chat_id,),
             ).fetchone()
-            current = float(row["hidden_service_fee"] or 0) if row else 0.0
-            if row and current == 0.0 and fee > 0:
+            if not row:
+                log.warning(
+                    "[%s] shop %s missing — cannot seed order fee",
+                    v.get("name"),
+                    shop_chat_id,
+                )
+                return
+            current = float(row["hidden_service_fee"] or 0)
+            if current == 0.0 and fee > 0:
                 conn.execute(
                     "UPDATE shops SET hidden_service_fee = ? WHERE chat_id = ?",
                     (fee, shop_chat_id),
                 )
                 log.info("[%s] per-order fee seeded: $%.2f", v.get("name"), fee)
             else:
-                log.info("[%s] per-order fee already set: $%.2f", v.get("name"), current)
+                log.info(
+                    "[%s] per-order fee left as-is: $%.2f (config $%.2f)",
+                    v.get("name"),
+                    current,
+                    fee,
+                )
     except Exception:
         log.exception("[%s] could not seed order fee", v.get("name"))
 

@@ -25,3 +25,8 @@ Append-only log. Newest at bottom.
 - Decision: Inventory bulk import via pipe layout text file (`name | price | stock | desc`); Telegram .txt upload; add-only skip-by-name
 - Why: Faster catalog setup than one-by-one Add product
 - Tests: tests/test_inventory_import.py
+
+### 2026-08-09
+- Decision: Overnight vendor mini-app cleanup — /invoices master command, VENDOR-ONBOARDING.md, fee seed default Unicorn=$1 when JSON omits order_fee
+- Why: Ship brief so Render resume + vendor N+1 playbook are complete; integrate Claude fee seeding with prior invite rebinding
+- Tests: full suite 237 pass on scratch DB_PATH; import run_cloud clean

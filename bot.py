@@ -2995,6 +2995,60 @@ async def cmd_master(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _master_home(update, context, edit=False)
 
 
+async def cmd_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """OWNER_IDS only: generate this week's service-fee invoices and list open ones.
+
+    Replies in-chat and DMs the same summary so it is usable from a group.
+    """
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await update.message.reply_text("Master admin only.")
+        return
+    import franchise
+
+    franchise.ensure_franchise_tables()
+    ok, msg, invs = franchise.generate_weekly_invoices(user.id)
+    lines = [("✅ " if ok else "❌ ") + msg, ""]
+    if not invs:
+        lines.append("_No billable fees this week (or all zero)._")
+    else:
+        lines.append("*This week (generated/updated):*")
+        for i in invs:
+            lines.append(
+                f"• #{i['id']} `{i['chat_id']}` {i.get('title') or ''} — "
+                f"*{money(i['total_fees'])}* across {i['order_count']} orders ({i['status']})"
+            )
+    open_inv = franchise.list_invoices(status="open", limit=20)
+    lines.append("")
+    lines.append(f"*Open invoices ({len(open_inv)}):*")
+    if not open_inv:
+        lines.append("_None open._")
+    else:
+        total_open = 0.0
+        for i in open_inv:
+            total_open += float(i.get("total_fees") or 0)
+            lines.append(
+                f"• #{i['id']} `{i['chat_id']}` {i.get('title') or ''} — "
+                f"*{money(i['total_fees'])}* ({i['order_count']} orders)\n"
+                f"  Week `{i['week_start']}` → `{i['week_end']}`"
+            )
+        lines.append(f"\n*Open total: {money(total_open)}*")
+    lines.append("\nMark paid via /master → Open invoices.")
+    text = "\n".join(lines)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    # Always DM the summary (brief: owner gets it even if command ran in a group)
+    chat = update.effective_chat
+    if chat and chat.type != "private":
+        try:
+            await context.bot.send_message(
+                user.id, text, parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as exc:
+            log.info("cmd_invoices DM failed for %s: %s", user.id, exc)
+    elif chat and chat.type == "private":
+        pass  # already replied in the DM
+
+
 async def _master_home(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool
 ) -> None:
@@ -6735,6 +6789,7 @@ async def post_init(app: Application) -> None:
         BotCommand("rescue", "Recovery kit after a ban (owner)"),
         BotCommand("syncsite", "Pull the SPBC site catalog (owner)"),
         BotCommand("master", "Master fees/invoices (owner)"),
+        BotCommand("invoices", "Generate + list weekly invoices (owner)"),
         BotCommand("backup", "Encrypted DB snapshot (owner)"),
         BotCommand("backup_status", "Vault + token pool (owner)"),
         BotCommand("help", "Help"),
@@ -7049,6 +7104,7 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("claim_clone", cmd_claim_clone))
     app.add_handler(CommandHandler("claim_transfer", cmd_claim_transfer))
     app.add_handler(CommandHandler("master", cmd_master))
+    app.add_handler(CommandHandler("invoices", cmd_invoices))
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("backup_status", cmd_backup_status))
     app.add_handler(CommandHandler("syncsite", cmd_syncsite))
