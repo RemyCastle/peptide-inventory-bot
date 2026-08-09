@@ -333,7 +333,7 @@ def _find_shop_for_miniapp(
     if not shops:
         return None
 
-    scored: list[tuple[int, int, int, int, dict]] = []
+    rows: list[dict] = []
     for s in shops:
         sid = int(s["chat_id"])
         title = (s.get("title") or "").lower()
@@ -341,25 +341,60 @@ def _find_shop_for_miniapp(
         n_active = _shop_product_count(sid, active_only=True)
         n_all = _shop_product_count(sid, active_only=False)
         n = n_active if n_active > 0 else n_all
-        is_virtual = 1 if sid >= db.VIRTUAL_SHOP_BASE else 0
-        has_stock = 1 if n > 0 else 0
-        # Priority: has products → title match → virtual shop → product count
-        scored.append((has_stock, hint_hits, is_virtual, n, s))
-        if n > 0 or hint_hits:
-            log.info(
-                "miniapp shop candidate chat_id=%s title=%r products=%s (active=%s) hints=%s virtual=%s",
-                sid,
-                s.get("title"),
-                n,
-                n_active,
-                hint_hits,
-                is_virtual,
-            )
+        is_virtual = sid >= db.VIRTUAL_SHOP_BASE
+        rows.append(
+            {
+                "shop": s,
+                "sid": sid,
+                "title": s.get("title"),
+                "hint_hits": hint_hits,
+                "n": n,
+                "n_active": n_active,
+                "is_virtual": is_virtual,
+            }
+        )
+        log.info(
+            "miniapp shop scan chat_id=%s title=%r products=%s active=%s hints=%s virtual=%s",
+            sid,
+            s.get("title"),
+            n,
+            n_active,
+            hint_hits,
+            int(is_virtual),
+        )
 
-    scored.sort(key=lambda t: (t[0], t[1], t[2], t[3]), reverse=True)
-    best = scored[0][4]
-    # If nothing is stocked, still return best title match so bind is diagnosable
-    return best
+    def _pick(cands: list[dict]) -> Optional[dict]:
+        if not cands:
+            return None
+        cands = sorted(
+            cands,
+            key=lambda r: (r["hint_hits"], r["n"], int(r["is_virtual"])),
+            reverse=True,
+        )
+        return cands[0]["shop"]
+
+    # 1) Title match + stocked (true handoff inventory for this brand)
+    picked = _pick([r for r in rows if r["hint_hits"] > 0 and r["n"] > 0])
+    if picked:
+        return picked
+    # 2) Pre-built /newvendor shops that actually have stock
+    picked = _pick([r for r in rows if r["is_virtual"] and r["n"] > 0])
+    if picked:
+        return picked
+    # 3) Title match even if empty (so bind is diagnosable; catalog will be empty)
+    picked = _pick([r for r in rows if r["hint_hits"] > 0])
+    if picked:
+        return picked
+    # 4) Any virtual shop (empty handoff shell)
+    picked = _pick([r for r in rows if r["is_virtual"]])
+    if picked:
+        return picked
+    # Do NOT fall back to the largest unrelated Telegram shop (would leak main catalog)
+    log.warning(
+        "miniapp shop: no title/virtual match among %s shops — refusing generic bind",
+        len(rows),
+    )
+    return None
 
 
 def ensure_miniapp_storefront(

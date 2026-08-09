@@ -135,6 +135,24 @@ class InviteTests(WebPanelBase):
         self.assertTrue(again["ok"])
         self.assertEqual(again["action"], "already_bound")
 
+    def test_ensure_miniapp_does_not_steal_unrelated_stocked_shop(self):
+        # Large main catalog should not become Unicorn's mini-app just because it's biggest
+        main = db.ensure_shop(-100111, title="Shop")
+        db.add_product(int(main["chat_id"]), "Main SEMA", 50.0, 99)
+        empty = db.create_virtual_shop("Unicorn Magic Factory", created_by=1)
+        fixed = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        result = webpanel.ensure_miniapp_storefront(
+            f"vendor{fixed}",
+            title_hints=["unicorn", "magic factory"],
+            note="Unicorn Magic Factory",
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["shop_chat_id"], int(empty["chat_id"]))
+        self.assertEqual(result["products"], 0)
+        code, body = webpanel.api_storefront(f"vendor{fixed}")
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["products"], [])
+
 
 class RestockTests(WebPanelBase):
     def test_restock_adds_and_audits(self):
