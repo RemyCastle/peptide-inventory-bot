@@ -19,6 +19,7 @@ talks to Telegram directly over HTTPS, so it never touches the PTB event loop.
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import re
@@ -764,7 +765,12 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
             auth = self.headers.get("Authorization") or ""
             if auth.lower().startswith("bearer "):
                 header = auth[7:].strip()
-        if header != NOTIFY_SECRET:
+        # Constant-time compare (length mismatch still fails closed)
+        try:
+            ok = hmac.compare_digest(str(header), str(NOTIFY_SECRET))
+        except Exception:
+            ok = False
+        if not ok:
             self._json(401, {"error": "unauthorized"})
             return False
         return True

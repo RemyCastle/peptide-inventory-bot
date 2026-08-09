@@ -172,6 +172,50 @@ class QnAStateTests(unittest.TestCase):
     def test_oos_none_detection(self):
         for t in ("none", "N/A", "all good", "0"):
             self.assertTrue(spbc_notify._oos_is_none(t))
+
+
+class CheckSecretTests(unittest.TestCase):
+    """X-Notify-Secret must use constant-time compare (hmac.compare_digest)."""
+
+    def _handler(self, secret_header: str | None, auth: str | None = None):
+        headers = {}
+        if secret_header is not None:
+            headers["X-Notify-Secret"] = secret_header
+        if auth is not None:
+            headers["Authorization"] = auth
+
+        handler = object.__new__(spbc_notify.NotifyHTTPHandler)
+        handler.headers = headers
+        handler._json_calls = []
+
+        def _json(code, body):
+            handler._json_calls.append((code, body))
+
+        handler._json = _json  # type: ignore[method-assign]
+        return handler
+
+    def test_compare_digest_accepts_match(self):
+        with mock.patch.object(spbc_notify, "NOTIFY_SECRET", "s3cret"):
+            h = self._handler("s3cret")
+            self.assertTrue(h._check_secret())
+            self.assertEqual(h._json_calls, [])
+
+    def test_compare_digest_rejects_mismatch(self):
+        with mock.patch.object(spbc_notify, "NOTIFY_SECRET", "s3cret"):
+            h = self._handler("wrong")
+            self.assertFalse(h._check_secret())
+            self.assertEqual(h._json_calls[0][0], 401)
+
+    def test_bearer_header(self):
+        with mock.patch.object(spbc_notify, "NOTIFY_SECRET", "s3cret"):
+            h = self._handler(None, auth="Bearer s3cret")
+            self.assertTrue(h._check_secret())
+
+    def test_missing_secret_config(self):
+        with mock.patch.object(spbc_notify, "NOTIFY_SECRET", ""):
+            h = self._handler("anything")
+            self.assertFalse(h._check_secret())
+            self.assertEqual(h._json_calls[0][0], 503)
         self.assertFalse(spbc_notify._oos_is_none("RETA 35"))
 
     def test_owner_report_format(self):
