@@ -176,6 +176,15 @@ def ensure_webpanel_tables() -> None:
                 used_by    INTEGER,
                 used_at    TEXT
             );
+            -- Public read-only catalog key (Pages store). NEVER a claim credential.
+            -- Separate namespace from vendor_invites so a leaked storefront URL
+            -- cannot redeem /start vendor… into shop admin.
+            CREATE TABLE IF NOT EXISTS storefront_keys (
+                key_hash     TEXT PRIMARY KEY,
+                key_plain    TEXT NOT NULL UNIQUE,
+                shop_chat_id INTEGER NOT NULL UNIQUE,
+                created_at   TEXT NOT NULL
+            );
             """
         )
         cols = {
@@ -283,7 +292,11 @@ def create_vendor_invite(
 def redeem_vendor_invite(
     raw: str, user_id: int
 ) -> tuple[bool, str, Optional[int]]:
-    """One-time redemption. Returns (ok, message, pre_built_shop_chat_id)."""
+    """One-time redemption. Returns (ok, message, pre_built_shop_chat_id).
+
+    Looks up vendor_invites only. A public storefront_keys catalog key can
+    never redeem to admin (different table / namespace).
+    """
     ensure_webpanel_tables()
     raw = normalize_invite_token(raw)
     with db.get_db() as conn:
@@ -311,19 +324,49 @@ def _shop_product_count(chat_id: int, *, active_only: bool = True) -> int:
         return 0
 
 
+def _ensure_storefront_key(shop_chat_id: int) -> str:
+    """Idempotent public catalog key for a shop (raw hex, for Pages / logs).
+
+    Distinct from vendor_invites claim tokens. key_plain is stored because the
+    key is intentionally public and boot must re-print it for Pages wiring.
+    """
+    ensure_webpanel_tables()
+    sid = int(shop_chat_id)
+    with db.get_db() as conn:
+        row = conn.execute(
+            "SELECT key_plain FROM storefront_keys WHERE shop_chat_id = ?",
+            (sid,),
+        ).fetchone()
+        if row:
+            return str(row["key_plain"])
+        raw = secrets.token_hex(12)
+        conn.execute(
+            "INSERT INTO storefront_keys (key_hash, key_plain, shop_chat_id, "
+            "created_at) VALUES (?, ?, ?, ?)",
+            (_hash(raw), raw, sid, _ts(_utc_now())),
+        )
+        return raw
+
+
 def _find_shop_for_miniapp(
     shop_chat_id: int | None = None,
     title_hints: list[str] | None = None,
 ) -> Optional[dict]:
     """Pick the pre-built vendor shop that should back a mini-app catalog.
 
-    Stocked inventory wins over empty title matches — a /newvendor handoff
-    shop with products is preferred even if its title is generic.
+    Fail closed: never guess across vendors. Heuristic matches require a
+    title-hint hit, except when the DB has exactly one virtual shop.
     """
-    if shop_chat_id:
+    if shop_chat_id is not None:
         shop = db.get_shop(int(shop_chat_id))
         if shop:
             return shop
+        # Explicit id provided but missing — do not fall through to guessing
+        log.warning(
+            "miniapp shop: explicit shop_chat_id=%s not found — refusing heuristic",
+            shop_chat_id,
+        )
+        return None
 
     hints = [h.lower() for h in (title_hints or []) if h and h.strip()]
     shops = db.list_shops() if hasattr(db, "list_shops") else None
@@ -378,22 +421,19 @@ def _find_shop_for_miniapp(
     picked = _pick([r for r in rows if r["hint_hits"] > 0 and r["n"] > 0])
     if picked:
         return picked
-    # 2) Pre-built /newvendor shops that actually have stock
-    picked = _pick([r for r in rows if r["is_virtual"] and r["n"] > 0])
-    if picked:
-        return picked
-    # 3) Title match even if empty (so bind is diagnosable; catalog will be empty)
+    # 2) Title match even if empty (bind is diagnosable; catalog may be empty)
     picked = _pick([r for r in rows if r["hint_hits"] > 0])
     if picked:
         return picked
-    # 4) Any virtual shop (empty handoff shell)
-    picked = _pick([r for r in rows if r["is_virtual"]])
-    if picked:
-        return picked
-    # Do NOT fall back to the largest unrelated Telegram shop (would leak main catalog)
+    # 3) Sole virtual shop in the whole DB (safe only when there is no choice)
+    virtuals = [r for r in rows if r["is_virtual"]]
+    if len(virtuals) == 1:
+        return virtuals[0]["shop"]
+    # Never bind an arbitrary stocked/empty virtual shop among several vendors
     log.warning(
-        "miniapp shop: no title/virtual match among %s shops — refusing generic bind",
+        "miniapp shop: no title match among %s shops (%s virtual) — refusing bind",
         len(rows),
+        len(virtuals),
     )
     return None
 
@@ -406,11 +446,11 @@ def ensure_miniapp_storefront(
     created_by: int = 0,
     note: str = "",
 ) -> dict[str, Any]:
-    """Idempotently bind a fixed invite token to a stocked shop for /storefront.
+    """Idempotently bind a claim invite to a shop AND issue a storefront key.
 
-    Claim is NOT required for the mini-app catalog. We only need vendor_invites
-    row: token_hash + shop_chat_id. Used by cloud boot so Pages demos keep
-    working after a suspended service or regenerated handoff link.
+    - vendor_invites: private claim credential (/start vendor… → admin).
+    - storefront_keys: public catalog key returned as storefront_key for Pages.
+    These MUST stay different secrets. Claim is not required for /storefront.
     """
     ensure_webpanel_tables()
     raw = normalize_invite_token(raw_invite)
@@ -430,15 +470,17 @@ def ensure_miniapp_storefront(
         title_l = ((shop or {}).get("title") or "").lower()
         title_ok = (not hints_l) or any(h in title_l for h in hints_l)
         is_virtual = sid >= db.VIRTUAL_SHOP_BASE
-        # Keep stocked virtual shops or stocked title matches; rebind everything else
-        # (prevents a bad prior bind to the main SPBC "Shop" catalog from sticking).
-        if shop and n > 0 and (is_virtual or title_ok):
+        # When title hints are given, require a title match even for virtual shops
+        # (a wrong prior virtual bind must not stick forever).
+        if shop and n > 0 and title_ok:
+            sf_key = _ensure_storefront_key(sid)
             return {
                 "ok": True,
                 "action": "already_bound",
                 "shop_chat_id": sid,
                 "title": shop.get("title"),
                 "products": n,
+                "storefront_key": sf_key,
             }
         log.info(
             "miniapp rebind: prior shop %s title=%r products=%s title_ok=%s virtual=%s",
@@ -456,7 +498,7 @@ def ensure_miniapp_storefront(
     sid = int(shop["chat_id"])
     title = (note or shop.get("title") or "Vendor shop").strip()[:80]
     now = _utc_now()
-    # Long-lived for storefront binding; claim still one-shot via used_by.
+    # Long-lived claim row mapping; claim still one-shot via used_by.
     expires = now + timedelta(days=3650)
     with db.get_db() as conn:
         row = conn.execute(
@@ -484,13 +526,15 @@ def ensure_miniapp_storefront(
             )
             action = "created"
 
+    sf_key = _ensure_storefront_key(sid)
     n = _shop_product_count(sid)
     log.info(
-        "miniapp storefront %s invite→shop %s (%s) products=%s",
+        "miniapp storefront %s claim→shop %s (%s) products=%s storefront_key=%s",
         action,
         sid,
         title,
         n,
+        sf_key,
     )
     return {
         "ok": True,
@@ -498,6 +542,7 @@ def ensure_miniapp_storefront(
         "shop_chat_id": sid,
         "title": title,
         "products": n,
+        "storefront_key": sf_key,
     }
 
 
@@ -507,21 +552,21 @@ def _err(code: int, msg: str) -> tuple[int, dict]:
     return code, {"ok": False, "error": msg}
 
 
-def api_storefront(raw_invite: str) -> tuple[int, dict]:
+def api_storefront(raw_key: str) -> tuple[int, dict]:
     """Public, read-only catalog for a vendor's mini-app storefront.
 
-    Keyed by the vendor invite token from the t.me handoff link (works before
-    AND after the invite is redeemed — the shop mapping persists). Exposes only
-    what a customer-facing store needs: names, prices, kit prices, stock,
-    shipping terms and payment-method names. No instructions, no admin data.
+    Keyed ONLY by storefront_keys (public catalog secret). Claim tokens from
+    vendor_invites are rejected so a leaked Pages URL cannot double as admin
+    claim. Exposes names, prices, kit prices, stock, shipping terms and
+    payment-method names only — no instructions, no admin data.
     """
     ensure_webpanel_tables()
-    raw = normalize_invite_token(raw_invite)
+    raw = normalize_invite_token(raw_key)
     if not re.fullmatch(r"[0-9a-fA-F]{24}", raw):
         return _err(404, "unknown storefront")
     with db.get_db() as conn:
         row = conn.execute(
-            "SELECT shop_chat_id FROM vendor_invites WHERE token_hash = ?",
+            "SELECT shop_chat_id FROM storefront_keys WHERE key_hash = ?",
             (_hash(raw),),
         ).fetchone()
     if not row or not row["shop_chat_id"]:
