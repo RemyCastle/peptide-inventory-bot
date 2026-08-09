@@ -20,10 +20,11 @@ log = logging.getLogger("run_cloud")
 
 
 def _bind_vendor_miniapps() -> None:
-    """Re-attach fixed mini-app invite tokens to the stocked vendor shops.
+    """Re-attach claim tokens + issue public storefront keys for vendor shops.
 
-    Claim is not required for /storefront. We only need vendor_invites.shop_chat_id
-    so Cloudflare Pages demos keep serving the inventory you loaded for handover.
+    Claim token (UNICORN_CLAIM_TOKEN / invite) binds vendor_invites for /start
+    redeem only. Catalog uses a separate storefront_key returned in the result
+    (copy into Cloudflare Pages — never put the claim token in public HTML).
     """
     import webpanel
 
@@ -56,6 +57,12 @@ def _bind_vendor_miniapps() -> None:
         )
         log.info("unicorn storefront bind: %s", result)
         print(f"[run_cloud] unicorn storefront bind: {result}", flush=True)
+        if result.get("storefront_key"):
+            print(
+                f"[run_cloud] unicorn PUBLIC storefront_key (Pages only): "
+                f"{result['storefront_key']}",
+                flush=True,
+            )
         # Seed payment rails she can edit anytime in her panel link
         sid = result.get("shop_chat_id") or shop_id
         if sid:

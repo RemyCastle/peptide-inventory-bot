@@ -826,6 +826,7 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
         if path == "/storefront":
             # Public read-only catalog for vendor mini-app stores (CORS: the
             # store is served from a different origin, e.g. *.pages.dev).
+            # ?invite= is the public storefront_key (NOT the claim token).
             import webpanel
 
             query = urllib.parse.parse_qs(parsed.query)
