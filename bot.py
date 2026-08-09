@@ -435,64 +435,111 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=InlineKeyboardMarkup(buttons),
             )
             return
-        if arg0.startswith("vendor_"):
-            token = arg0.removeprefix("vendor_")
-            ok, note, prebuilt = webpanel.redeem_vendor_invite(token, user.id)
-            if not ok:
-                await update.message.reply_text(note)
-                return
-            if prebuilt and db.get_shop(int(prebuilt)):
-                # Owner already built and stocked this shop — hand it over
-                sid = int(prebuilt)
-                shop = db.get_shop(sid)
-            else:
-                sid = user.id
-                title = f"{user.first_name or 'Vendor'}'s Shop"
-                shop = db.get_shop(sid) or db.ensure_shop(sid, title=title)
-            db.add_admin(sid, user.id, user.username, user.id)
-            set_shop(context, sid)
-            stocked = len(db.list_products(sid, active_only=True))
-            lines = [
-                f"🎉 Welcome{' ' + note if note else ''}! "
-                f"Your shop *{shop['title']}* is ready.",
-                "",
-            ]
-            if stocked:
-                lines += [
-                    f"It's already set up with *{stocked} product"
-                    f"{'s' if stocked != 1 else ''}* — you can start selling now.",
-                    "",
-                    "To change prices or stock:",
-                ]
-            else:
-                lines.append("Fastest way to set up — from your phone:")
-            if PANEL_BASE_URL:
-                link = webpanel.panel_url(
-                    PANEL_BASE_URL, webpanel.issue_token(sid, user.id)
+        # Handoff payloads: vendor<hex24> (Markdown-safe field links) and
+        # vendor_<hex24> (legacy /handover). Require 24 hex so shop_/etc. stay free.
+        if arg0.startswith("vendor"):
+            token = webpanel.normalize_invite_token(arg0)
+            if (
+                len(token) == 24
+                and all(c in "0123456789abcdefABCDEF" for c in token)
+            ):
+                ok, note, prebuilt = webpanel.redeem_vendor_invite(token, user.id)
+                if not ok:
+                    await update.message.reply_text(note)
+                    return
+                is_prebuilt = bool(prebuilt and db.get_shop(int(prebuilt)))
+                if is_prebuilt:
+                    # Owner already built and stocked this shop — hand it over
+                    sid = int(prebuilt)
+                    shop = db.get_shop(sid)
+                else:
+                    sid = user.id
+                    title = f"{user.first_name or 'Vendor'}'s Shop"
+                    shop = db.get_shop(sid) or db.ensure_shop(sid, title=title)
+                db.add_admin(sid, user.id, user.username, user.id)
+                set_shop(context, sid)
+                stocked = len(db.list_products(sid, active_only=True))
+                panel_link = None
+                if PANEL_BASE_URL:
+                    panel_link = webpanel.panel_url(
+                        PANEL_BASE_URL, webpanel.issue_token(sid, user.id)
+                    )
+                title_md = shop["title"]
+                if is_prebuilt and stocked:
+                    n_label = f"{stocked} product" + ("s" if stocked != 1 else "")
+                    lines = [
+                        f"🎉 Welcome! Your shop *{title_md}* is now yours — "
+                        f"*{n_label}* already loaded.",
+                        "",
+                    ]
+                    if panel_link:
+                        lines += [
+                            f"1. *Manage your shop* — open your "
+                            f"[shop panel]({panel_link}): review prices and stock.",
+                            "2. *Add how customers pay you* — set Venmo, PayPal, "
+                            "Zelle, Apple Cash, or crypto in the panel. Until this "
+                            "is set, order confirmations cannot quote payment info.",
+                        ]
+                    else:
+                        lines += [
+                            "1. *Manage your shop* — tap ⚙️ Admin Panel below: "
+                            "review prices and stock.",
+                            "2. *Add how customers pay you* — Venmo, PayPal, Zelle, "
+                            "Apple Cash, or crypto. Until this is set, order "
+                            "confirmations cannot quote payment info.",
+                        ]
+                    lines += [
+                        "3. *Your storefront* — open @UnicornMagicFactoryBot, "
+                        "tap /start once, and pin t.me/UnicornMagicFactoryBot in "
+                        "your customer group. Every order arrives as a DM from "
+                        "that bot with a payment code.",
+                        "4. *Restock anytime* — panel changes update the store live.",
+                    ]
+                    if panel_link:
+                        lines += [
+                            "",
+                            "Panel link lasts 3 days — send /webpanel for a fresh one.",
+                        ]
+                else:
+                    lines = [
+                        f"🎉 Welcome{' ' + note if note else ''}! "
+                        f"Your shop *{title_md}* is ready.",
+                        "",
+                    ]
+                    if stocked:
+                        lines += [
+                            f"It's already set up with *{stocked} product"
+                            f"{'s' if stocked != 1 else ''}* — you can start selling now.",
+                            "",
+                        ]
+                    if panel_link:
+                        lines += [
+                            f"1. *Manage your shop* — open your "
+                            f"[shop panel]({panel_link}): add or review products.",
+                            "2. *Add how customers pay you* — set Venmo, PayPal, "
+                            "Zelle, Apple Cash, or crypto in the panel. Until this "
+                            "is set, order confirmations cannot quote payment info.",
+                            "",
+                            "The link lasts 3 days — send /webpanel any time for a fresh one.",
+                        ]
+                    else:
+                        lines += [
+                            "1. *Manage your shop* — tap ⚙️ Admin Panel below.",
+                            "2. *Add how customers pay you* — Venmo, PayPal, Zelle, "
+                            "Apple Cash, or crypto. Until this is set, order "
+                            "confirmations cannot quote payment info.",
+                        ]
+                    lines += [
+                        "",
+                        "Have a website? Link its catalog with /linksite — "
+                        "tap Admin Panel → 🌐 Site links for the guide.",
+                    ]
+                await safe_reply(
+                    update.message,
+                    "\n".join(lines),
+                    reply_markup=main_menu_kb(True),
                 )
-                lines += [
-                    f"1. Open your [shop panel]({link})",
-                    "2. Add products (bulk paste works), payment methods, shipping",
-                    "3. Come back here and tap Catalog to see your shop live",
-                    "",
-                    "The link lasts 3 days — send /webpanel any time for a fresh one.",
-                ]
-            else:
-                lines += [
-                    "1. Tap ⚙️ Admin Panel below",
-                    "2. Add products, payment methods, shipping",
-                ]
-            lines += [
-                "",
-                "Have a website? Link its catalog with /linksite — "
-                "tap Admin Panel → 🌐 Site links for the guide.",
-            ]
-            await safe_reply(
-                update.message,
-                "\n".join(lines),
-                reply_markup=main_menu_kb(True),
-            )
-            return
+                return
         if arg0.startswith("setup_"):
             try:
                 sid = int(arg0.removeprefix("setup_"))

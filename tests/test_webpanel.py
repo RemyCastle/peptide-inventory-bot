@@ -93,6 +93,45 @@ class InviteTests(WebPanelBase):
         ok, msg, _ = webpanel.redeem_vendor_invite("bogus", USER)
         self.assertFalse(ok)
 
+    def test_redeem_both_deep_link_payload_forms(self):
+        """Regression: field links use vendor<hex24> (no underscore); /handover
+        used vendor_<hex24>. Both must normalize and redeem."""
+        raw_a = webpanel.create_vendor_invite(1, "NoUnderscore")
+        self.assertEqual(len(raw_a), 24)
+        self.assertTrue(all(c in "0123456789abcdef" for c in raw_a))
+
+        # Markdown-safe form (what create_vendor_invite field links use)
+        payload_a = f"vendor{raw_a}"
+        self.assertEqual(webpanel.normalize_invite_token(payload_a), raw_a)
+        ok, note, prebuilt = webpanel.redeem_vendor_invite(payload_a, USER)
+        self.assertTrue(ok, note)
+        self.assertEqual(note, "NoUnderscore")
+        self.assertIsNone(prebuilt)
+
+        # Legacy underscore form
+        raw_b = webpanel.create_vendor_invite(1, "WithUnderscore")
+        payload_b = f"vendor_{raw_b}"
+        self.assertEqual(webpanel.normalize_invite_token(payload_b), raw_b)
+        ok, note, prebuilt = webpanel.redeem_vendor_invite(payload_b, USER + 1)
+        self.assertTrue(ok, note)
+        self.assertEqual(note, "WithUnderscore")
+        self.assertIsNone(prebuilt)
+
+        # Bare hex still works (normalize is a no-op)
+        raw_c = webpanel.create_vendor_invite(1, "Bare")
+        self.assertEqual(webpanel.normalize_invite_token(raw_c), raw_c)
+        ok, note, _ = webpanel.redeem_vendor_invite(raw_c, USER + 2)
+        self.assertTrue(ok, note)
+
+        # Handler gate: remainder after normalize must be 24 hex — not other
+        # start payloads that merely begin with the letters "vendor"
+        self.assertNotEqual(
+            len(webpanel.normalize_invite_token("vendor_nothex")), 24
+        )
+        self.assertEqual(
+            webpanel.normalize_invite_token("shop_abc"), "shop_abc"
+        )
+
     def test_handover_invite_carries_prebuilt_shop(self):
         shop = db.create_virtual_shop("Prebuilt Vendor", created_by=1)
         sid = int(shop["chat_id"])
