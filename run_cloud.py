@@ -22,15 +22,12 @@ def main() -> None:
         target=spbc_notify.serve_http, args=(port,), name="notify-http", daemon=True
     ).start()
 
-    # Optional: vendor mini-app order receiver (@UnicornMagicFactoryBot).
-    # Only starts when UNICORN_BOT_TOKEN is set; a crash logs and never takes
-    # down the main bot.
-    if (os.environ.get("UNICORN_BOT_TOKEN") or "").strip():
-        import unicorn_store_bot
+    # Vendor mini-app order receivers (one branded bot per vendor, all sharing
+    # this process and database). Configured via VENDOR_STORES_JSON, with the
+    # legacy UNICORN_* vars still honored. No vendors configured = no threads.
+    import vendor_stores
 
-        threading.Thread(
-            target=unicorn_store_bot.run_threaded, name="unicorn-store", daemon=True
-        ).start()
+    vendor_stores.start_all()
 
     import bot
 

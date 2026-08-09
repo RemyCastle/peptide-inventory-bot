@@ -1,9 +1,10 @@
-# UnicornFartzzBot on your existing Render account (separate from TyFit).
-# Web service keeps a public health URL; bot long-polls Telegram inside the same process.
-# Starter ≈ always-on (same tier idea as TyFit). Free sleeps after inactivity.
+# SPBC Inventory Bot — the central order/inventory brain for all vendors.
+# Web service keeps a public health URL (storefront API + vendor panel); the
+# SPBC bot and every vendor's branded store bot long-poll inside this process.
+# Starter ≈ always-on. Free tier is NOT viable here: no persistent disk = no DB.
 services:
   - type: web
-    name: unicornfartzz-bot
+    name: spbc-inventory-bot
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
@@ -17,7 +18,10 @@ services:
       - key: OWNER_IDS
         sync: false
       - key: BRAND_NAME
-        value: UnicornFartzzBot
+        value: SPBC Order Bot
+      # Vendor mini-app store bots — one JSON entry per vendor (vendor_stores.py)
+      - key: VENDOR_STORES_JSON
+        sync: false
       - key: DB_PATH
         value: /data/inventory.db
       - key: LOG_PATH
