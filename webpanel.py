@@ -303,9 +303,9 @@ def redeem_vendor_invite(
     return True, str(row["note"] or ""), (int(shop_id) if shop_id else None)
 
 
-def _shop_product_count(chat_id: int) -> int:
+def _shop_product_count(chat_id: int, *, active_only: bool = True) -> int:
     try:
-        return len(db.list_products(int(chat_id), active_only=True))
+        return len(db.list_products(int(chat_id), active_only=active_only))
     except Exception:
         return 0
 
@@ -314,7 +314,11 @@ def _find_shop_for_miniapp(
     shop_chat_id: int | None = None,
     title_hints: list[str] | None = None,
 ) -> Optional[dict]:
-    """Pick the pre-built vendor shop that should back a mini-app catalog."""
+    """Pick the pre-built vendor shop that should back a mini-app catalog.
+
+    Stocked inventory wins over empty title matches — a /newvendor handoff
+    shop with products is preferred even if its title is generic.
+    """
     if shop_chat_id:
         shop = db.get_shop(int(shop_chat_id))
         if shop:
@@ -329,23 +333,33 @@ def _find_shop_for_miniapp(
     if not shops:
         return None
 
-    # Prefer pre-built virtual vendor shops (/newvendor) when present.
-    virtual = [s for s in shops if int(s["chat_id"]) >= db.VIRTUAL_SHOP_BASE]
-    pool = virtual or shops
-
-    scored: list[tuple[int, int, dict]] = []
-    for s in pool:
+    scored: list[tuple[int, int, int, int, dict]] = []
+    for s in shops:
+        sid = int(s["chat_id"])
         title = (s.get("title") or "").lower()
         hint_hits = sum(1 for h in hints if h in title)
-        n = _shop_product_count(int(s["chat_id"]))
-        # title match first, then product count
-        scored.append((hint_hits, n, s))
-    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
-    best = scored[0]
-    # Require either a title hint hit or at least one product
-    if best[0] > 0 or best[1] > 0:
-        return best[2]
-    return best[2]
+        n_active = _shop_product_count(sid, active_only=True)
+        n_all = _shop_product_count(sid, active_only=False)
+        n = n_active if n_active > 0 else n_all
+        is_virtual = 1 if sid >= db.VIRTUAL_SHOP_BASE else 0
+        has_stock = 1 if n > 0 else 0
+        # Priority: has products → title match → virtual shop → product count
+        scored.append((has_stock, hint_hits, is_virtual, n, s))
+        if n > 0 or hint_hits:
+            log.info(
+                "miniapp shop candidate chat_id=%s title=%r products=%s (active=%s) hints=%s virtual=%s",
+                sid,
+                s.get("title"),
+                n,
+                n_active,
+                hint_hits,
+                is_virtual,
+            )
+
+    scored.sort(key=lambda t: (t[0], t[1], t[2], t[3]), reverse=True)
+    best = scored[0][4]
+    # If nothing is stocked, still return best title match so bind is diagnosable
+    return best
 
 
 def ensure_miniapp_storefront(
@@ -367,12 +381,12 @@ def ensure_miniapp_storefront(
     if not re.fullmatch(r"[0-9a-fA-F]{24}", raw):
         return {"ok": False, "error": "bad_invite_token", "invite": raw_invite}
 
-    # Already bound with a real shop?
+    # Already bound with a stocked shop? Keep it.
     with db.get_db() as conn:
         existing = conn.execute(
             "SELECT * FROM vendor_invites WHERE token_hash = ?", (_hash(raw),)
         ).fetchone()
-    if existing and existing["shop_chat_id"]:
+    if existing and existing["shop_chat_id"] and not shop_chat_id:
         sid = int(existing["shop_chat_id"])
         shop = db.get_shop(sid)
         n = _shop_product_count(sid)
@@ -384,6 +398,7 @@ def ensure_miniapp_storefront(
                 "title": shop.get("title"),
                 "products": n,
             }
+        # Bound to an empty shop — re-resolve (handoff inventory may live elsewhere)
 
     shop = _find_shop_for_miniapp(shop_chat_id, title_hints)
     if not shop:
