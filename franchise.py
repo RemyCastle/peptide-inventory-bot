@@ -550,24 +550,40 @@ def list_shops_service_fees() -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def _week_bounds(ref: datetime | None = None) -> tuple[str, str, datetime, datetime]:
-    """UTC week Mon 00:00 → next Mon 00:00 (ISO-like). Returns (start_str, end_str, start_dt, end_dt)."""
+def _week_bounds(
+    ref: datetime | None = None, *, week_offset: int = 0
+) -> tuple[str, str, datetime, datetime]:
+    """UTC week Mon 00:00 → next Mon 00:00 (ISO-like).
+
+    week_offset: 0 = week containing ref, -1 = previous completed week, etc.
+    Returns (start_str, end_str, start_dt, end_dt).
+    """
     now = ref or datetime.now(timezone.utc)
     # Monday = 0
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now.weekday())
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
+        days=now.weekday()
+    )
+    start = start + timedelta(weeks=int(week_offset))
     end = start + timedelta(days=7)
     fmt = "%Y-%m-%d %H:%M:%S"
     return start.strftime(fmt), end.strftime(fmt), start, end
 
 
 def generate_weekly_invoices(
-    by_user: int, *, ref: datetime | None = None
+    by_user: int, *, ref: datetime | None = None, week_offset: int = 0
 ) -> tuple[bool, str, list[dict]]:
-    """Roll up paid-order hidden fees for the current UTC week per shop. Master only."""
+    """Roll up hidden fees for a UTC week per shop. Master only.
+
+    Includes orders in status paid/shipped/complete (fee already collected once
+    paid; shipping mid-week must still bill). Re-runs never downgrade an open
+    invoice's totals — only increase, or skip if already paid.
+
+    week_offset: 0 = current week (may be partial), -1 = previous completed week.
+    """
     if not is_owner(by_user):
         return False, "Master admin only.", []
     ensure_franchise_tables()
-    week_start, week_end, _, _ = _week_bounds(ref)
+    week_start, week_end, _, _ = _week_bounds(ref, week_offset=week_offset)
     created: list[dict] = []
     with get_db() as conn:
         shops = conn.execute("SELECT chat_id, title FROM shops").fetchall()
@@ -578,7 +594,7 @@ def generate_weekly_invoices(
                 SELECT COUNT(*) AS c, COALESCE(SUM(hidden_service_fee), 0) AS total
                 FROM orders
                 WHERE chat_id = ?
-                  AND status = 'paid'
+                  AND status IN ('paid', 'shipped', 'complete')
                   AND paid_at IS NOT NULL
                   AND paid_at >= ? AND paid_at < ?
                   AND hidden_service_fee > 0
@@ -600,14 +616,21 @@ def generate_weekly_invoices(
             if existing:
                 if existing["status"] == "paid":
                     continue
-                conn.execute(
-                    """
-                    UPDATE service_fee_invoices
-                    SET order_count = ?, total_fees = ?, created_at = ?
-                    WHERE id = ?
-                    """,
-                    (count, total, now, int(existing["id"])),
-                )
+                ex_count = int(existing["order_count"] or 0)
+                ex_total = float(existing["total_fees"] or 0)
+                # Never downgrade on re-run (partial mid-week → full week is fine;
+                # a smaller recomputation must not erase a higher prior total).
+                new_count = max(ex_count, count)
+                new_total = max(ex_total, total)
+                if new_count != ex_count or new_total != ex_total:
+                    conn.execute(
+                        """
+                        UPDATE service_fee_invoices
+                        SET order_count = ?, total_fees = ?, created_at = ?
+                        WHERE id = ?
+                        """,
+                        (new_count, new_total, now, int(existing["id"])),
+                    )
                 inv = conn.execute(
                     "SELECT * FROM service_fee_invoices WHERE id = ?",
                     (int(existing["id"]),),
@@ -629,6 +652,24 @@ def generate_weekly_invoices(
             d["title"] = s["title"]
             created.append(d)
     return True, f"Weekly invoices ready ({week_start} → {week_end} UTC).", created
+
+
+def generate_weekly_invoices_current_and_previous(
+    by_user: int, *, ref: datetime | None = None
+) -> tuple[bool, str, list[dict]]:
+    """Master-only: bill current (partial) week and previous completed week."""
+    ok0, msg0, invs0 = generate_weekly_invoices(by_user, ref=ref, week_offset=0)
+    if not ok0:
+        return ok0, msg0, invs0
+    ok1, msg1, invs1 = generate_weekly_invoices(by_user, ref=ref, week_offset=-1)
+    if not ok1:
+        return ok1, msg1, invs1
+    merged = list(invs0) + list(invs1)
+    return (
+        True,
+        f"Weekly invoices ready (current + previous). {msg0} | {msg1}",
+        merged,
+    )
 
 
 def list_invoices(

@@ -3054,12 +3054,13 @@ async def cmd_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     import franchise
 
     franchise.ensure_franchise_tables()
-    ok, msg, invs = franchise.generate_weekly_invoices(user.id)
+    # Current (partial) week + previous completed week so mid-week ship/re-runs bill fully
+    ok, msg, invs = franchise.generate_weekly_invoices_current_and_previous(user.id)
     lines = [("✅ " if ok else "❌ ") + msg, ""]
     if not invs:
         lines.append("_No billable fees this week (or all zero)._")
     else:
-        lines.append("*This week (generated/updated):*")
+        lines.append("*Generated/updated (current + previous week):*")
         for i in invs:
             lines.append(
                 f"• #{i['id']} `{i['chat_id']}` {i.get('title') or ''} — "
@@ -3261,7 +3262,9 @@ async def cb_master_geninv(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     import franchise
 
-    ok, msg, invs = franchise.generate_weekly_invoices(update.effective_user.id)
+    ok, msg, invs = franchise.generate_weekly_invoices_current_and_previous(
+        update.effective_user.id
+    )
     lines = [("✅ " if ok else "❌ ") + msg, ""]
     if not invs:
         lines.append("_No billable fees this week (or all zero)._")
