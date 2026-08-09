@@ -56,6 +56,22 @@ def _bind_vendor_miniapps() -> None:
         )
         log.info("unicorn storefront bind: %s", result)
         print(f"[run_cloud] unicorn storefront bind: {result}", flush=True)
+        # Seed payment rails she can edit anytime in her panel link
+        sid = result.get("shop_chat_id") or shop_id
+        if sid:
+            pay = webpanel.ensure_shop_payments(
+                int(sid),
+                [
+                    {"method_type": "venmo", "handle": "@wineboos"},
+                    {
+                        "method_type": "paypal",
+                        "handle": "unicornfartzz@proton.me",
+                        "network_note": "friends_family",
+                    },
+                ],
+            )
+            log.info("unicorn payments seed: %s", pay)
+            print(f"[run_cloud] unicorn payments seed: {pay}", flush=True)
 
     # Optional multi-vendor JSON: each entry may include invite + shop_chat_id + name
     raw = (os.getenv("VENDOR_STORES_JSON") or "").strip()

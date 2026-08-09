@@ -33,6 +33,7 @@ from typing import Any, Optional
 
 import db
 import inventory_import
+import payment_templates
 from config import MEDIA_DIR, PANEL_BASE_URL
 
 log = logging.getLogger("webpanel")
@@ -618,6 +619,12 @@ def api_state(tok: dict) -> tuple[int, dict]:
                 "name": m["name"],
                 "instructions": m.get("instructions") or "",
                 "active": int(m.get("active") or 0),
+                "method_type": (m.get("method_type") or "custom"),
+                "cashtag": m.get("cashtag") or "",
+                "handle": m.get("handle") or "",
+                "chain": m.get("chain") or "",
+                "address": m.get("address") or "",
+                "network_note": m.get("network_note") or "",
             }
             for m in payments
         ],
@@ -824,6 +831,50 @@ def api_bulk(tok: dict, payload: dict) -> tuple[int, dict]:
     }
 
 
+def _payment_payload_to_fields(payload: dict) -> dict[str, Any]:
+    """Normalize panel/API payment payload into DB columns + buyer instructions."""
+    method_type = str(payload.get("method_type") or "custom").strip().lower()
+    if method_type not in payment_templates.METHOD_TYPES:
+        method_type = "custom"
+    handle = str(payload.get("handle") or "").strip()
+    address = str(payload.get("address") or "").strip()
+    chain = str(payload.get("chain") or "").strip()
+    network_note = str(payload.get("network_note") or "").strip()
+    cashtag = str(payload.get("cashtag") or "").strip()
+    name = str(payload.get("name") or "").strip()[:60]
+    instructions = str(payload.get("instructions") or "").strip()[:1000]
+
+    # Prefer structured type fields when present
+    if method_type != "custom" or handle or address or cashtag:
+        rendered = payment_templates.render_from_fields(
+            method_type,
+            handle=handle,
+            address=address,
+            chain=chain,
+            network_note=network_note,
+            cashtag=cashtag,
+            name=name,
+            instructions=instructions,
+        )
+        # Allow explicit name/instructions override after template render
+        if name:
+            rendered["name"] = name
+        if payload.get("instructions") is not None and instructions:
+            rendered["instructions"] = instructions
+        return rendered
+
+    return {
+        "name": name or "Payment",
+        "instructions": instructions,
+        "method_type": "custom",
+        "cashtag": None,
+        "handle": None,
+        "chain": None,
+        "address": None,
+        "network_note": None,
+    }
+
+
 def api_payment(tok: dict, payload: dict) -> tuple[int, dict]:
     chat_id = tok["chat_id"]
     mid = payload.get("id")
@@ -842,26 +893,87 @@ def api_payment(tok: dict, payload: dict) -> tuple[int, dict]:
         db.delete_payment_method(mid)
         return 200, {"ok": True, "deleted": True}
 
-    name = str(payload.get("name") or "").strip()[:60]
-    instructions = str(payload.get("instructions") or "").strip()[:1000]
+    rendered = _payment_payload_to_fields(payload)
+    name = str(rendered.get("name") or "").strip()[:60]
+    instructions = str(rendered.get("instructions") or "").strip()[:1000]
 
     if mid is None:
         if not name:
             return _err(400, "Name required")
-        new_id = db.add_payment_method(chat_id, name, instructions)
+        # Require a usable handle/address for structured types
+        mt = (rendered.get("method_type") or "custom").lower()
+        if mt == "crypto" and not (rendered.get("address") or "").strip():
+            return _err(400, "Crypto wallet address required")
+        if mt in ("venmo", "paypal", "zelle", "apple_cash", "cashapp") and not (
+            (rendered.get("handle") or rendered.get("cashtag") or "").strip()
+        ):
+            return _err(400, "Payment handle / number required")
+        new_id = db.add_payment_from_template(chat_id, rendered)
         return 200, {"ok": True, "id": new_id, "created": True}
 
-    fields: dict[str, Any] = {}
-    if name:
-        fields["name"] = name
-    if payload.get("instructions") is not None:
-        fields["instructions"] = instructions
+    fields: dict[str, Any] = {
+        "name": name or "Payment",
+        "instructions": instructions,
+        "method_type": rendered.get("method_type"),
+        "cashtag": rendered.get("cashtag"),
+        "handle": rendered.get("handle"),
+        "chain": rendered.get("chain"),
+        "address": rendered.get("address"),
+        "network_note": rendered.get("network_note"),
+    }
     if payload.get("active") is not None:
         fields["active"] = 1 if payload["active"] in (1, True, "1", "true") else 0
+    # Allow partial save of just active/name without wiping structured fields
+    if payload.get("method_type") is None and not any(
+        payload.get(k) is not None
+        for k in ("handle", "address", "chain", "cashtag", "network_note", "instructions")
+    ):
+        fields = {}
+        if payload.get("name"):
+            fields["name"] = str(payload.get("name") or "").strip()[:60]
+        if payload.get("instructions") is not None:
+            fields["instructions"] = str(payload.get("instructions") or "").strip()[:1000]
+        if payload.get("active") is not None:
+            fields["active"] = 1 if payload["active"] in (1, True, "1", "true") else 0
     if not fields:
         return _err(400, "Nothing to update")
     db.update_payment_method(mid, **fields)
     return 200, {"ok": True, "id": mid, "created": False}
+
+
+def ensure_shop_payments(
+    chat_id: int,
+    defaults: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Idempotently seed payment methods on a shop (by method_type).
+
+    Existing methods of the same type are left alone so vendors can edit freely.
+    """
+    existing = db.list_payment_methods(int(chat_id), active_only=False)
+    by_type = {
+        (m.get("method_type") or "").lower(): m
+        for m in existing
+        if (m.get("method_type") or "").strip()
+    }
+    created: list[str] = []
+    for item in defaults or []:
+        mt = str(item.get("method_type") or "").lower()
+        if not mt or mt in by_type:
+            continue
+        rendered = payment_templates.render_from_fields(
+            mt,
+            handle=str(item.get("handle") or ""),
+            address=str(item.get("address") or ""),
+            chain=str(item.get("chain") or ""),
+            network_note=str(item.get("network_note") or ""),
+            cashtag=str(item.get("cashtag") or ""),
+            name=str(item.get("name") or ""),
+            instructions=str(item.get("instructions") or ""),
+        )
+        db.add_payment_from_template(int(chat_id), rendered)
+        created.append(mt)
+        by_type[mt] = rendered
+    return {"ok": True, "created": created, "total": len(by_type)}
 
 
 def api_shipping(tok: dict, payload: dict) -> tuple[int, dict]:
@@ -1118,22 +1230,61 @@ function render(){
         <button class="sub" id="bulk-go">Import</button></div></div>
   </div>
   <div class="card"><h2>Payment methods</h2>
-    <div id="paylist">${S.payments.map(m=>`
-      <div class="prod${m.active?'':' off'}" data-mid="${m.id}">
-        <div class="row"><div class="name"><label>Name</label>
-          <input class="p-name" value="${esc(m.name)}"></div></div>
-        <label>Instructions shown to buyers</label>
+    <p class="tag" style="margin:0 0 10px">Buyers see these at checkout. Edit anytime and hit Save — changes apply immediately.</p>
+    <div id="paylist">${S.payments.map(m=>{
+      const t=m.method_type||'custom';
+      const handle=esc(m.handle||m.cashtag||'');
+      const addr=esc(m.address||'');
+      const chain=esc(m.chain||'');
+      const note=esc(m.network_note||'');
+      return `<div class="prod${m.active?'':' off'}" data-mid="${m.id}" data-type="${esc(t)}">
+        <div class="row">
+          <div class="name"><label>Type</label>
+            <select class="p-type">
+              <option value="venmo"${t==='venmo'?' selected':''}>Venmo</option>
+              <option value="paypal"${t==='paypal'?' selected':''}>PayPal</option>
+              <option value="zelle"${t==='zelle'?' selected':''}>Zelle</option>
+              <option value="apple_cash"${t==='apple_cash'?' selected':''}>Apple Cash</option>
+              <option value="crypto"${t==='crypto'?' selected':''}>Crypto</option>
+              <option value="cashapp"${t==='cashapp'?' selected':''}>Cash App</option>
+              <option value="custom"${t==='custom'?' selected':''}>Custom</option>
+            </select></div>
+          <div class="name"><label>Label</label>
+            <input class="p-name" value="${esc(m.name)}"></div></div>
+        <div class="row p-fields">
+          <div class="name p-f-handle"><label>Handle / email / phone</label>
+            <input class="p-handle" value="${handle}" placeholder="@handle, email, or phone"></div>
+          <div class="name p-f-chain" style="${t==='crypto'?'':'display:none'}"><label>Coin</label>
+            <input class="p-chain" value="${chain}" placeholder="BTC / ETH / USDT"></div>
+          <div class="name p-f-addr" style="${t==='crypto'?'':'display:none'}"><label>Wallet address</label>
+            <input class="p-addr" value="${addr}" placeholder="0x… or bc1…"></div>
+          <div class="name p-f-note" style="${t==='crypto'||t==='paypal'?'':'display:none'}"><label>${t==='paypal'?'PayPal mode':'Network note'}</label>
+            <input class="p-note" value="${note}" placeholder="${t==='paypal'?'friends_family':'e.g. USDT TRC20'}"></div>
+        </div>
+        <label>Instructions shown to buyers (auto-filled from the fields above — editable)</label>
         <textarea class="p-instr" style="min-height:60px">${esc(m.instructions)}</textarea>
         <div class="flex" style="margin-top:8px">
           <label class="flex" style="margin:0"><input type="checkbox" class="p-act"
             style="width:auto" ${m.active?'checked':''}> enabled</label>
           <span class="grow"></span>
           <button class="danger p-del">Delete</button>
-          <button class="sub p-save">Save</button></div></div>`).join('')}
-    <div class="prod"><div class="row">
-      <div class="name"><label>New method (Cash App, Zelle, crypto…)</label>
-        <input id="pm-name" placeholder="Cash App"></div>
-      <div><button id="pm-add">Add</button></div></div></div>
+          <button class="sub p-save">Save changes</button></div></div>`;}).join('')||'<p class="tag">No payment methods yet — add one below.</p>'}
+    <div class="prod">
+      <label>Quick-add a method</label>
+      <div class="flex" style="flex-wrap:wrap;gap:8px;margin:8px 0">
+        <button type="button" class="sub pm-quick" data-type="venmo">+ Venmo</button>
+        <button type="button" class="sub pm-quick" data-type="paypal">+ PayPal</button>
+        <button type="button" class="sub pm-quick" data-type="zelle">+ Zelle</button>
+        <button type="button" class="sub pm-quick" data-type="apple_cash">+ Apple Cash</button>
+        <button type="button" class="sub pm-quick" data-type="crypto">+ Crypto</button>
+        <button type="button" class="sub pm-quick" data-type="cashapp">+ Cash App</button>
+      </div>
+      <div class="row">
+        <div class="name"><label>Or custom label</label>
+          <input id="pm-name" placeholder="Custom payment name"></div>
+        <div><button id="pm-add">Add custom</button></div></div>
+      <span class="tag">You can change any method anytime — just edit and Save.</span>
+    </div>
   </div>
   <div class="card"><h2>Shipping</h2>
     <div class="row">
@@ -1242,21 +1393,63 @@ function wire(){
     const d=await api('bulk',{text:$('#bulk').value});
     if(d.ok){toast(`Imported: ${d.created} new, ${d.updated} updated`+
       (d.errors.length?`, ${d.errors.length} errors`:''));load();}};
-  document.querySelectorAll('#paylist .prod').forEach(el=>{
+  document.querySelectorAll('#paylist .prod[data-mid]').forEach(el=>{
+    const typeSel=el.querySelector('.p-type');
+    const syncFields=()=>{
+      const t=typeSel.value;
+      el.querySelectorAll('.p-f-chain,.p-f-addr').forEach(n=>n.style.display=t==='crypto'?'':'none');
+      el.querySelectorAll('.p-f-note').forEach(n=>n.style.display=(t==='crypto'||t==='paypal')?'':'none');
+      el.querySelectorAll('.p-f-handle').forEach(n=>n.style.display=t==='crypto'?'none':'');
+    };
+    if(typeSel){typeSel.onchange=syncFields;syncFields();}
     el.querySelector('.p-save').onclick=async()=>{
-      const d=await api('payment',{id:el.dataset.mid,
+      const d=await api('payment',{
+        id:el.dataset.mid,
+        method_type:typeSel?typeSel.value:'custom',
         name:el.querySelector('.p-name').value,
+        handle:(el.querySelector('.p-handle')||{}).value||'',
+        chain:(el.querySelector('.p-chain')||{}).value||'',
+        address:(el.querySelector('.p-addr')||{}).value||'',
+        network_note:(el.querySelector('.p-note')||{}).value||'',
         instructions:el.querySelector('.p-instr').value,
         active:el.querySelector('.p-act').checked});
-      if(d.ok)toast('Saved');};
+      if(d.ok){toast('Payment method saved');load();}};
     el.querySelector('.p-del').onclick=async()=>{
       if(!confirm('Delete this payment method?'))return;
       const d=await api('payment',{id:el.dataset.mid,delete:true});
       if(d.ok){toast('Deleted');load();}};});
+  document.querySelectorAll('.pm-quick').forEach(btn=>{
+    btn.onclick=async()=>{
+      const t=btn.dataset.type;
+      const placeholders={
+        venmo:'@yourhandle',
+        paypal:'you@email.com',
+        zelle:'email or phone',
+        apple_cash:'phone number',
+        cashapp:'$cashtag',
+        crypto:''
+      };
+      let handle='', address='', chain='', network_note='';
+      if(t==='crypto'){
+        chain=prompt('Coin (BTC / ETH / USDT / Other)','USDT')||'';
+        address=prompt('Wallet address','')||'';
+        if(!address.trim()){toast('Address required',true);return;}
+        network_note=prompt('Network note (optional)','')||'';
+      } else {
+        handle=prompt('Enter your '+(t.replace('_',' '))+ ' details', placeholders[t]||'')||'';
+        if(!handle.trim()){toast('Value required',true);return;}
+        if(t==='paypal') network_note='friends_family';
+      }
+      const d=await api('payment',{method_type:t,handle,address,chain,network_note});
+      if(d.ok){toast('Added — edit anytime below');load();}
+      else toast(d.error||'Could not add',true);
+    };
+  });
   $('#pm-add').onclick=async()=>{
-    const d=await api('payment',{name:$('#pm-name').value,
-      instructions:''});
-    if(d.ok){toast('Added — now write its instructions');load();}};
+    const name=$('#pm-name').value.trim();
+    if(!name){toast('Name required',true);return;}
+    const d=await api('payment',{method_type:'custom',name,instructions:''});
+    if(d.ok){toast('Added — write instructions and Save');load();}};
   $('#sh-save').onclick=async()=>{
     const d=await api('shipping',{enabled:$('#sh-on').checked,
       fee:$('#sh-fee').value,free_above:$('#sh-free').value});

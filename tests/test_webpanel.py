@@ -199,6 +199,38 @@ class ApiTests(WebPanelBase):
         self.assertEqual(len(data["products"]), 1)
         self.assertEqual(len(data["payments"]), 1)
 
+    def test_payment_typed_create_update_and_seed(self):
+        code, data = webpanel.api_payment(
+            self.tok, {"method_type": "venmo", "handle": "@wineboos"}
+        )
+        self.assertEqual(code, 200, data)
+        mid = data["id"]
+        methods = db.list_payment_methods(SHOP, active_only=False)
+        self.assertEqual(methods[0]["method_type"], "venmo")
+        self.assertIn("@wineboos", methods[0]["handle"])
+        # update handle anytime
+        code, data = webpanel.api_payment(
+            self.tok,
+            {"id": mid, "method_type": "venmo", "handle": "@newhandle", "active": True},
+        )
+        self.assertEqual(code, 200, data)
+        m = db.get_payment_method(mid)
+        self.assertEqual(m["handle"], "@newhandle")
+        # seed is idempotent for existing types; adds paypal
+        seed = webpanel.ensure_shop_payments(
+            SHOP,
+            [
+                {"method_type": "venmo", "handle": "@ignored"},
+                {"method_type": "paypal", "handle": "unicornfartzz@proton.me"},
+                {"method_type": "zelle", "handle": "555-0100"},
+            ],
+        )
+        self.assertIn("paypal", seed["created"])
+        self.assertIn("zelle", seed["created"])
+        self.assertNotIn("venmo", seed["created"])
+        types = {m["method_type"] for m in db.list_payment_methods(SHOP, active_only=False)}
+        self.assertEqual(types, {"venmo", "paypal", "zelle"})
+
     def test_create_product_and_audit(self):
         code, data = webpanel.api_product(
             self.tok, {"name": "TB-500", "price": "47", "stock": "8"}
