@@ -182,6 +182,31 @@ def _resolve_shop(v: dict) -> int:
     return 0
 
 
+def get_bot_token_for_shop(shop_chat_id: int) -> str | None:
+    """Return the vendor bot token bound to this shop, or None.
+
+    Customers only ever talk to the vendor storefront bot (not the main SPBC
+    bot), so panel-side DMs must use this token. Matches load_vendor_configs()
+    entries via _resolve_shop (explicit shop_chat_id or invite bind).
+    """
+    try:
+        target = int(db.resolve_shop_chat_id(int(shop_chat_id)))
+    except Exception:
+        target = int(shop_chat_id)
+    for v in load_vendor_configs():
+        token = (v.get("token") or "").strip()
+        if not token:
+            continue
+        try:
+            resolved = _resolve_shop(v)
+        except Exception:
+            log.exception("get_bot_token_for_shop: resolve failed for %s", v.get("name"))
+            continue
+        if resolved and int(resolved) == target:
+            return token
+    return None
+
+
 # ── per-vendor bot ───────────────────────────────────────────────────────────
 
 def _fmt_money(x: float) -> str:
