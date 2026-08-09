@@ -416,7 +416,8 @@ def ensure_miniapp_storefront(
     if not re.fullmatch(r"[0-9a-fA-F]{24}", raw):
         return {"ok": False, "error": "bad_invite_token", "invite": raw_invite}
 
-    # Already bound with a stocked shop? Keep it.
+    # Already bound? Keep only if it still looks like the intended vendor shop.
+    hints_l = [h.lower() for h in (title_hints or []) if h and h.strip()]
     with db.get_db() as conn:
         existing = conn.execute(
             "SELECT * FROM vendor_invites WHERE token_hash = ?", (_hash(raw),)
@@ -425,7 +426,12 @@ def ensure_miniapp_storefront(
         sid = int(existing["shop_chat_id"])
         shop = db.get_shop(sid)
         n = _shop_product_count(sid)
-        if shop and n > 0:
+        title_l = ((shop or {}).get("title") or "").lower()
+        title_ok = (not hints_l) or any(h in title_l for h in hints_l)
+        is_virtual = sid >= db.VIRTUAL_SHOP_BASE
+        # Keep stocked virtual shops or stocked title matches; rebind everything else
+        # (prevents a bad prior bind to the main SPBC "Shop" catalog from sticking).
+        if shop and n > 0 and (is_virtual or title_ok):
             return {
                 "ok": True,
                 "action": "already_bound",
@@ -433,7 +439,14 @@ def ensure_miniapp_storefront(
                 "title": shop.get("title"),
                 "products": n,
             }
-        # Bound to an empty shop — re-resolve (handoff inventory may live elsewhere)
+        log.info(
+            "miniapp rebind: prior shop %s title=%r products=%s title_ok=%s virtual=%s",
+            sid,
+            (shop or {}).get("title"),
+            n,
+            title_ok,
+            is_virtual,
+        )
 
     shop = _find_shop_for_miniapp(shop_chat_id, title_hints)
     if not shop:
