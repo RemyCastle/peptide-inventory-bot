@@ -414,6 +414,83 @@ def format_confirm_payment_dm_line(order_id: int, shop_chat_id: int) -> str:
     return f"✅ Confirm payment: {base}/confirm?ct={raw}"
 
 
+def mint_order_cancel_token(order_id: int, shop_chat_id: int) -> str:
+    """Mint (or reuse) a cancel-only token for one order. Returns raw hex(12).
+
+    Idempotent: a non-expired row for this order_id + action=cancel is reused
+    so re-sending NEW ORDER never multiplies links. Distinct from confirm/track.
+    """
+    ensure_webpanel_tables()
+    oid = int(order_id)
+    sid = int(shop_chat_id)
+    now = _utc_now()
+    now_s = _ts(now)
+    with db.get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT token_plain FROM order_action_tokens
+            WHERE order_id = ? AND action = 'cancel' AND expires_at > ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (oid, now_s),
+        ).fetchone()
+        if row and (row["token_plain"] or "").strip():
+            return str(row["token_plain"]).strip()
+        raw = secrets.token_hex(12)
+        conn.execute(
+            """
+            INSERT INTO order_action_tokens (
+                token_hash, token_plain, order_id, shop_chat_id, action,
+                created_at, expires_at
+            ) VALUES (?, ?, ?, ?, 'cancel', ?, ?)
+            """,
+            (
+                _hash(raw),
+                raw,
+                oid,
+                sid,
+                now_s,
+                _ts(now + timedelta(days=ORDER_TRACK_TOKEN_TTL_DAYS)),
+            ),
+        )
+    return raw
+
+
+def resolve_order_cancel_token(raw: str) -> Optional[dict]:
+    """Valid non-expired cancel token → {order_id, shop_chat_id}; else None."""
+    if not raw or not str(raw).strip():
+        return None
+    ensure_webpanel_tables()
+    with db.get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM order_action_tokens WHERE token_hash = ?",
+            (_hash(str(raw).strip()),),
+        ).fetchone()
+    if not row:
+        return None
+    if str(row["action"] or "") != "cancel":
+        return None
+    if _ts(_utc_now()) > str(row["expires_at"]):
+        return None
+    return {
+        "order_id": int(row["order_id"]),
+        "shop_chat_id": int(row["shop_chat_id"]),
+    }
+
+
+def format_cancel_order_dm_line(order_id: int, shop_chat_id: int) -> str:
+    """Line for NEW ORDER vendor DM, or '' if PANEL_BASE_URL is unset."""
+    base = (PANEL_BASE_URL or "").strip().rstrip("/")
+    if not base:
+        log.info(
+            "PANEL_BASE_URL unset — skip cancel-order link for order %s",
+            order_id,
+        )
+        return ""
+    raw = mint_order_cancel_token(int(order_id), int(shop_chat_id))
+    return f"❌ Cancel order: {base}/cancel?xt={raw}"
+
+
 def panel_url(base_url: str, raw_token: str, mode: str = "") -> str:
     """mode='restock' opens straight into the shipment-receiving view."""
     url = f"{base_url.rstrip('/')}/panel?t={urllib.parse.quote(raw_token)}"
@@ -1461,6 +1538,37 @@ def api_confirm_payment(tok: dict, payload: dict) -> tuple[int, dict]:
     }
 
 
+_PAID_STATUSES_FOR_REFUND_MSG = frozenset({"paid", "shipped", "complete"})
+
+
+def api_cancel_order(tok: dict, payload: dict) -> tuple[int, dict]:
+    """Shop-scoped cancel: pending (no stock) or paid (restore stock)."""
+    chat_id = int(tok["chat_id"])
+    try:
+        order_id = int(payload.get("order_id"))
+    except (TypeError, ValueError):
+        return _err(400, "Bad order id")
+    order = db.get_order(order_id)
+    if not _order_belongs(order, chat_id):
+        return _err(404, "Order not found in your shop")
+    prior_status = str(order.get("status") or "")
+    ok, msg = db.cancel_order_any(order_id, int(tok["user_id"]))
+    if not ok:
+        return _err(400, msg or "Could not cancel order")
+    order = db.get_order(order_id) or order
+    code = (order.get("payment_code") or str(order_id)).strip()
+    text = f"Your order <code>{code}</code> has been cancelled."
+    if prior_status in _PAID_STATUSES_FOR_REFUND_MSG:
+        text += " A refund will be issued to your payment method."
+    notified = notify_order_customer(chat_id, int(order["user_id"]), text)
+    return 200, {
+        "ok": True,
+        "status": "cancelled",
+        "message": msg,
+        "customer_notified": bool(notified),
+    }
+
+
 def api_set_tracking(tok: dict, payload: dict) -> tuple[int, dict]:
     chat_id = int(tok["chat_id"])
     try:
@@ -1617,6 +1725,7 @@ _API_POST = {
     "shop": api_shop,
     "orders": api_orders,
     "confirm_payment": api_confirm_payment,
+    "cancel_order": api_cancel_order,
     "set_tracking": api_set_tracking,
 }
 
@@ -2040,6 +2149,226 @@ def handle_confirm_post(
     return 200, "text/html; charset=utf-8", _confirm_success_html(code, already=False)
 
 
+# ── Standalone cancel-order page (/cancel) ──────────────────────────────────
+# Auth = order_action_tokens action=cancel only. Two-step (GET form → POST).
+# Scoped to one order — cannot cancel other orders or open the admin panel.
+
+_CANCEL_DONE_STATUSES = frozenset({"cancelled", "rejected"})
+_CANCEL_RESTOCK_STATUSES = frozenset({"paid", "shipped", "complete"})
+
+
+def _cancel_expired_html() -> bytes:
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Link expired</title>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;"
+        "padding:0 1rem;color:#222}h1{font-size:1.25rem}</style></head>"
+        "<body><h1>Link expired</h1>"
+        "<p>This cancel-order link is invalid or has expired. "
+        "Open the order from your shop panel instead.</p></body></html>"
+    ).encode("utf-8")
+
+
+def _cancel_success_html(code: str, *, already: bool = False) -> bytes:
+    code_e = html.escape(code)
+    if already:
+        title = "Already cancelled"
+        heading = "Already cancelled"
+        detail = (
+            f"<p>Order <strong>{code_e}</strong> was already cancelled. "
+            "No further action was taken.</p>"
+        )
+    else:
+        title = "Order cancelled"
+        heading = "Order cancelled"
+        detail = (
+            f"<p>Order <strong>{code_e}</strong> has been cancelled. "
+            "If payment had been confirmed, stock was restored and a refund "
+            "message was sent to the customer.</p>"
+        )
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        f"<title>{title}</title>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;"
+        "padding:0 1rem;color:#222}h1{font-size:1.25rem;color:#0a7}</style></head>"
+        f"<body><h1>{heading}</h1>{detail}</body></html>"
+    ).encode("utf-8")
+
+
+def _cancel_error_html(message: str) -> bytes:
+    msg_e = html.escape(message or "Could not cancel order.")
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Could not cancel</title>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;"
+        "padding:0 1rem;color:#222}h1{font-size:1.25rem;color:#a30}"
+        "a{color:#1a73e8}</style></head>"
+        f"<body><h1>Could not cancel</h1><p>{msg_e}</p>"
+        "<p><a href='javascript:history.back()'>Back</a></p></body></html>"
+    ).encode("utf-8")
+
+
+def _cancel_form_html(
+    order: dict, items: list[dict], raw_xt: str, *, already: bool = False
+) -> bytes:
+    code = html.escape(
+        (order.get("payment_code") or str(order.get("id") or "")).strip()
+    )
+    status = html.escape(str(order.get("status") or "—"))
+    ship_name = html.escape((order.get("ship_name") or "").strip() or "—")
+    ship_addr = html.escape((order.get("ship_address") or "").strip() or "—")
+    summary = html.escape(_item_summary(items))
+    total = float(order.get("total") or 0)
+    total_e = html.escape(f"${total:.2f}")
+    xt_e = html.escape(raw_xt)
+    st_raw = str(order.get("status") or "")
+    restock_note = ""
+    if st_raw in _CANCEL_RESTOCK_STATUSES:
+        restock_note = (
+            "<p class=warn>Payment was confirmed — cancelling will restore "
+            "stock and notify the customer about a refund.</p>"
+        )
+    if already:
+        action_block = (
+            "<p class=ok><strong>Already cancelled</strong> — this order is "
+            f"<code>{status}</code>. No further action is needed.</p>"
+        )
+    else:
+        action_block = f"""
+{restock_note}
+<form method=POST action=/cancel>
+  <input type=hidden name=xt value="{xt_e}">
+  <button type=submit>❌ Cancel this order</button>
+</form>
+<p class=muted>This link only cancels this order. It is not the admin panel.
+  Cancel cannot be undone from this page.</p>
+"""
+    body = f"""<!doctype html>
+<html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Cancel order · {code}</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:28rem;margin:2rem auto;padding:0 1rem;color:#222;line-height:1.45}}
+h1{{font-size:1.2rem;margin:0 0 .75rem}}
+.card{{background:#f6f7f9;border-radius:10px;padding:1rem;margin-bottom:1.25rem}}
+.card p{{margin:.35rem 0}}
+button{{margin-top:.5rem;width:100%;padding:.7rem;font-size:1rem;font-weight:600;border:0;border-radius:8px;background:#b4231f;color:#fff}}
+.ok{{color:#0a7}}
+.warn{{color:#a15c00;font-size:.95rem}}
+.muted{{color:#666;font-size:.9rem}}
+</style></head><body>
+<h1>Cancel order</h1>
+<div class=card>
+  <p><strong>Order</strong> {code}</p>
+  <p><strong>Items</strong> {summary}</p>
+  <p><strong>Ship to</strong> {ship_name}<br>{ship_addr.replace(chr(10), '<br>')}</p>
+  <p><strong>Total</strong> {total_e}</p>
+  <p><strong>Status</strong> {status}</p>
+</div>
+{action_block}
+</body></html>"""
+    return body.encode("utf-8")
+
+
+def handle_cancel_get(query: dict) -> tuple[int, str, bytes]:
+    """GET /cancel?xt=… — two-step form for one order, or plain expired page."""
+    raw = (query.get("xt") or [""])[0]
+    tok = resolve_order_cancel_token(raw)
+    if not tok:
+        return 403, "text/html; charset=utf-8", _cancel_expired_html()
+    order = db.get_order(int(tok["order_id"]))
+    if not order or not _order_belongs(order, int(tok["shop_chat_id"])):
+        return 403, "text/html; charset=utf-8", _cancel_expired_html()
+    items = db.get_order_items(int(order["id"]))
+    status = str(order.get("status") or "")
+    already = status in _CANCEL_DONE_STATUSES
+    return (
+        200,
+        "text/html; charset=utf-8",
+        _cancel_form_html(order, items, str(raw).strip(), already=already),
+    )
+
+
+def handle_cancel_post(
+    payload: dict, *, wants_json: bool = False
+) -> tuple[int, str, bytes]:
+    """POST /cancel — cancel the token's order only; notify customer."""
+    raw = str(payload.get("xt") or "").strip()
+    tok = resolve_order_cancel_token(raw)
+    if not tok:
+        if wants_json:
+            return (
+                403,
+                "application/json",
+                json.dumps({"ok": False, "error": "link_expired"}).encode("utf-8"),
+            )
+        return 403, "text/html; charset=utf-8", _cancel_expired_html()
+
+    order_id = int(tok["order_id"])
+    shop_chat_id = int(tok["shop_chat_id"])
+    order = db.get_order(order_id)
+    if not order or not _order_belongs(order, shop_chat_id):
+        if wants_json:
+            return (
+                403,
+                "application/json",
+                json.dumps({"ok": False, "error": "link_expired"}).encode("utf-8"),
+            )
+        return 403, "text/html; charset=utf-8", _cancel_expired_html()
+
+    code = (order.get("payment_code") or str(order_id)).strip()
+    prior_status = str(order.get("status") or "")
+    if prior_status in _CANCEL_DONE_STATUSES:
+        if wants_json:
+            body = {
+                "ok": True,
+                "already_cancelled": True,
+                "order_id": order_id,
+                "status": prior_status,
+                "message": f"Order already {prior_status}.",
+            }
+            return 200, "application/json", json.dumps(body).encode("utf-8")
+        return (
+            200,
+            "text/html; charset=utf-8",
+            _cancel_success_html(code, already=True),
+        )
+
+    ok, msg = db.cancel_order_any(order_id, 0)
+    if not ok:
+        if wants_json:
+            return (
+                400,
+                "application/json",
+                json.dumps(
+                    {"ok": False, "error": "cancel_failed", "message": msg or ""}
+                ).encode("utf-8"),
+            )
+        return 400, "text/html; charset=utf-8", _cancel_error_html(msg or "")
+
+    order = db.get_order(order_id) or order
+    code = (order.get("payment_code") or str(order_id)).strip()
+    text = f"Your order <code>{code}</code> has been cancelled."
+    if prior_status in _PAID_STATUSES_FOR_REFUND_MSG:
+        text += " A refund will be issued to your payment method."
+    notified = notify_order_customer(shop_chat_id, int(order["user_id"]), text)
+
+    if wants_json:
+        body = {
+            "ok": True,
+            "already_cancelled": False,
+            "order_id": order_id,
+            "status": "cancelled",
+            "message": msg,
+            "customer_notified": bool(notified),
+        }
+        return 200, "application/json", json.dumps(body).encode("utf-8")
+    return 200, "text/html; charset=utf-8", _cancel_success_html(code, already=False)
+
+
 # ── HTTP layer (called from spbc_notify's request handler) ──────────────────
 
 def handle_panel_get(path: str, query: dict) -> tuple[int, str, bytes]:
@@ -2216,6 +2545,8 @@ function defaultRange(){
 function orderCard(o){
   const st=o.status||'';
   const canConfirm=st==='pending_payment'||st==='awaiting_confirmation';
+  const canCancel=st==='pending_payment'||st==='awaiting_confirmation'
+    ||st==='paid'||st==='shipped'||st==='complete';
   const canShip=st==='paid'||st==='shipped'||st==='awaiting_confirmation';
   // tracking only after paid (server also enforces)
   const showTrack=st==='paid'||st==='shipped'||st==='complete';
@@ -2232,7 +2563,10 @@ function orderCard(o){
           ${o.shipping_fee?`<span class="tag">ship ${money(o.shipping_fee)}</span>`:''}
         </div>
       </div>
-      ${canConfirm?`<button class="b-confirm" data-oid="${o.id}">Confirm payment</button>`:''}
+      <div class="flex" style="gap:6px;flex-wrap:wrap">
+        ${canConfirm?`<button class="b-confirm" data-oid="${o.id}">Confirm payment</button>`:''}
+        ${canCancel?`<button class="danger b-cancel" data-oid="${o.id}">Cancel order</button>`:''}
+      </div>
     </div>
     ${showTrack?`<div class="row" style="margin-top:10px">
       <div class="num" style="max-width:120px"><label>Carrier</label>
@@ -2500,6 +2834,15 @@ function wire(){
       const note=d.customer_notified===false
         ? 'Payment confirmed (could not message customer)'
         : 'Payment confirmed — customer notified';
+      toast(note);await loadOrders();render();};});
+  document.querySelectorAll('.b-cancel').forEach(btn=>{
+    btn.onclick=async()=>{
+      if(!confirm('Cancel this order? This cannot be undone.'))return;
+      const d=await api('cancel_order',{order_id:btn.dataset.oid});
+      if(!d.ok)return;
+      const note=d.customer_notified===false
+        ? 'Order cancelled (could not message customer)'
+        : 'Order cancelled — customer notified';
       toast(note);await loadOrders();render();};});
   document.querySelectorAll('.b-ship').forEach(btn=>{
     btn.onclick=async()=>{
