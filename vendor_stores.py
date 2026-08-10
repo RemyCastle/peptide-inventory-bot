@@ -203,6 +203,213 @@ def format_new_order_ship_section(ship_name: str, ship_address: str) -> str:
     return "⚠️ No address provided — contact the customer"
 
 
+def build_new_order_notify_text(
+    order: dict,
+    *,
+    shop_name: str = "",
+    emoji: str = "\U0001f6cd",
+    order_lines: list[dict] | None = None,
+) -> str:
+    """Full NEW ORDER vendor/owner DM text (plain). Shared by on_web_app_data + /resend.
+
+    Includes items, total, ship-to, and both confirm+track links when PANEL_BASE_URL
+    is set (mint/reuse tokens via webpanel).
+    """
+    oid = int(order["id"])
+    code = order.get("payment_code") or f"#{oid}"
+    full_name = (order.get("full_name") or "").strip() or "Customer"
+    username = (order.get("username") or "").strip() or "—"
+    user_id = order.get("user_id") or "—"
+    shop_label = (shop_name or "").strip() or "the shop"
+
+    if order_lines is None:
+        order_lines = db.get_order_items(oid)
+    plain_lines = [
+        f"  • {ln['product_name']} × {ln['quantity']} — {_fmt_money(ln['line_total'])}"
+        for ln in (order_lines or [])
+    ]
+    if order.get("shipping_fee"):
+        plain_lines.append(f"  • Shipping — {_fmt_money(order['shipping_fee'])}")
+
+    total_txt = _fmt_money(order.get("total", 0))
+    ship_notify = format_new_order_ship_section(
+        (order.get("ship_name") or "").strip(),
+        (order.get("ship_address") or "").strip(),
+    )
+
+    confirm_line = ""
+    track_line = ""
+    try:
+        import webpanel as _webpanel
+
+        shop_chat_id = int(order["chat_id"])
+        confirm_line = _webpanel.format_confirm_payment_dm_line(oid, shop_chat_id)
+        track_line = _webpanel.format_add_tracking_dm_line(oid, shop_chat_id)
+    except Exception:
+        log.exception(
+            "mint order action links failed for order %s", order.get("id")
+        )
+
+    note = (
+        f"{emoji} NEW ORDER {code} — {shop_label}\n"
+        f"From: {full_name} (@{username}, id {user_id})\n"
+        + "\n".join(plain_lines)
+        + f"\nTotal: {total_txt}\n"
+        + ship_notify
+    )
+    if confirm_line:
+        note = note + "\n" + confirm_line
+    if track_line:
+        note = note + "\n" + track_line
+    return note
+
+
+async def notify_order_recipient(
+    shop_chat_id,
+    recipient_id,
+    text: str,
+    context=None,
+) -> bool:
+    """Deliver one NEW ORDER DM: vendor storefront bot first, then main SPBC bot.
+
+    Recipients may have /start'd *either* the shop's vendor bot or @SPBCOrderBot
+    (claim link). Trying both avoids silent failure when only one is opened.
+
+    1) get_bot_token_for_shop → webpanel.telegram_send_with_token (parse_mode=None)
+    2) On fail/False → spbc_notify.send_telegram (main bot)
+
+    Both sends are sync HTTP; run via asyncio.to_thread. Never raises.
+    ``context`` is accepted for call-site flexibility (unused; delivery is token-based).
+    """
+    _ = context
+    try:
+        rid = int(recipient_id)
+        shop = int(shop_chat_id)
+    except (TypeError, ValueError):
+        log.warning(
+            "notify_order_recipient: bad ids shop=%r recipient=%r",
+            shop_chat_id,
+            recipient_id,
+        )
+        return False
+
+    # 1) Vendor storefront bot token
+    vendor_ok = False
+    try:
+        import webpanel as _webpanel
+
+        token = get_bot_token_for_shop(shop)
+        if token:
+            vendor_ok = bool(
+                await asyncio.to_thread(
+                    _webpanel.telegram_send_with_token,
+                    token,
+                    rid,
+                    text,
+                    parse_mode=None,
+                )
+            )
+            if vendor_ok:
+                log.info(
+                    "notify_order_recipient: delivered via vendor bot shop=%s to=%s",
+                    shop,
+                    rid,
+                )
+                return True
+            log.info(
+                "notify_order_recipient: vendor bot send failed shop=%s to=%s; "
+                "trying main bot",
+                shop,
+                rid,
+            )
+        else:
+            log.info(
+                "notify_order_recipient: no vendor token for shop=%s; trying main bot",
+                shop,
+            )
+    except Exception:
+        log.exception(
+            "notify_order_recipient: vendor path error shop=%s to=%s",
+            shop,
+            rid,
+        )
+
+    # 2) Main bot fallback (@SPBCOrderBot / pool token)
+    try:
+        import spbc_notify
+
+        await asyncio.to_thread(spbc_notify.send_telegram, rid, text)
+        log.info(
+            "notify_order_recipient: delivered via main bot shop=%s to=%s",
+            shop,
+            rid,
+        )
+        return True
+    except Exception as e:
+        log.warning(
+            "notify_order_recipient: both paths failed shop=%s to=%s: %s",
+            shop,
+            rid,
+            e,
+        )
+        return False
+
+
+def vendor_meta_for_shop(shop_chat_id: int) -> dict:
+    """Brand + configured notify_ids for a shop (from vendor config or shop title)."""
+    try:
+        target = int(db.resolve_shop_chat_id(int(shop_chat_id)))
+    except Exception:
+        target = int(shop_chat_id)
+    for v in load_vendor_configs():
+        token = (v.get("token") or "").strip()
+        if not token:
+            continue
+        try:
+            resolved = _resolve_shop(v)
+        except Exception:
+            continue
+        if resolved and int(resolved) == target:
+            raw_ids = v.get("notify_ids") or []
+            ids: list[int] = []
+            for x in raw_ids:
+                try:
+                    ids.append(int(x))
+                except (TypeError, ValueError):
+                    continue
+            return {
+                "name": (v.get("name") or "").strip() or "the shop",
+                "emoji": (v.get("emoji") or "\U0001f6cd"),
+                "notify_ids": ids,
+            }
+    shop = db.get_shop(target) or {}
+    return {
+        "name": (shop.get("title") or "").strip() or "the shop",
+        "emoji": "\U0001f6cd",
+        "notify_ids": [],
+    }
+
+
+def base_notify_ids_for_shop(shop_chat_id: int) -> list[int]:
+    """Configured notify_ids + owner (same base set as on_web_app_data)."""
+    meta = vendor_meta_for_shop(shop_chat_id)
+    return list(dict.fromkeys([*meta["notify_ids"], *_owner_ids()]))
+
+
+def find_order_for_resend(key: str) -> dict | None:
+    """Look up an order by payment_code or numeric id (optional leading #)."""
+    raw = (key or "").strip()
+    if not raw:
+        return None
+    # Numeric id (allow #123)
+    id_part = raw[1:] if raw.startswith("#") and len(raw) > 1 else raw
+    if id_part.isdigit():
+        order = db.get_order(int(id_part))
+        if order:
+            return order
+    return db.get_order_by_payment_code(raw)
+
+
 # ── configuration ────────────────────────────────────────────────────────────
 
 def _owner_ids() -> list[int]:
@@ -482,44 +689,17 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
             except Exception as e2:
                 log.warning("[%s] plain customer confirm also failed: %s", name, e2)
 
-        ship_notify = format_new_order_ship_section(ship_name, ship_address)
-
-        # Narrow per-order action links (not admin panel). Skip if no public URL.
-        confirm_line = ""
-        track_line = ""
-        try:
-            import webpanel as _webpanel
-
-            confirm_line = _webpanel.format_confirm_payment_dm_line(
-                int(order["id"]), shop_chat_id
-            )
-            track_line = _webpanel.format_add_tracking_dm_line(
-                int(order["id"]), shop_chat_id
-            )
-        except Exception:
-            log.exception(
-                "[%s] mint order action links failed for order %s",
-                name,
-                order.get("id"),
-            )
-
-        note = (
-            f"{emoji} NEW ORDER {code} — {name}\n"
-            f"From: {user.full_name} (@{user.username}, id {user.id})\n"
-            + "\n".join(plain_lines)
-            + f"\nTotal: {total_txt}\n"
-            + ship_notify
+        # Owner/vendor NEW ORDER: try vendor storefront bot, then main bot.
+        # Recipients may have started either bot (storefront or claim via SPBC).
+        note = build_new_order_notify_text(
+            order,
+            shop_name=name,
+            emoji=emoji,
+            order_lines=order_lines,
         )
-        if confirm_line:
-            note = note + "\n" + confirm_line
-        if track_line:
-            note = note + "\n" + track_line
         recipients = build_notify_recipient_ids(notify_ids, shop_chat_id)
         for nid in recipients:
-            try:
-                await context.bot.send_message(nid, note)
-            except Exception as e:
-                log.warning("[%s] notify %s failed: %s", name, nid, e)
+            await notify_order_recipient(shop_chat_id, nid, note, context=context)
 
     app = Application.builder().token(v["token"]).build()
     app.add_handler(CommandHandler("start", cmd_start))
