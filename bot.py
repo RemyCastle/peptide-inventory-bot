@@ -3081,6 +3081,9 @@ async def cmd_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"  Week `{i['week_start']}` → `{i['week_end']}`"
             )
         lines.append(f"\n*Open total: {money(total_open)}*")
+    from config import MASTER_VENMO
+
+    lines.append(f"\nPay via Venmo: {MASTER_VENMO}")
     lines.append("\nMark paid via /master → Open invoices.")
     text = "\n".join(lines)
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -3298,6 +3301,8 @@ async def cb_master_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE)
         text = "No open invoices. Generate weekly invoices first."
         buttons = [[InlineKeyboardButton("« Master", callback_data="master_home")]]
     else:
+        from config import MASTER_VENMO
+
         lines = ["📬 *Open service-fee invoices*\n"]
         buttons = []
         for i in invs:
@@ -3314,6 +3319,7 @@ async def cb_master_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     )
                 ]
             )
+        lines.append(f"\nPay via Venmo: {MASTER_VENMO}")
         buttons.append([InlineKeyboardButton("« Master", callback_data="master_home")])
         text = "\n".join(lines)
     await safe_edit(query, text, InlineKeyboardMarkup(buttons))
