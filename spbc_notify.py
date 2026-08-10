@@ -888,6 +888,14 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
             code, ctype, body = webpanel.handle_confirm_get(query)
             self._send_raw(code, ctype, body)
             return
+        if path == "/cancel":
+            # Narrow order-action token auth (xt=). Cancel order only (two-step).
+            import webpanel
+
+            query = urllib.parse.parse_qs(parsed.query)
+            code, ctype, body = webpanel.handle_cancel_get(query)
+            self._send_raw(code, ctype, body)
+            return
         if path.startswith("/panel"):
             import webpanel
 
@@ -970,6 +978,25 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
                     )
                 return
             code, ctype, body = webpanel.handle_confirm_post(
+                payload, wants_json=wants_json
+            )
+            self._send_raw(code, ctype, body)
+            return
+        if path == "/cancel":
+            import webpanel
+
+            payload, wants_json = self._read_form_or_json()
+            if payload is None:
+                if wants_json:
+                    self._json(400, {"ok": False, "error": "bad_body"})
+                else:
+                    self._send_raw(
+                        400,
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><body><p>Bad request.</p></body></html>",
+                    )
+                return
+            code, ctype, body = webpanel.handle_cancel_post(
                 payload, wants_json=wants_json
             )
             self._send_raw(code, ctype, body)

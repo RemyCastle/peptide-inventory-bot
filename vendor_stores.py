@@ -212,8 +212,8 @@ def build_new_order_notify_text(
 ) -> str:
     """Full NEW ORDER vendor/owner DM text (plain). Shared by on_web_app_data + /resend.
 
-    Includes items, total, ship-to, and both confirm+track links when PANEL_BASE_URL
-    is set (mint/reuse tokens via webpanel).
+    Includes items, total, ship-to, and confirm+track+cancel links when
+    PANEL_BASE_URL is set (mint/reuse tokens via webpanel).
     """
     oid = int(order["id"])
     code = order.get("payment_code") or f"#{oid}"
@@ -239,12 +239,14 @@ def build_new_order_notify_text(
 
     confirm_line = ""
     track_line = ""
+    cancel_line = ""
     try:
         import webpanel as _webpanel
 
         shop_chat_id = int(order["chat_id"])
         confirm_line = _webpanel.format_confirm_payment_dm_line(oid, shop_chat_id)
         track_line = _webpanel.format_add_tracking_dm_line(oid, shop_chat_id)
+        cancel_line = _webpanel.format_cancel_order_dm_line(oid, shop_chat_id)
     except Exception:
         log.exception(
             "mint order action links failed for order %s", order.get("id")
@@ -261,6 +263,8 @@ def build_new_order_notify_text(
         note = note + "\n" + confirm_line
     if track_line:
         note = note + "\n" + track_line
+    if cancel_line:
+        note = note + "\n" + cancel_line
     return note
 
 
