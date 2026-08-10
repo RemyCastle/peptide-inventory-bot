@@ -48,5 +48,10 @@ Append-only log. Newest at bottom.
 - Decision: Mini-app ship address — parse optional `ship` from web_app_data into ship_name/address/notes (phone in notes as `Phone: … · via mini app`); customer confirm + NEW ORDER text show address (Markdown-escaped); missing address warns on NEW ORDER notify. Notify recipients = configured notify_ids ∪ db.list_admins(shop). Panel `_order_public` + history .txt expose ship fields. Did not touch storefront_keys, fail-closed bind, run_cloud payment seeding, or store HTML.
 - Why: Store now sends ship object; vendor who claimed shop must get order DMs without manual notify_ids
 - Tests: 298 pass on scratch DB_PATH; tests/test_vendor_stores_ship.py
+
+### 2026-08-09
+- Decision: Automatic weekly vendor billing — `service_fee_invoices.vendor_notified_at` (NULL = not DM'd); `franchise.bill_previous_complete_week` (week_offset=-1 only); `autobiller` daemon thread (~hourly, boot delay 45s) started from `run_cloud.main` with full try/except isolation; vendor DMs via main-bot `spbc_notify.send_telegram` to `db.list_admins`; stamp only after successful send; owner summary on notify wave; `MASTER_VENMO` config default `@remycastle` on vendor DM + `/invoices` + open-invoices view. Does not touch storefront_keys, fail-closed bind, payment-seeding, store HTML, or order-receiver order logic.
+- Why: Platform fees for previous complete UTC week without manual /invoices every Monday; restart/catch-up safe via unique(shop,week) + vendor_notified_at
+- Tests: 325 pass on scratch DB_PATH; tests/test_autobiller.py
 - Why: Feature brief for magic-link panel order ops
 - Tests: 282 pass on scratch DB; tests/test_panel_orders.py
