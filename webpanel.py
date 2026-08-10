@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import logging
 import re
@@ -40,7 +41,9 @@ log = logging.getLogger("webpanel")
 
 TOKEN_TTL_HOURS = 72
 INVITE_TTL_HOURS = 14 * 24
+ORDER_TRACK_TOKEN_TTL_DAYS = 60
 MAX_BULK_BYTES = 100_000
+TRACK_CARRIERS = ("UPS", "USPS", "FedEx", "DHL", "Other")
 
 # ── Uploads (product photos + COA files) ────────────────────────────────────
 MAX_UPLOAD_BYTES = 6 * 1024 * 1024
@@ -185,6 +188,20 @@ def ensure_webpanel_tables() -> None:
                 shop_chat_id INTEGER NOT NULL UNIQUE,
                 created_at   TEXT NOT NULL
             );
+            -- Narrow per-order capability (e.g. add tracking). Separate from
+            -- web_tokens / vendor_invites / storefront_keys. token_plain stored
+            -- so the vendor DM can embed the low-power link.
+            CREATE TABLE IF NOT EXISTS order_action_tokens (
+                token_hash   TEXT PRIMARY KEY,
+                token_plain  TEXT NOT NULL,
+                order_id     INTEGER NOT NULL,
+                shop_chat_id INTEGER NOT NULL,
+                action       TEXT NOT NULL DEFAULT 'track',
+                created_at   TEXT NOT NULL,
+                expires_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_order_action_tokens_order
+                ON order_action_tokens (order_id, action);
             """
         )
         cols = {
@@ -242,6 +259,82 @@ def resolve_token(raw: str) -> Optional[dict]:
     if _ts(_utc_now()) > str(row["expires_at"]):
         return None
     return {"chat_id": int(row["chat_id"]), "user_id": int(row["user_id"])}
+
+
+def mint_order_tracking_token(order_id: int, shop_chat_id: int) -> str:
+    """Mint (or reuse) a track-only token for one order. Returns raw hex(12).
+
+    Idempotent: a non-expired row for this order_id + action=track is reused
+    so re-sending NEW ORDER never multiplies links.
+    """
+    ensure_webpanel_tables()
+    oid = int(order_id)
+    sid = int(shop_chat_id)
+    now = _utc_now()
+    now_s = _ts(now)
+    with db.get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT token_plain FROM order_action_tokens
+            WHERE order_id = ? AND action = 'track' AND expires_at > ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (oid, now_s),
+        ).fetchone()
+        if row and (row["token_plain"] or "").strip():
+            return str(row["token_plain"]).strip()
+        raw = secrets.token_hex(12)
+        conn.execute(
+            """
+            INSERT INTO order_action_tokens (
+                token_hash, token_plain, order_id, shop_chat_id, action,
+                created_at, expires_at
+            ) VALUES (?, ?, ?, ?, 'track', ?, ?)
+            """,
+            (
+                _hash(raw),
+                raw,
+                oid,
+                sid,
+                now_s,
+                _ts(now + timedelta(days=ORDER_TRACK_TOKEN_TTL_DAYS)),
+            ),
+        )
+    return raw
+
+
+def resolve_order_tracking_token(raw: str) -> Optional[dict]:
+    """Valid non-expired track token → {order_id, shop_chat_id}; else None."""
+    if not raw or not str(raw).strip():
+        return None
+    ensure_webpanel_tables()
+    with db.get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM order_action_tokens WHERE token_hash = ?",
+            (_hash(str(raw).strip()),),
+        ).fetchone()
+    if not row:
+        return None
+    if str(row["action"] or "track") != "track":
+        return None
+    if _ts(_utc_now()) > str(row["expires_at"]):
+        return None
+    return {
+        "order_id": int(row["order_id"]),
+        "shop_chat_id": int(row["shop_chat_id"]),
+    }
+
+
+def format_add_tracking_dm_line(order_id: int, shop_chat_id: int) -> str:
+    """Line for NEW ORDER vendor DM, or '' if PANEL_BASE_URL is unset."""
+    base = (PANEL_BASE_URL or "").strip().rstrip("/")
+    if not base:
+        log.info(
+            "PANEL_BASE_URL unset — skip tracking link for order %s", order_id
+        )
+        return ""
+    raw = mint_order_tracking_token(int(order_id), int(shop_chat_id))
+    return f"➕ Add tracking: {base}/track?ot={raw}"
 
 
 def panel_url(base_url: str, raw_token: str, mode: str = "") -> str:
@@ -1420,6 +1513,215 @@ _API_POST = {
     "confirm_payment": api_confirm_payment,
     "set_tracking": api_set_tracking,
 }
+
+
+# ── Standalone order-tracking page (/track) ─────────────────────────────────
+# Auth = order_action_tokens only. Never the admin panel magic-link. Scoped to
+# one order + action=track — cannot touch other orders, prices, or the panel.
+
+def _track_expired_html() -> bytes:
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Link expired</title>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;"
+        "padding:0 1rem;color:#222}h1{font-size:1.25rem}</style></head>"
+        "<body><h1>Link expired</h1>"
+        "<p>This tracking link is invalid or has expired. "
+        "Open the order from your shop panel instead.</p></body></html>"
+    ).encode("utf-8")
+
+
+def _track_success_html(code: str, carrier: str, tn: str, url: str | None) -> bytes:
+    code_e = html.escape(code)
+    car_e = html.escape(carrier or "—")
+    tn_e = html.escape(tn)
+    link = (
+        f'<p><a href="{html.escape(url)}">Open tracking page</a></p>'
+        if url
+        else ""
+    )
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Tracking saved</title>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;"
+        "padding:0 1rem;color:#222}h1{font-size:1.25rem;color:#0a7}</style></head>"
+        f"<body><h1>Tracking saved</h1>"
+        f"<p>Order <strong>{code_e}</strong> · {car_e} · <code>{tn_e}</code></p>"
+        f"{link}"
+        "<p>The customer was notified if their chat is open with your store bot.</p>"
+        "</body></html>"
+    ).encode("utf-8")
+
+
+def _track_form_html(order: dict, items: list[dict], raw_ot: str) -> bytes:
+    code = html.escape(
+        (order.get("payment_code") or str(order.get("id") or "")).strip()
+    )
+    status = html.escape(str(order.get("status") or "—"))
+    ship_name = html.escape((order.get("ship_name") or "").strip() or "—")
+    ship_addr = html.escape((order.get("ship_address") or "").strip() or "—")
+    cur_car = (order.get("tracking_carrier") or "").strip()
+    cur_tn = (order.get("tracking_number") or "").strip()
+    summary = html.escape(_item_summary(items))
+    ot_e = html.escape(raw_ot)
+    options = []
+    for c in TRACK_CARRIERS:
+        sel = " selected" if c.lower() == cur_car.lower() else ""
+        options.append(f'<option value="{html.escape(c)}"{sel}>{html.escape(c)}</option>')
+    existing = ""
+    if cur_tn:
+        existing = (
+            f"<p class=cur>Current: <strong>{html.escape(cur_car or '—')}</strong> "
+            f"<code>{html.escape(cur_tn)}</code> — you can update below.</p>"
+        )
+    body = f"""<!doctype html>
+<html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Add tracking · {code}</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:28rem;margin:2rem auto;padding:0 1rem;color:#222;line-height:1.45}}
+h1{{font-size:1.2rem;margin:0 0 .75rem}}
+.card{{background:#f6f7f9;border-radius:10px;padding:1rem;margin-bottom:1.25rem}}
+.card p{{margin:.35rem 0}}
+label{{display:block;font-weight:600;margin:.75rem 0 .3rem}}
+select,input{{width:100%;box-sizing:border-box;padding:.55rem .65rem;font-size:1rem;border:1px solid #ccc;border-radius:8px}}
+button{{margin-top:1rem;width:100%;padding:.7rem;font-size:1rem;font-weight:600;border:0;border-radius:8px;background:#1a73e8;color:#fff}}
+.cur{{color:#555;font-size:.95rem}}
+.muted{{color:#666;font-size:.9rem}}
+</style></head><body>
+<h1>Add tracking</h1>
+<div class=card>
+  <p><strong>Order</strong> {code}</p>
+  <p><strong>Items</strong> {summary}</p>
+  <p><strong>Ship to</strong> {ship_name}<br>{ship_addr.replace(chr(10), '<br>')}</p>
+  <p><strong>Status</strong> {status}</p>
+  {existing}
+</div>
+<form method=POST action=/track>
+  <input type=hidden name=ot value="{ot_e}">
+  <label for=carrier>Carrier</label>
+  <select id=carrier name=carrier required>
+    {''.join(options)}
+  </select>
+  <label for=tracking_number>Tracking number</label>
+  <input id=tracking_number name=tracking_number required autocomplete=off
+         value="{html.escape(cur_tn)}" placeholder="e.g. 1Z… or 9400…">
+  <button type=submit>Save tracking</button>
+</form>
+<p class=muted>This link only adds tracking for this order. It is not the admin panel.</p>
+</body></html>"""
+    return body.encode("utf-8")
+
+
+def handle_track_get(query: dict) -> tuple[int, str, bytes]:
+    """GET /track?ot=… — form for one order, or plain expired page."""
+    raw = (query.get("ot") or [""])[0]
+    tok = resolve_order_tracking_token(raw)
+    if not tok:
+        return 403, "text/html; charset=utf-8", _track_expired_html()
+    order = db.get_order(int(tok["order_id"]))
+    if not order or not _order_belongs(order, int(tok["shop_chat_id"])):
+        return 403, "text/html; charset=utf-8", _track_expired_html()
+    items = db.get_order_items(int(order["id"]))
+    return 200, "text/html; charset=utf-8", _track_form_html(order, items, str(raw).strip())
+
+
+def handle_track_post(
+    payload: dict, *, wants_json: bool = False
+) -> tuple[int, str, bytes]:
+    """POST /track — set tracking for the token's order only; notify customer."""
+    raw = str(payload.get("ot") or "").strip()
+    carrier = str(payload.get("carrier") or "").strip()
+    tracking_number = str(payload.get("tracking_number") or "").strip()
+    tok = resolve_order_tracking_token(raw)
+    if not tok:
+        if wants_json:
+            return (
+                403,
+                "application/json",
+                json.dumps({"ok": False, "error": "link_expired"}).encode("utf-8"),
+            )
+        return 403, "text/html; charset=utf-8", _track_expired_html()
+    if not tracking_number:
+        if wants_json:
+            return (
+                400,
+                "application/json",
+                json.dumps(
+                    {"ok": False, "error": "tracking_number_required"}
+                ).encode("utf-8"),
+            )
+        return (
+            400,
+            "text/html; charset=utf-8",
+            (
+                "<!doctype html><html><body><p>Tracking number required.</p>"
+                "<p><a href='javascript:history.back()'>Back</a></p></body></html>"
+            ).encode("utf-8"),
+        )
+
+    order_id = int(tok["order_id"])
+    shop_chat_id = int(tok["shop_chat_id"])
+    order = db.get_order(order_id)
+    if not order or not _order_belongs(order, shop_chat_id):
+        if wants_json:
+            return (
+                403,
+                "application/json",
+                json.dumps({"ok": False, "error": "link_expired"}).encode("utf-8"),
+            )
+        return 403, "text/html; charset=utf-8", _track_expired_html()
+
+    if not db.set_order_tracking(order_id, tracking_number, carrier or None):
+        if wants_json:
+            return (
+                400,
+                "application/json",
+                json.dumps({"ok": False, "error": "could_not_save"}).encode("utf-8"),
+            )
+        return (
+            400,
+            "text/html; charset=utf-8",
+            b"<!doctype html><html><body><p>Could not save tracking.</p></body></html>",
+        )
+
+    status = str(order.get("status") or "")
+    if status == "paid":
+        ship_ok, ship_msg = db.mark_order_shipped(order_id)
+        if not ship_ok and "already" not in (ship_msg or "").lower():
+            log.warning(
+                "track page: mark_order_shipped failed order=%s: %s",
+                order_id,
+                ship_msg,
+            )
+
+    order = db.get_order(order_id) or order
+    code = (order.get("payment_code") or str(order_id)).strip()
+    car = (order.get("tracking_carrier") or carrier or "").strip() or "—"
+    tn = (order.get("tracking_number") or tracking_number).strip()
+    url = tracking_url(car if car != "—" else None, tn)
+    text = (
+        f"📦 Your order <code>{code}</code> has shipped! "
+        f"Carrier: {car} · Tracking: {tn}"
+    )
+    if url:
+        text += f"\n🔗 {url}"
+    notified = notify_order_customer(shop_chat_id, int(order["user_id"]), text)
+
+    if wants_json:
+        body = {
+            "ok": True,
+            "order_id": order_id,
+            "status": order.get("status") or "",
+            "tracking_number": tn,
+            "tracking_carrier": "" if car == "—" else car,
+            "tracking_url": url,
+            "customer_notified": bool(notified),
+        }
+        return 200, "application/json", json.dumps(body).encode("utf-8")
+    return 200, "text/html; charset=utf-8", _track_success_html(code, car, tn, url)
 
 
 # ── HTTP layer (called from spbc_notify's request handler) ──────────────────
