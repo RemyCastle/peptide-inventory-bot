@@ -48,6 +48,7 @@ import setup_wizard
 import site_sync
 import spbc_notify
 import token_pool
+import vendor_stores
 import webpanel
 from config import (
     ACTIVE_BOT_INDEX,
@@ -6414,6 +6415,49 @@ def build_rescue_kit(bot_username: str, shops: list[dict]) -> str:
     return "\n".join(lines)
 
 
+async def cmd_resend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """OWNER_IDS only: rebuild and re-DM the NEW ORDER notice for an order.
+
+    Usage: /resend <payment_code or order_id>
+    Uses the same text builder + dual-bot delivery as mini-app checkout.
+    """
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await update.message.reply_text("Owners only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: /resend <payment_code or order_id>\n"
+            "Example: /resend UF12 or /resend 12"
+        )
+        return
+    key = " ".join(args).strip()
+    order = vendor_stores.find_order_for_resend(key)
+    if not order:
+        await update.message.reply_text(
+            f"No order found for {key!r}. Try payment code (e.g. UF12) or numeric id."
+        )
+        return
+    shop_chat_id = int(order["chat_id"])
+    note = vendor_stores.build_new_order_notify_text(order)
+    recipients = vendor_stores.build_notify_recipient_ids(
+        vendor_stores.base_notify_ids_for_shop(shop_chat_id),
+        shop_chat_id,
+    )
+    delivered = 0
+    for nid in recipients:
+        ok = await vendor_stores.notify_order_recipient(
+            shop_chat_id, nid, note, context=context
+        )
+        if ok:
+            delivered += 1
+    code = order.get("payment_code") or f"#{order['id']}"
+    await update.message.reply_text(
+        f"Resent {code} to {len(recipients)} recipient(s) (delivered: {delivered})."
+    )
+
+
 async def cmd_rescue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner: recovery kit for getting everyone back after a ban/token swap."""
     user = update.effective_user
@@ -6843,6 +6887,7 @@ async def post_init(app: Application) -> None:
         BotCommand("newvendor", "Build a vendor's shop (owner)"),
         BotCommand("handover", "Hand a built shop to its vendor (owner)"),
         BotCommand("rescue", "Recovery kit after a ban (owner)"),
+        BotCommand("resend", "Re-DM NEW ORDER notice (owner)"),
         BotCommand("syncsite", "Pull the SPBC site catalog (owner)"),
         BotCommand("master", "Master fees/invoices (owner)"),
         BotCommand("invoices", "Generate + list weekly invoices (owner)"),
@@ -7172,6 +7217,7 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("restock", cmd_restock))
     app.add_handler(CommandHandler("rescue", cmd_rescue))
+    app.add_handler(CommandHandler("resend", cmd_resend))
     app.add_handler(CallbackQueryHandler(cb_adm_sites, pattern=r"^adm_sites$"))
     app.add_handler(CallbackQueryHandler(cb_sitesync, pattern=r"^sitesync:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_siterm, pattern=r"^siterm:\d+$"))
