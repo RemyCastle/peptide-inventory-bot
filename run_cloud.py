@@ -138,6 +138,15 @@ def main() -> None:
 
     vendor_stores.start_all()
 
+    # Weekly vendor service-fee autobiller (reads orders + writes invoices only).
+    # Isolated daemon — must never block bot startup or order handling.
+    try:
+        import autobiller
+
+        autobiller.start_autobiller(daemon=True)
+    except Exception:
+        log.exception("autobiller start failed (continuing boot)")
+
     import bot
 
     bot.main()
