@@ -91,6 +91,8 @@ def ensure_franchise_tables() -> None:
                 note            TEXT,
                 created_at      TEXT NOT NULL,
                 paid_at         TEXT,
+                vendor_notified_at TEXT,
+                -- NULL = vendor not yet DM'd this invoice
                 UNIQUE(chat_id, week_start, week_end)
             );
 
@@ -102,6 +104,15 @@ def ensure_franchise_tables() -> None:
                 ON service_fee_invoices(status, chat_id);
             """
         )
+        # Redeploy-safe: existing DBs created before vendor_notified_at
+        icols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(service_fee_invoices)").fetchall()
+        }
+        if "vendor_notified_at" not in icols:
+            conn.execute(
+                "ALTER TABLE service_fee_invoices ADD COLUMN vendor_notified_at TEXT"
+            )
 
 
 def is_franchisee_shop(chat_id: int) -> bool:
@@ -570,7 +581,11 @@ def _week_bounds(
 
 
 def generate_weekly_invoices(
-    by_user: int, *, ref: datetime | None = None, week_offset: int = 0
+    by_user: int,
+    *,
+    ref: datetime | None = None,
+    week_offset: int = 0,
+    system: bool = False,
 ) -> tuple[bool, str, list[dict]]:
     """Roll up hidden fees for a UTC week per shop. Master only.
 
@@ -579,8 +594,9 @@ def generate_weekly_invoices(
     invoice's totals — only increase, or skip if already paid.
 
     week_offset: 0 = current week (may be partial), -1 = previous completed week.
+    system=True: skip owner gate (autobiller daemon only).
     """
-    if not is_owner(by_user):
+    if not system and not is_owner(by_user):
         return False, "Master admin only.", []
     ensure_franchise_tables()
     week_start, week_end, _, _ = _week_bounds(ref, week_offset=week_offset)
@@ -670,6 +686,119 @@ def generate_weekly_invoices_current_and_previous(
         f"Weekly invoices ready (current + previous). {msg0} | {msg1}",
         merged,
     )
+
+
+def bill_previous_complete_week(
+    *, ref: datetime | None = None, by_user: int | None = None
+) -> tuple[bool, str, list[dict]]:
+    """Bill only the previous COMPLETE UTC week (Mon 00:00 → next Mon 00:00).
+
+    Never bills the current partial week. Idempotent via unique(shop, week) +
+    skip-paid in generate_weekly_invoices. Intended for the autobiller daemon
+    (system=True when no explicit owner id).
+    """
+    if by_user is not None:
+        return generate_weekly_invoices(
+            int(by_user), ref=ref, week_offset=-1, system=False
+        )
+    # Daemon path: no human actor; reuse rollup without owner gate.
+    return generate_weekly_invoices(0, ref=ref, week_offset=-1, system=True)
+
+
+def week_range_label(week_start: str, week_end: str | None = None) -> str:
+    """Human label Mon DD–Sun DD from week_start (Mon 00:00 UTC)."""
+    try:
+        start = datetime.strptime(str(week_start)[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return str(week_start)
+    sun = start + timedelta(days=6)
+    return f"{start.strftime('%b %d')}–{sun.strftime('%b %d')}"
+
+
+def list_unnotified_open_invoices(*, limit: int = 100) -> list[dict]:
+    """Open invoices with fees owed that have not been DM'd to the vendor yet."""
+    ensure_franchise_tables()
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT i.*, s.title
+            FROM service_fee_invoices i
+            LEFT JOIN shops s ON s.chat_id = i.chat_id
+            WHERE i.status = 'open'
+              AND i.total_fees > 0
+              AND i.vendor_notified_at IS NULL
+            ORDER BY i.week_start ASC, i.id ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_vendor_notified(invoice_id: int, *, when: str | None = None) -> bool:
+    """Stamp vendor_notified_at once (no-op if already set). Returns True if stamped."""
+    ensure_franchise_tables()
+    ts = when or _utc_now()
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            UPDATE service_fee_invoices
+            SET vendor_notified_at = ?
+            WHERE id = ? AND vendor_notified_at IS NULL
+            """,
+            (ts, int(invoice_id)),
+        )
+        return cur.rowcount > 0
+
+
+def format_vendor_invoice_dm(
+    inv: dict, *, master_venmo: str | None = None
+) -> str:
+    """Vendor-facing weekly invoice text (plain; * markers kept for light emphasis)."""
+    from config import MASTER_VENMO
+
+    venmo = (master_venmo if master_venmo is not None else MASTER_VENMO) or "@remycastle"
+    label = week_range_label(inv.get("week_start") or "")
+    title = (inv.get("title") or f"Shop {inv.get('chat_id')}").strip()
+    n = int(inv.get("order_count") or 0)
+    total = float(inv.get("total_fees") or 0)
+    return (
+        f"📋 *Weekly invoice* — {label}\n"
+        f"{title}\n"
+        f"Orders: {n}\n"
+        f"You owe: ${total:.2f}\n"
+        f"\n"
+        f"Pay via Venmo: {venmo}\n"
+        f"Reply here once sent — thanks!"
+    )
+
+
+def format_owner_autobill_summary(
+    *,
+    invoices: list[dict],
+    notified: list[dict],
+    total_billed: float,
+) -> str:
+    """Owner DM after an autobill tick that did work."""
+    lines = [
+        "🧾 *Weekly vendor billing summary*",
+        f"Invoices this run: {len(invoices)}",
+        f"Vendor DMs sent: {len(notified)}",
+        f"Total billed: ${float(total_billed):.2f}",
+        "",
+    ]
+    if invoices:
+        lines.append("Per shop:")
+        for inv in invoices:
+            title = (inv.get("title") or f"Shop {inv.get('chat_id')}").strip()
+            lines.append(
+                f"• {title} — ${float(inv.get('total_fees') or 0):.2f} "
+                f"({int(inv.get('order_count') or 0)} orders) "
+                f"[{week_range_label(inv.get('week_start') or '')}]"
+            )
+    else:
+        lines.append("_No invoices generated this tick._")
+    return "\n".join(lines)
 
 
 def list_invoices(
