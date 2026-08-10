@@ -91,6 +91,118 @@ def _md_escape(text: str) -> str:
     )
 
 
+def _coerce_ship_str(value, max_len: int | None = None) -> str:
+    """Coerce free-text ship field to trimmed str; never raise on bad types."""
+    if value is None or isinstance(value, (bool, dict, list)):
+        return ""
+    try:
+        s = str(value).strip()
+    except Exception:
+        return ""
+    if max_len is not None and max_len > 0 and len(s) > max_len:
+        s = s[:max_len]
+    return s
+
+
+def parse_ship_fields(payload) -> tuple[str, str, str]:
+    """Extract (ship_name, ship_address, ship_notes) from web_app_data payload.
+
+    Contract (store): ``{"v":1,"items":[...],"ship":{"name","line1","line2",
+    "city","state","zip","phone"}}``. ``ship`` may be absent on old clients.
+    """
+    raw = payload.get("ship") if isinstance(payload, dict) else None
+    ship = raw if isinstance(raw, dict) else {}
+
+    name = _coerce_ship_str(ship.get("name"), max_len=120)
+    line1 = _coerce_ship_str(ship.get("line1"))
+    line2 = _coerce_ship_str(ship.get("line2"))
+    city = _coerce_ship_str(ship.get("city"))
+    state = _coerce_ship_str(ship.get("state"))
+    zip_code = _coerce_ship_str(ship.get("zip"))
+    phone = _coerce_ship_str(ship.get("phone"))
+
+    parts: list[str] = []
+    if line1:
+        parts.append(line1)
+    if line2:
+        parts.append(line2)
+    st_zip = " ".join(p for p in (state, zip_code) if p)
+    if city and st_zip:
+        parts.append(f"{city}, {st_zip}")
+    elif city:
+        parts.append(city)
+    elif st_zip:
+        parts.append(st_zip)
+
+    ship_address = "\n".join(parts)
+    if phone:
+        ship_notes = f"Phone: {phone} · via mini app"
+    else:
+        ship_notes = "via mini app"
+    return name, ship_address, ship_notes
+
+
+def build_notify_recipient_ids(base_ids, shop_chat_id: int) -> list[int]:
+    """Union configured notify ids with shop admins; dedupe, order-preserving.
+
+    Shop admins (``db.list_admins``) are included so a vendor who claimed the
+    shop receives new-order DMs without manual notify_ids env config.
+    """
+    out: list[int] = []
+    seen: set[int] = set()
+    for nid in base_ids or []:
+        try:
+            i = int(nid)
+        except (TypeError, ValueError):
+            continue
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    try:
+        admins = db.list_admins(int(shop_chat_id))
+    except Exception:
+        log.exception(
+            "list_admins failed for shop_chat_id=%s; notify without admins",
+            shop_chat_id,
+        )
+        admins = []
+    for a in admins or []:
+        try:
+            uid = int((a or {}).get("user_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if uid and uid not in seen:
+            seen.add(uid)
+            out.append(uid)
+    return out
+
+
+def format_customer_ship_block(
+    ship_name: str, ship_address: str, *, markdown: bool = True
+) -> str:
+    """Customer confirmation 'Shipping to' block, or empty if nothing to show."""
+    if not (ship_name or ship_address):
+        return ""
+    header = "📦 *Shipping to:*" if markdown else "📦 Shipping to:"
+    parts = [header]
+    if ship_name:
+        parts.append(_md_escape(ship_name) if markdown else ship_name)
+    if ship_address:
+        parts.append(_md_escape(ship_address) if markdown else ship_address)
+    return "\n\n" + "\n".join(parts)
+
+
+def format_new_order_ship_section(ship_name: str, ship_address: str) -> str:
+    """NEW ORDER notify shipping section (plain text)."""
+    if ship_address:
+        lines = ["Ship to:"]
+        if ship_name:
+            lines.append(ship_name)
+        lines.append(ship_address)
+        return "\n".join(lines)
+    return "⚠️ No address provided — contact the customer"
+
+
 # ── configuration ────────────────────────────────────────────────────────────
 
 def _owner_ids() -> list[int]:
@@ -280,6 +392,11 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
             await msg.reply_text("Your cart came through empty — add something and try again.")
             return
 
+        # Ship block is optional (old clients omit it); never crash on bad types.
+        ship_name, ship_address, ship_notes = parse_ship_fields(
+            parsed if isinstance(parsed, dict) else {}
+        )
+
         order = db.create_order(
             chat_id=shop_chat_id,
             user_id=user.id,
@@ -287,9 +404,9 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
             full_name=user.full_name,
             items=items,
             payment_method=None,
-            ship_name="",
-            ship_address="",
-            ship_notes="via mini app",
+            ship_name=ship_name,
+            ship_address=ship_address,
+            ship_notes=ship_notes,
         )
         if not order:
             await msg.reply_text(
@@ -312,6 +429,14 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
             ship_ln = f"  • Shipping — {_fmt_money(order['shipping_fee'])}"
             lines.append(ship_ln)
             plain_lines.append(ship_ln)
+
+        ship_md_block = format_customer_ship_block(
+            ship_name, ship_address, markdown=True
+        )
+        ship_plain_block = format_customer_ship_block(
+            ship_name, ship_address, markdown=False
+        )
+
         pays = db.list_payment_methods(shop_chat_id)
         pay_txt = (
             "\n".join(
@@ -334,6 +459,7 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
             await msg.reply_text(
                 f"{emoji} *Order received!*\n\n"
                 + "\n".join(lines)
+                + ship_md_block
                 + f"\n\n*Total: {total_txt}*\n"
                 + f"Payment code: `{_md_escape(code)}` (put this in the memo)\n\n"
                 + "Pay with:\n" + pay_txt + "\n\n"
@@ -346,6 +472,7 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
                 await msg.reply_text(
                     f"{emoji} Order received!\n\n"
                     + "\n".join(plain_lines)
+                    + ship_plain_block
                     + f"\n\nTotal: {total_txt}\n"
                     + f"Payment code:\n{code}\n"
                     + "(put this in the memo)\n\n"
@@ -355,13 +482,17 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
             except Exception as e2:
                 log.warning("[%s] plain customer confirm also failed: %s", name, e2)
 
+        ship_notify = format_new_order_ship_section(ship_name, ship_address)
+
         note = (
             f"{emoji} NEW ORDER {code} — {name}\n"
             f"From: {user.full_name} (@{user.username}, id {user.id})\n"
             + "\n".join(plain_lines)
-            + f"\nTotal: {total_txt}"
+            + f"\nTotal: {total_txt}\n"
+            + ship_notify
         )
-        for nid in notify_ids:
+        recipients = build_notify_recipient_ids(notify_ids, shop_chat_id)
+        for nid in recipients:
             try:
                 await context.bot.send_message(nid, note)
             except Exception as e:
