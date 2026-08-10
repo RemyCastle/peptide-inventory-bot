@@ -1205,6 +1205,9 @@ def _order_public(order: dict) -> dict:
         "tracking_url": tracking_url(
             order.get("tracking_carrier"), order.get("tracking_number")
         ),
+        "ship_name": (order.get("ship_name") or "").strip(),
+        "ship_address": (order.get("ship_address") or "").strip(),
+        "ship_notes": (order.get("ship_notes") or "").strip(),
     }
 
 
@@ -1385,6 +1388,14 @@ def api_order_history_txt(
             lines.append("  (no line items)")
         lines.append(f"Shipping: ${float(o.get('shipping_fee') or 0):,.2f}")
         lines.append(f"Total:    ${float(o.get('total') or 0):,.2f}")
+        sn = (o.get("ship_name") or "").strip()
+        sa = (o.get("ship_address") or "").strip().replace("\n", ", ")
+        snotes = (o.get("ship_notes") or "").strip()
+        ship_bits = [b for b in (sn, sa, snotes) if b]
+        if ship_bits:
+            lines.append("Ship to: " + " · ".join(ship_bits))
+        else:
+            lines.append("Ship to: —")
         tn = (o.get("tracking_number") or "").strip()
         if tn:
             car = (o.get("tracking_carrier") or "").strip()
