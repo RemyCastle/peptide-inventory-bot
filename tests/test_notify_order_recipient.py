@@ -172,6 +172,8 @@ class BuildNewOrderNotifyTextTests(unittest.TestCase):
         self.assertIn("/confirm?ct=", note)
         self.assertIn("➕ Add tracking:", note)
         self.assertIn("/track?ot=", note)
+        self.assertIn("❌ Cancel order:", note)
+        self.assertIn("/cancel?xt=", note)
         self.assertIn("Total:", note)
 
 
