@@ -484,16 +484,24 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
 
         ship_notify = format_new_order_ship_section(ship_name, ship_address)
 
-        # Narrow per-order tracking link (not admin panel). Skip if no public URL.
+        # Narrow per-order action links (not admin panel). Skip if no public URL.
+        confirm_line = ""
         track_line = ""
         try:
             import webpanel as _webpanel
 
+            confirm_line = _webpanel.format_confirm_payment_dm_line(
+                int(order["id"]), shop_chat_id
+            )
             track_line = _webpanel.format_add_tracking_dm_line(
                 int(order["id"]), shop_chat_id
             )
         except Exception:
-            log.exception("[%s] mint tracking link failed for order %s", name, order.get("id"))
+            log.exception(
+                "[%s] mint order action links failed for order %s",
+                name,
+                order.get("id"),
+            )
 
         note = (
             f"{emoji} NEW ORDER {code} — {name}\n"
@@ -502,6 +510,8 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
             + f"\nTotal: {total_txt}\n"
             + ship_notify
         )
+        if confirm_line:
+            note = note + "\n" + confirm_line
         if track_line:
             note = note + "\n" + track_line
         recipients = build_notify_recipient_ids(notify_ids, shop_chat_id)
