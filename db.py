@@ -280,6 +280,11 @@ def init_db() -> None:
     except Exception:
         pass
 
+    # Weekly vendor invoice DM stamp (redeploy-safe; NULL = not yet notified)
+    with get_db() as conn:
+        if _table_exists(conn, "service_fee_invoices"):
+            _ensure_column(conn, "service_fee_invoices", "vendor_notified_at", "TEXT")
+
     # Shop rename/transfer tokens + deep-link aliases
     try:
         ensure_shop_transfer_tables()

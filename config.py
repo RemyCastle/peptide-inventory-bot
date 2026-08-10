@@ -123,6 +123,9 @@ PANEL_BASE_URL = os.getenv("PANEL_BASE_URL", "").strip().rstrip("/")
 # Where panel-uploaded product photos / COA files are stored (persistent disk)
 MEDIA_DIR = os.getenv("MEDIA_DIR", str(DB_PATH.parent / "uploads"))
 
+# Master Venmo handle for vendor platform-fee invoices (weekly autobill + /invoices).
+MASTER_VENMO = (os.getenv("MASTER_VENMO", "") or "").strip() or "@remycastle"
+
 # Schema version expected by this code release
 SCHEMA_VERSION = 10
 
