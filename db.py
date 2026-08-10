@@ -1970,6 +1970,19 @@ def get_order(order_id: int) -> Optional[dict]:
         return dict(row) if row else None
 
 
+def get_order_by_payment_code(payment_code: str) -> Optional[dict]:
+    """Look up order by exact payment_code (case-sensitive memo code)."""
+    code = (payment_code or "").strip()
+    if not code:
+        return None
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM orders WHERE payment_code = ?",
+            (code,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
 def get_order_items(order_id: int) -> list[dict]:
     with get_db() as conn:
         rows = conn.execute(
