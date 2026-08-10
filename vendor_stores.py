@@ -35,11 +35,15 @@ Adding vendor N+1 = create their bot in BotFather, add one JSON entry, done.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import math
 import os
 import threading
+import time
+import urllib.parse
 
 from telegram import KeyboardButton, ReplyKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import (
@@ -54,6 +58,13 @@ import db
 from config import KIT_SIZE
 
 log = logging.getLogger("vendor_stores")
+
+# Telegram WebApp initData max age (replay guard)
+INIT_DATA_MAX_AGE_SEC = 24 * 60 * 60
+
+
+class InitDataError(Exception):
+    """Telegram WebApp initData failed validation (auth boundary)."""
 
 
 def _coerce_cart_int(value) -> int:
@@ -140,6 +151,213 @@ def parse_ship_fields(payload) -> tuple[str, str, str]:
     else:
         ship_notes = "via mini app"
     return name, ship_address, ship_notes
+
+
+def parse_miniapp_cart_items(cart_items) -> list[dict]:
+    """Parse store cart items into create_order line dicts.
+
+    Same rules as on_web_app_data: coerce id/vials/kits via hardened helpers;
+    vials → quantity line; kits → kits*KIT_SIZE with is_kit. Raises ValueError
+    on structural problems (caller maps to 400).
+    """
+    if not isinstance(cart_items, list):
+        raise ValueError("items is not a list")
+    items: list[dict] = []
+    for it in cart_items:
+        if not isinstance(it, dict):
+            raise ValueError("cart item is not an object")
+        pid = _coerce_cart_int(it.get("id") or 0)
+        vials = max(0, _coerce_cart_int(it.get("vials") or 0))
+        kits = max(0, _coerce_cart_int(it.get("kits") or 0))
+        if pid <= 0:
+            continue
+        if vials:
+            items.append({"product_id": pid, "quantity": vials})
+        if kits:
+            items.append(
+                {
+                    "product_id": pid,
+                    "quantity": kits * KIT_SIZE,
+                    "is_kit": True,
+                }
+            )
+    return items
+
+
+def validate_webapp_init_data(
+    init_data: str,
+    bot_token: str,
+    *,
+    max_age_sec: int = INIT_DATA_MAX_AGE_SEC,
+) -> dict:
+    """Validate Telegram.WebApp.initData against the vendor bot token.
+
+    Algorithm (constant-time hash compare + 24h auth_date replay guard):
+      - Parse initData as query string; pull out hash
+      - data_check_string = sorted key=value pairs excluding hash, joined by \\n
+      - secret_key = HMAC_SHA256(key=b\"WebAppData\", msg=bot_token)
+      - expected = HMAC_SHA256(key=secret_key, msg=data_check_string).hex()
+      - reject unless compare_digest(expected, provided_hash)
+      - reject if auth_date older than max_age_sec
+
+    Returns buyer dict: user_id, username, full_name, auth_date.
+    Raises InitDataError on any failure.
+    """
+    raw = (init_data or "").strip()
+    token = (bot_token or "").strip()
+    if not raw or not token:
+        raise InitDataError("missing initData or bot token")
+
+    pairs = urllib.parse.parse_qsl(raw, keep_blank_values=True)
+    if not pairs:
+        raise InitDataError("empty initData")
+
+    provided_hash = ""
+    for k, v in pairs:
+        if k == "hash":
+            provided_hash = v
+            break
+    if not provided_hash:
+        raise InitDataError("missing hash")
+
+    data_check_string = "\n".join(
+        f"{k}={v}" for k, v in sorted(pairs, key=lambda kv: kv[0]) if k != "hash"
+    )
+    secret_key = hmac.new(b"WebAppData", token.encode("utf-8"), hashlib.sha256).digest()
+    expected = hmac.new(
+        secret_key, data_check_string.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    try:
+        ok = hmac.compare_digest(expected, provided_hash)
+    except Exception:
+        ok = False
+    if not ok:
+        raise InitDataError("bad hash")
+
+    # Rebuild map for field lookup (first value wins; hash already checked)
+    fields = {k: v for k, v in pairs if k != "hash"}
+    try:
+        auth_date = int(fields.get("auth_date") or 0)
+    except (TypeError, ValueError):
+        raise InitDataError("bad auth_date") from None
+    if auth_date <= 0:
+        raise InitDataError("bad auth_date")
+    age = time.time() - auth_date
+    if age > max_age_sec or age < -60:
+        # allow 60s clock skew forward; reject old / far-future
+        raise InitDataError("expired auth_date")
+
+    user_raw = fields.get("user") or ""
+    if not user_raw:
+        raise InitDataError("missing user")
+    try:
+        user = json.loads(user_raw)
+    except Exception as exc:
+        raise InitDataError("bad user json") from exc
+    if not isinstance(user, dict):
+        raise InitDataError("bad user")
+    try:
+        user_id = int(user.get("id"))
+    except (TypeError, ValueError):
+        raise InitDataError("bad user id") from None
+    if user_id <= 0:
+        raise InitDataError("bad user id")
+
+    username = (user.get("username") or "") or None
+    if username is not None:
+        username = str(username).strip() or None
+    first = str(user.get("first_name") or "").strip()
+    last = str(user.get("last_name") or "").strip()
+    full_name = f"{first} {last}".strip() or first or last or None
+
+    return {
+        "user_id": user_id,
+        "username": username,
+        "full_name": full_name,
+        "auth_date": auth_date,
+    }
+
+
+def build_customer_order_received_text(
+    order: dict,
+    shop_chat_id: int,
+    *,
+    emoji: str = "\U0001f6cd",
+    markdown: bool = False,
+    order_lines: list[dict] | None = None,
+) -> str:
+    """Customer 'Order received' body (sendData path + POST /order).
+
+    When markdown=True, product/pay strings are escaped for Telegram legacy
+    Markdown. HTTP path uses markdown=False + parse_mode=None.
+    """
+    oid = int(order["id"])
+    if order_lines is None:
+        order_lines = db.get_order_items(oid)
+
+    def _esc(s: str) -> str:
+        return _md_escape(s) if markdown else s
+
+    lines: list[str] = []
+    for ln in order_lines or []:
+        lines.append(
+            f"  • {_esc(str(ln['product_name']))} × {ln['quantity']} — "
+            f"{_fmt_money(ln['line_total'])}"
+        )
+    if order.get("shipping_fee"):
+        lines.append(f"  • Shipping — {_fmt_money(order['shipping_fee'])}")
+
+    ship_name = (order.get("ship_name") or "").strip()
+    ship_address = (order.get("ship_address") or "").strip()
+    ship_block = format_customer_ship_block(
+        ship_name, ship_address, markdown=markdown
+    )
+
+    pays = db.list_payment_methods(int(shop_chat_id))
+    if pays:
+        pay_lines = [
+            f"  • {_esc(p['name'])}: {_esc(p['instructions'])}".rstrip(": ")
+            for p in pays
+        ]
+        pay_txt = "\n".join(pay_lines)
+    else:
+        pay_txt = "  • Payment details will be DM'd to you."
+
+    code = order.get("payment_code") or f"#{oid}"
+    total_txt = _fmt_money(order.get("total", 0))
+
+    if markdown:
+        return (
+            f"{emoji} *Order received!*\n\n"
+            + "\n".join(lines)
+            + ship_block
+            + f"\n\n*Total: {total_txt}*\n"
+            + f"Payment code: `{_esc(code)}` (put this in the memo)\n\n"
+            + "Pay with:\n"
+            + pay_txt
+            + "\n\n"
+            + "You'll get a confirmation here once payment lands."
+        )
+    return (
+        f"{emoji} Order received!\n\n"
+        + "\n".join(lines)
+        + ship_block
+        + f"\n\nTotal: {total_txt}\n"
+        + f"Payment code:\n{code}\n"
+        + "(put this in the memo)\n\n"
+        + "Pay with:\n"
+        + pay_txt
+        + "\n\n"
+        + "You'll get a confirmation here once payment lands."
+    )
+
+
+def payment_display_lines(shop_chat_id: int) -> list[str]:
+    """Payment method lines for JSON responses (name: instructions)."""
+    pays = db.list_payment_methods(int(shop_chat_id))
+    return [
+        f"{p['name']}: {p['instructions']}".rstrip(": ") for p in pays
+    ]
 
 
 def build_notify_recipient_ids(base_ids, shop_chat_id: int) -> list[int]:
@@ -570,28 +788,7 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
             parsed = json.loads(raw)
             if not isinstance(parsed, dict):
                 raise ValueError("cart root is not an object")
-            cart_items = parsed.get("items")
-            if not isinstance(cart_items, list):
-                raise ValueError("items is not a list")
-            items: list[dict] = []
-            for it in cart_items:
-                if not isinstance(it, dict):
-                    raise ValueError("cart item is not an object")
-                pid = _coerce_cart_int(it.get("id") or 0)
-                vials = max(0, _coerce_cart_int(it.get("vials") or 0))
-                kits = max(0, _coerce_cart_int(it.get("kits") or 0))
-                if pid <= 0:
-                    continue
-                if vials:
-                    items.append({"product_id": pid, "quantity": vials})
-                if kits:
-                    items.append(
-                        {
-                            "product_id": pid,
-                            "quantity": kits * KIT_SIZE,
-                            "is_kit": True,
-                        }
-                    )
+            items = parse_miniapp_cart_items(parsed.get("items"))
         except Exception:
             log.warning("[%s] malformed web_app_data cart from %s", name, getattr(user, "id", None))
             await msg.reply_text(
@@ -627,69 +824,28 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
             return
 
         order_lines = db.get_order_items(int(order["id"]))
-        # Escape DB/owner strings so Markdown parse never 400s after create_order.
-        lines = [
-            f"  • {_md_escape(ln['product_name'])} × {ln['quantity']} — {_fmt_money(ln['line_total'])}"
-            for ln in order_lines
-        ]
-        plain_lines = [
-            f"  • {ln['product_name']} × {ln['quantity']} — {_fmt_money(ln['line_total'])}"
-            for ln in order_lines
-        ]
-        if order.get("shipping_fee"):
-            ship_ln = f"  • Shipping — {_fmt_money(order['shipping_fee'])}"
-            lines.append(ship_ln)
-            plain_lines.append(ship_ln)
-
-        ship_md_block = format_customer_ship_block(
-            ship_name, ship_address, markdown=True
+        md_text = build_customer_order_received_text(
+            order,
+            shop_chat_id,
+            emoji=emoji,
+            markdown=True,
+            order_lines=order_lines,
         )
-        ship_plain_block = format_customer_ship_block(
-            ship_name, ship_address, markdown=False
+        plain_text = build_customer_order_received_text(
+            order,
+            shop_chat_id,
+            emoji=emoji,
+            markdown=False,
+            order_lines=order_lines,
         )
-
-        pays = db.list_payment_methods(shop_chat_id)
-        pay_txt = (
-            "\n".join(
-                f"  • {_md_escape(p['name'])}: {_md_escape(p['instructions'])}".rstrip(": ")
-                for p in pays
-            )
-            if pays
-            else "  • Payment details will be DM'd to you."
-        )
-        pay_plain = (
-            "\n".join(f"  • {p['name']}: {p['instructions']}".rstrip(": ") for p in pays)
-            if pays
-            else "  • Payment details will be DM'd to you."
-        )
-        code = order.get("payment_code") or f"#{order.get('id')}"
-        total_txt = _fmt_money(order.get("total", 0))
 
         # Customer reply must not block owner notify if Telegram rejects Markdown.
         try:
-            await msg.reply_text(
-                f"{emoji} *Order received!*\n\n"
-                + "\n".join(lines)
-                + ship_md_block
-                + f"\n\n*Total: {total_txt}*\n"
-                + f"Payment code: `{_md_escape(code)}` (put this in the memo)\n\n"
-                + "Pay with:\n" + pay_txt + "\n\n"
-                + "You'll get a confirmation here once payment lands.",
-                parse_mode="Markdown",
-            )
+            await msg.reply_text(md_text, parse_mode="Markdown")
         except Exception as e:
             log.warning("[%s] customer confirm reply failed (order still saved): %s", name, e)
             try:
-                await msg.reply_text(
-                    f"{emoji} Order received!\n\n"
-                    + "\n".join(plain_lines)
-                    + ship_plain_block
-                    + f"\n\nTotal: {total_txt}\n"
-                    + f"Payment code:\n{code}\n"
-                    + "(put this in the memo)\n\n"
-                    + "Pay with:\n" + pay_plain + "\n\n"
-                    + "You'll get a confirmation here once payment lands."
-                )
+                await msg.reply_text(plain_text)
             except Exception as e2:
                 log.warning("[%s] plain customer confirm also failed: %s", name, e2)
 
