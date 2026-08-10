@@ -337,6 +337,83 @@ def format_add_tracking_dm_line(order_id: int, shop_chat_id: int) -> str:
     return f"➕ Add tracking: {base}/track?ot={raw}"
 
 
+def mint_order_confirm_token(order_id: int, shop_chat_id: int) -> str:
+    """Mint (or reuse) a confirm-payment-only token for one order. Returns raw hex(12).
+
+    Idempotent: a non-expired row for this order_id + action=confirm is reused
+    so re-sending NEW ORDER never multiplies links. Distinct from track tokens.
+    """
+    ensure_webpanel_tables()
+    oid = int(order_id)
+    sid = int(shop_chat_id)
+    now = _utc_now()
+    now_s = _ts(now)
+    with db.get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT token_plain FROM order_action_tokens
+            WHERE order_id = ? AND action = 'confirm' AND expires_at > ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (oid, now_s),
+        ).fetchone()
+        if row and (row["token_plain"] or "").strip():
+            return str(row["token_plain"]).strip()
+        raw = secrets.token_hex(12)
+        conn.execute(
+            """
+            INSERT INTO order_action_tokens (
+                token_hash, token_plain, order_id, shop_chat_id, action,
+                created_at, expires_at
+            ) VALUES (?, ?, ?, ?, 'confirm', ?, ?)
+            """,
+            (
+                _hash(raw),
+                raw,
+                oid,
+                sid,
+                now_s,
+                _ts(now + timedelta(days=ORDER_TRACK_TOKEN_TTL_DAYS)),
+            ),
+        )
+    return raw
+
+
+def resolve_order_confirm_token(raw: str) -> Optional[dict]:
+    """Valid non-expired confirm token → {order_id, shop_chat_id}; else None."""
+    if not raw or not str(raw).strip():
+        return None
+    ensure_webpanel_tables()
+    with db.get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM order_action_tokens WHERE token_hash = ?",
+            (_hash(str(raw).strip()),),
+        ).fetchone()
+    if not row:
+        return None
+    if str(row["action"] or "") != "confirm":
+        return None
+    if _ts(_utc_now()) > str(row["expires_at"]):
+        return None
+    return {
+        "order_id": int(row["order_id"]),
+        "shop_chat_id": int(row["shop_chat_id"]),
+    }
+
+
+def format_confirm_payment_dm_line(order_id: int, shop_chat_id: int) -> str:
+    """Line for NEW ORDER vendor DM, or '' if PANEL_BASE_URL is unset."""
+    base = (PANEL_BASE_URL or "").strip().rstrip("/")
+    if not base:
+        log.info(
+            "PANEL_BASE_URL unset — skip confirm-payment link for order %s",
+            order_id,
+        )
+        return ""
+    raw = mint_order_confirm_token(int(order_id), int(shop_chat_id))
+    return f"✅ Confirm payment: {base}/confirm?ct={raw}"
+
+
 def panel_url(base_url: str, raw_token: str, mode: str = "") -> str:
     """mode='restock' opens straight into the shipment-receiving view."""
     url = f"{base_url.rstrip('/')}/panel?t={urllib.parse.quote(raw_token)}"
@@ -1751,6 +1828,216 @@ def handle_track_post(
         }
         return 200, "application/json", json.dumps(body).encode("utf-8")
     return 200, "text/html; charset=utf-8", _track_success_html(code, car, tn, url)
+
+
+# ── Standalone confirm-payment page (/confirm) ──────────────────────────────
+# Auth = order_action_tokens action=confirm only. Scoped to one order — cannot
+# track, touch other orders, or open the admin panel.
+
+_ALREADY_CONFIRMED_STATUSES = frozenset({"paid", "shipped", "complete"})
+
+
+def _confirm_expired_html() -> bytes:
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Link expired</title>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;"
+        "padding:0 1rem;color:#222}h1{font-size:1.25rem}</style></head>"
+        "<body><h1>Link expired</h1>"
+        "<p>This confirm-payment link is invalid or has expired. "
+        "Open the order from your shop panel instead.</p></body></html>"
+    ).encode("utf-8")
+
+
+def _confirm_success_html(code: str, *, already: bool = False) -> bytes:
+    code_e = html.escape(code)
+    if already:
+        title = "Already confirmed"
+        heading = "Already confirmed"
+        detail = (
+            f"<p>Order <strong>{code_e}</strong> was already marked paid. "
+            "No further action was taken.</p>"
+        )
+    else:
+        title = "Payment confirmed"
+        heading = "Payment confirmed"
+        detail = (
+            f"<p>Order <strong>{code_e}</strong> is now paid. "
+            "Stock was decremented and the customer was notified if their "
+            "chat is open with your store bot.</p>"
+        )
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        f"<title>{title}</title>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;"
+        "padding:0 1rem;color:#222}h1{font-size:1.25rem;color:#0a7}</style></head>"
+        f"<body><h1>{heading}</h1>{detail}</body></html>"
+    ).encode("utf-8")
+
+
+def _confirm_error_html(message: str) -> bytes:
+    msg_e = html.escape(message or "Could not confirm payment.")
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Could not confirm</title>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;"
+        "padding:0 1rem;color:#222}h1{font-size:1.25rem;color:#a30}"
+        "a{color:#1a73e8}</style></head>"
+        f"<body><h1>Could not confirm</h1><p>{msg_e}</p>"
+        "<p><a href='javascript:history.back()'>Back</a></p></body></html>"
+    ).encode("utf-8")
+
+
+def _confirm_form_html(
+    order: dict, items: list[dict], raw_ct: str, *, already: bool = False
+) -> bytes:
+    code = html.escape(
+        (order.get("payment_code") or str(order.get("id") or "")).strip()
+    )
+    status = html.escape(str(order.get("status") or "—"))
+    ship_name = html.escape((order.get("ship_name") or "").strip() or "—")
+    ship_addr = html.escape((order.get("ship_address") or "").strip() or "—")
+    summary = html.escape(_item_summary(items))
+    total = float(order.get("total") or 0)
+    total_e = html.escape(f"${total:.2f}")
+    ct_e = html.escape(raw_ct)
+    if already:
+        action_block = (
+            "<p class=ok><strong>Already confirmed</strong> — this order is "
+            f"<code>{status}</code>. No further action is needed.</p>"
+        )
+    else:
+        action_block = f"""
+<form method=POST action=/confirm>
+  <input type=hidden name=ct value="{ct_e}">
+  <button type=submit>✅ Confirm payment received</button>
+</form>
+<p class=muted>This link only confirms payment for this order. It is not the admin panel.</p>
+"""
+    body = f"""<!doctype html>
+<html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Confirm payment · {code}</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:28rem;margin:2rem auto;padding:0 1rem;color:#222;line-height:1.45}}
+h1{{font-size:1.2rem;margin:0 0 .75rem}}
+.card{{background:#f6f7f9;border-radius:10px;padding:1rem;margin-bottom:1.25rem}}
+.card p{{margin:.35rem 0}}
+button{{margin-top:.5rem;width:100%;padding:.7rem;font-size:1rem;font-weight:600;border:0;border-radius:8px;background:#0a7;color:#fff}}
+.ok{{color:#0a7}}
+.muted{{color:#666;font-size:.9rem}}
+</style></head><body>
+<h1>Confirm payment</h1>
+<div class=card>
+  <p><strong>Order</strong> {code}</p>
+  <p><strong>Items</strong> {summary}</p>
+  <p><strong>Ship to</strong> {ship_name}<br>{ship_addr.replace(chr(10), '<br>')}</p>
+  <p><strong>Total</strong> {total_e}</p>
+  <p><strong>Status</strong> {status}</p>
+</div>
+{action_block}
+</body></html>"""
+    return body.encode("utf-8")
+
+
+def handle_confirm_get(query: dict) -> tuple[int, str, bytes]:
+    """GET /confirm?ct=… — confirm form for one order, or plain expired page."""
+    raw = (query.get("ct") or [""])[0]
+    tok = resolve_order_confirm_token(raw)
+    if not tok:
+        return 403, "text/html; charset=utf-8", _confirm_expired_html()
+    order = db.get_order(int(tok["order_id"]))
+    if not order or not _order_belongs(order, int(tok["shop_chat_id"])):
+        return 403, "text/html; charset=utf-8", _confirm_expired_html()
+    items = db.get_order_items(int(order["id"]))
+    status = str(order.get("status") or "")
+    already = status in _ALREADY_CONFIRMED_STATUSES
+    return (
+        200,
+        "text/html; charset=utf-8",
+        _confirm_form_html(order, items, str(raw).strip(), already=already),
+    )
+
+
+def handle_confirm_post(
+    payload: dict, *, wants_json: bool = False
+) -> tuple[int, str, bytes]:
+    """POST /confirm — confirm payment for the token's order only; notify buyer."""
+    raw = str(payload.get("ct") or "").strip()
+    tok = resolve_order_confirm_token(raw)
+    if not tok:
+        if wants_json:
+            return (
+                403,
+                "application/json",
+                json.dumps({"ok": False, "error": "link_expired"}).encode("utf-8"),
+            )
+        return 403, "text/html; charset=utf-8", _confirm_expired_html()
+
+    order_id = int(tok["order_id"])
+    shop_chat_id = int(tok["shop_chat_id"])
+    order = db.get_order(order_id)
+    if not order or not _order_belongs(order, shop_chat_id):
+        if wants_json:
+            return (
+                403,
+                "application/json",
+                json.dumps({"ok": False, "error": "link_expired"}).encode("utf-8"),
+            )
+        return 403, "text/html; charset=utf-8", _confirm_expired_html()
+
+    code = (order.get("payment_code") or str(order_id)).strip()
+    status = str(order.get("status") or "")
+    if status in _ALREADY_CONFIRMED_STATUSES:
+        if wants_json:
+            body = {
+                "ok": True,
+                "already_confirmed": True,
+                "order_id": order_id,
+                "status": status,
+                "message": "Already confirmed",
+            }
+            return 200, "application/json", json.dumps(body).encode("utf-8")
+        return (
+            200,
+            "text/html; charset=utf-8",
+            _confirm_success_html(code, already=True),
+        )
+
+    ok, msg, _alerts = db.confirm_order_payment(order_id, 0)
+    if not ok:
+        if wants_json:
+            return (
+                400,
+                "application/json",
+                json.dumps(
+                    {"ok": False, "error": "confirm_failed", "message": msg or ""}
+                ).encode("utf-8"),
+            )
+        return 400, "text/html; charset=utf-8", _confirm_error_html(msg or "")
+
+    order = db.get_order(order_id) or order
+    code = (order.get("payment_code") or str(order_id)).strip()
+    text = (
+        f"✅ Payment received for order <code>{code}</code>! "
+        "It's being prepared — you'll get tracking here when it ships."
+    )
+    notified = notify_order_customer(shop_chat_id, int(order["user_id"]), text)
+
+    if wants_json:
+        body = {
+            "ok": True,
+            "already_confirmed": False,
+            "order_id": order_id,
+            "status": order.get("status") or "paid",
+            "message": msg,
+            "customer_notified": bool(notified),
+        }
+        return 200, "application/json", json.dumps(body).encode("utf-8")
+    return 200, "text/html; charset=utf-8", _confirm_success_html(code, already=False)
 
 
 # ── HTTP layer (called from spbc_notify's request handler) ──────────────────
