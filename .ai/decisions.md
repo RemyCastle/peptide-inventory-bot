@@ -40,6 +40,11 @@ Append-only log. Newest at bottom.
 - Decision: Vendor web panel Orders section — confirm payment, set tracking + ship, date-range .txt export. Customer DMs via vendor_stores.get_bot_token_for_shop + telegram_send_with_token (never main SPBC bot). Cross-shop rejected by tok["chat_id"]. Reused db.confirm_order_payment / set_order_tracking / mark_order_shipped / list_orders. Did not touch storefront_keys, fail-closed bind, run_cloud payment seeding, store HTML, or vendor order-receiver logic beyond the new token helper.
 
 ### 2026-08-09
+- Decision: Per-order "Add tracking" link in NEW ORDER vendor DMs. New `order_action_tokens` namespace (separate from web_tokens / vendor_invites / storefront_keys); mint_order_tracking_token hex(12) idempotent ~60d; standalone GET/POST `/track?ot=` (not admin panel). Token binds one order_id + shop_chat_id + action=track only. POST sets tracking, marks shipped if paid, customer DM via existing notify_order_customer. PANEL_BASE_URL required for link line; skip+log if unset. Did not touch storefront_keys, fail-closed bind, run_cloud payment seeding, or store HTML.
+- Why: Vendor can tap tracking from the order DM without opening the full panel
+- Tests: tests/test_order_tracking_link.py; full suite 312 pass on scratch DB_PATH
+
+### 2026-08-09
 - Decision: Mini-app ship address — parse optional `ship` from web_app_data into ship_name/address/notes (phone in notes as `Phone: … · via mini app`); customer confirm + NEW ORDER text show address (Markdown-escaped); missing address warns on NEW ORDER notify. Notify recipients = configured notify_ids ∪ db.list_admins(shop). Panel `_order_public` + history .txt expose ship fields. Did not touch storefront_keys, fail-closed bind, run_cloud payment seeding, or store HTML.
 - Why: Store now sends ship object; vendor who claimed shop must get order DMs without manual notify_ids
 - Tests: 298 pass on scratch DB_PATH; tests/test_vendor_stores_ship.py
