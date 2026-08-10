@@ -872,6 +872,14 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(raw)
             return
+        if path == "/track":
+            # Narrow order-action token auth (ot=). Not the admin panel.
+            import webpanel
+
+            query = urllib.parse.parse_qs(parsed.query)
+            code, ctype, body = webpanel.handle_track_get(query)
+            self._send_raw(code, ctype, body)
+            return
         if path.startswith("/panel"):
             import webpanel
 
@@ -890,8 +898,55 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
+    def _read_form_or_json(self) -> tuple[Optional[dict], bool]:
+        """Parse POST body as JSON or form-urlencoded. Returns (dict|None, wants_json)."""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > MAX_BODY_BYTES:
+            return None, ctype == "application/json"
+        try:
+            raw = self.rfile.read(length)
+        except Exception:
+            return None, ctype == "application/json"
+        if ctype == "application/json":
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                return (data if isinstance(data, dict) else None), True
+            except Exception:
+                return None, True
+        # form (or default): application/x-www-form-urlencoded
+        try:
+            qs = urllib.parse.parse_qs(
+                raw.decode("utf-8"), keep_blank_values=True
+            )
+            return {k: (v[0] if v else "") for k, v in qs.items()}, False
+        except Exception:
+            return None, False
+
     def do_POST(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
+        if path == "/track":
+            import webpanel
+
+            payload, wants_json = self._read_form_or_json()
+            if payload is None:
+                if wants_json:
+                    self._json(400, {"ok": False, "error": "bad_body"})
+                else:
+                    self._send_raw(
+                        400,
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><body><p>Bad request.</p></body></html>",
+                    )
+                return
+            code, ctype, body = webpanel.handle_track_post(
+                payload, wants_json=wants_json
+            )
+            self._send_raw(code, ctype, body)
+            return
         if path.startswith("/panel/api/"):
             import webpanel
 
