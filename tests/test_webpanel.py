@@ -431,6 +431,100 @@ class ApiTests(WebPanelBase):
         code, _ = webpanel.api_product(self.tok, {"id": pid, "stock": -1})
         self.assertEqual(code, 400)
 
+    def test_product_category_and_sort_order_persist(self):
+        pid = db.add_product(SHOP, "H125", 55.0, 3)
+        p0 = db.get_product(pid)
+        self.assertIsNone(p0.get("category"))
+        self.assertEqual(int(p0.get("sort_order") or 0), 0)
+
+        code, data = webpanel.api_product(
+            self.tok,
+            {
+                "id": pid,
+                "category": "  GLP-1  ",
+                "sort_order": "10",
+            },
+        )
+        self.assertEqual(code, 200, data)
+        p = db.get_product(pid)
+        self.assertEqual(p["category"], "GLP-1")
+        self.assertEqual(int(p["sort_order"]), 10)
+
+        # Empty category clears to NULL; omitted sort_order keeps existing
+        code, _ = webpanel.api_product(
+            self.tok, {"id": pid, "category": "   "}
+        )
+        self.assertEqual(code, 200)
+        p = db.get_product(pid)
+        self.assertIsNone(p["category"])
+        self.assertEqual(int(p["sort_order"]), 10)
+
+        # Create with category + sort_order
+        code, data = webpanel.api_product(
+            self.tok,
+            {
+                "name": "BPC-157",
+                "price": 41,
+                "stock": 1,
+                "category": "Recovery",
+                "sort_order": 2,
+            },
+        )
+        self.assertEqual(code, 200, data)
+        p2 = db.get_product(data["id"])
+        self.assertEqual(p2["category"], "Recovery")
+        self.assertEqual(int(p2["sort_order"]), 2)
+
+        # Max length + bad sort_order
+        long_cat = "X" * 50
+        code, _ = webpanel.api_product(
+            self.tok, {"id": pid, "category": long_cat}
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(len(db.get_product(pid)["category"]), 40)
+        code, _ = webpanel.api_product(
+            self.tok, {"id": pid, "sort_order": "nope"}
+        )
+        self.assertEqual(code, 400)
+
+    def test_storefront_returns_category_sort_order_and_order(self):
+        a = db.add_product(SHOP, "Zebra", 10.0, 1)
+        b = db.add_product(SHOP, "Alpha", 20.0, 1)
+        c = db.add_product(SHOP, "Middle", 15.0, 1)
+        webpanel.api_product(
+            self.tok, {"id": a, "category": "Other", "sort_order": 30}
+        )
+        webpanel.api_product(
+            self.tok, {"id": b, "category": "Peptides", "sort_order": 10}
+        )
+        webpanel.api_product(
+            self.tok, {"id": c, "sort_order": 20}
+        )  # category left NULL
+
+        sf_key = webpanel._ensure_storefront_key(SHOP)
+        code, body = webpanel.api_storefront(sf_key)
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body["ok"])
+        prods = body["products"]
+        self.assertEqual(len(prods), 3)
+        names = [p["name"] for p in prods]
+        self.assertEqual(names, ["Alpha", "Middle", "Zebra"])
+        by_name = {p["name"]: p for p in prods}
+        self.assertEqual(by_name["Alpha"]["category"], "Peptides")
+        self.assertEqual(by_name["Alpha"]["sort_order"], 10)
+        self.assertEqual(by_name["Zebra"]["category"], "Other")
+        self.assertEqual(by_name["Zebra"]["sort_order"], 30)
+        self.assertIsNone(by_name["Middle"]["category"])
+        self.assertEqual(by_name["Middle"]["sort_order"], 20)
+
+        # Panel state also exposes the fields
+        code, state = webpanel.api_state(self.tok)
+        self.assertEqual(code, 200)
+        sp = {p["name"]: p for p in state["products"]}
+        self.assertEqual(sp["Alpha"]["category"], "Peptides")
+        self.assertEqual(sp["Middle"]["category"], None)
+        self.assertEqual(sp["Zebra"]["sort_order"], 30)
+
     def test_bulk_import_upserts(self):
         db.add_product(SHOP, "BPC-157 10MG", 41.0, 5)
         code, data = webpanel.api_bulk(
