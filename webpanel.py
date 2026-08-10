@@ -799,6 +799,25 @@ def _err(code: int, msg: str) -> tuple[int, dict]:
     return code, {"ok": False, "error": msg}
 
 
+def resolve_storefront_key(raw_key: str) -> int | None:
+    """Return shop_chat_id for a public storefront_keys entry, or None.
+
+    Claim tokens (vendor_invites) never resolve here — storefront_keys only.
+    """
+    ensure_webpanel_tables()
+    raw = normalize_invite_token(raw_key)
+    if not re.fullmatch(r"[0-9a-fA-F]{24}", raw):
+        return None
+    with db.get_db() as conn:
+        row = conn.execute(
+            "SELECT shop_chat_id FROM storefront_keys WHERE key_hash = ?",
+            (_hash(raw),),
+        ).fetchone()
+    if not row or not row["shop_chat_id"]:
+        return None
+    return int(db.resolve_shop_chat_id(int(row["shop_chat_id"])))
+
+
 def api_storefront(raw_key: str) -> tuple[int, dict]:
     """Public, read-only catalog for a vendor's mini-app storefront.
 
@@ -807,18 +826,9 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
     claim. Exposes names, prices, kit prices, stock, shipping terms and
     payment-method names only — no instructions, no admin data.
     """
-    ensure_webpanel_tables()
-    raw = normalize_invite_token(raw_key)
-    if not re.fullmatch(r"[0-9a-fA-F]{24}", raw):
+    chat_id = resolve_storefront_key(raw_key)
+    if chat_id is None:
         return _err(404, "unknown storefront")
-    with db.get_db() as conn:
-        row = conn.execute(
-            "SELECT shop_chat_id FROM storefront_keys WHERE key_hash = ?",
-            (_hash(raw),),
-        ).fetchone()
-    if not row or not row["shop_chat_id"]:
-        return _err(404, "unknown storefront")
-    chat_id = db.resolve_shop_chat_id(int(row["shop_chat_id"]))
     shop = db.get_shop(chat_id) or db.ensure_shop(chat_id)
     products = db.list_products(chat_id, active_only=True)
     payments = db.list_payment_methods(chat_id, active_only=True)
