@@ -685,6 +685,12 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
                 "stock": int(p.get("stock") or 0),
                 "photo_url": ((p.get("photo_file_id") or "").strip()
                               if (p.get("photo_file_id") or "").startswith("http") else ""),
+                "category": (
+                    (str(p["category"]).strip() or None)
+                    if p.get("category") is not None
+                    else None
+                ),
+                "sort_order": int(p.get("sort_order") or 0),
             }
             for p in products
         ],
@@ -717,6 +723,9 @@ def _audit_stock(
 
 def _product_public(p: dict) -> dict:
     photo = (p.get("photo_file_id") or "").strip()
+    cat = p.get("category")
+    if cat is not None:
+        cat = str(cat).strip() or None
     return {
         "id": p["id"],
         "name": p["name"],
@@ -731,6 +740,8 @@ def _product_public(p: dict) -> dict:
         "has_photo": bool(photo),
         "coa_url": (p.get("coa_url") or "").strip(),
         "has_coa_file": bool((p.get("coa_file_id") or "").strip()),
+        "category": cat,
+        "sort_order": int(p.get("sort_order") or 0),
     }
 
 
@@ -819,6 +830,22 @@ def api_product(tok: dict, payload: dict) -> tuple[int, dict]:
         fields["unit"] = unit
     if payload.get("active") is not None:
         fields["active"] = 1 if payload["active"] in (1, True, "1", "true") else 0
+    if "category" in payload:
+        cat = payload.get("category")
+        if cat is None or (isinstance(cat, str) and not cat.strip()):
+            fields["category"] = None
+        else:
+            cat_s = " ".join(str(cat).split())[:40]
+            fields["category"] = cat_s or None
+    if "sort_order" in payload and payload.get("sort_order") is not None:
+        try:
+            so = int(payload["sort_order"])
+        except (TypeError, ValueError):
+            return _err(400, "Bad sort_order")
+        # Keep display order in a sane range
+        if so < -1_000_000 or so > 1_000_000:
+            return _err(400, "sort_order out of range")
+        fields["sort_order"] = so
 
     if pid is None:
         if not name:
@@ -833,7 +860,9 @@ def api_product(tok: dict, payload: dict) -> tuple[int, dict]:
             unit=fields.get("unit", "vial"),
         )
         extra = {
-            k: v for k, v in fields.items() if k in ("kit_price", "active")
+            k: v
+            for k, v in fields.items()
+            if k in ("kit_price", "active", "category", "sort_order")
         }
         if extra:
             db.update_product(new_id, **extra)
@@ -1810,6 +1839,8 @@ PANEL_HTML = """<!doctype html>
   .row>div{flex:1;min-width:70px}
   .row .name{flex:2.5;min-width:140px}
   .row .num{max-width:92px}
+  .row .ord{max-width:72px}
+  .row .cat{flex:1.4;min-width:110px}
   .prod{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
   .off{opacity:.55}
   .tag{font-size:.72rem;color:var(--mut)}
@@ -1935,6 +1966,8 @@ function prodRow(p){
   const coaBit=p.coa_url
     ? `<a href="${esc(p.coa_url)}" target="_blank" rel="noopener">COA ✓</a>`
     : (p.has_coa_file?'<span class="tag">COA file in Telegram</span>':'<span class="tag">no COA</span>');
+  const cat=p.category==null?'':esc(p.category);
+  const so=(p.sort_order==null||p.sort_order==='')?0:p.sort_order;
   return `<div class="prod${p.active?'':' off'}" data-id="${p.id}">
     <div class="row">
       <div class="name"><label>Product</label>
@@ -1945,6 +1978,17 @@ function prodRow(p){
         <input class="f-kit" type="number" step="0.01" min="0" value="${p.kit_price==null?'':p.kit_price}"></div>
       <div class="num"><label>Stock</label>
         <input class="f-stock${low}" type="number" step="1" min="0" value="${p.stock}"></div>
+    </div>
+    <div class="row">
+      <div class="cat"><label>Category</label>
+        <input class="f-cat" list="cat-suggestions" value="${cat}"
+          placeholder="e.g. Peptides" maxlength="40"></div>
+      <div class="ord"><label>Order</label>
+        <input class="f-order" type="number" step="1" value="${so}" title="Lower numbers show first"></div>
+      <div class="flex" style="align-items:end;gap:4px;padding-bottom:1px">
+        <button type="button" class="sub b-up" title="Move up">▲</button>
+        <button type="button" class="sub b-dn" title="Move down">▼</button>
+      </div>
     </div>
     <div class="flex media">
       ${thumb}
@@ -2005,6 +2049,11 @@ function render(){
   </div>
   <div id="tab-catalog" class="${TAB==='catalog'?'':'hide'}">
   <div class="card"><h2>Products (${S.products.length})</h2>
+    <datalist id="cat-suggestions">
+      <option value="GLP-1"><option value="Recovery"><option value="Longevity">
+      <option value="Blends"><option value="Peptides"><option value="Supplies">
+      <option value="Other">
+    </datalist>
     <div class="flex" style="margin-bottom:10px">
       <button id="restock-on">📦 Received a shipment</button>
       <span class="tag grow">Adds to stock instead of replacing it</span>
@@ -2235,13 +2284,37 @@ function wire(){
       if(!confirm('Remove this COA?'))return;
       await media({id,kind:'coa',clear:true});};
     el.querySelector('.b-save').onclick=async()=>{
+      const ordRaw=el.querySelector('.f-order').value;
+      const sort_order=ordRaw===''?0:parseInt(ordRaw,10);
       const d=await api('product',{id:el.dataset.id,
         name:el.querySelector('.f-name').value,
         price:el.querySelector('.f-price').value,
         kit_price:el.querySelector('.f-kit').value||null,
         stock:el.querySelector('.f-stock').value,
+        category:el.querySelector('.f-cat').value,
+        sort_order:Number.isFinite(sort_order)?sort_order:0,
         active:el.querySelector('.f-act').checked});
-      if(d.ok)toast('Saved');};});
+      if(d.ok)toast('Saved');};
+    const swapOrder=async(dir)=>{
+      const list=[...document.querySelectorAll('#plist .prod')];
+      const i=list.indexOf(el);
+      const j=i+dir;
+      if(j<0||j>=list.length)return;
+      const a=list[i],b=list[j];
+      const ao=parseInt(a.querySelector('.f-order').value||'0',10)||0;
+      const bo=parseInt(b.querySelector('.f-order').value||'0',10)||0;
+      // If both share the same order, assign i/j so the swap sticks
+      const na=(ao===bo)?j:bo, nb=(ao===bo)?i:ao;
+      a.querySelector('.f-order').value=na;
+      b.querySelector('.f-order').value=nb;
+      const r1=await api('product',{id:a.dataset.id,sort_order:na});
+      const r2=await api('product',{id:b.dataset.id,sort_order:nb});
+      if(r1.ok&&r2.ok){toast('Order updated');load();}
+      else toast('Could not reorder',true);
+    };
+    el.querySelector('.b-up').onclick=()=>swapOrder(-1);
+    el.querySelector('.b-dn').onclick=()=>swapOrder(1);
+  });
   $('#np-add').onclick=async()=>{
     const d=await api('product',{name:$('#np-name').value,
       price:$('#np-price').value,stock:$('#np-stock').value||0,
