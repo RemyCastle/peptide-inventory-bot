@@ -1488,7 +1488,13 @@ def _order_public(order: dict) -> dict:
 
 
 def api_orders(tok: dict, payload: dict | None = None) -> tuple[int, dict]:
-    """List this shop's orders: actionable first, then recent paid/shipped."""
+    """Active work list: orders that still need action.
+
+    Unpaid (needs payment confirm) surface first, then paid (needs shipping).
+    Once tracking is added the order becomes 'shipped' and auto-clears from this
+    list — same for complete/cancelled/rejected — since she's done with it.
+    Every status remains in the downloadable history export (api_order_history_txt).
+    """
     chat_id = int(tok["chat_id"])
     # Pull enough rows; group in Python so actionable always surfaces first
     rows = db.list_orders(chat_id, status=None, limit=80)
@@ -1497,12 +1503,11 @@ def api_orders(tok: dict, payload: dict | None = None) -> tuple[int, dict]:
     for o in rows:
         st = str(o.get("status") or "")
         if st in _ACTIONABLE_STATUSES:
-            actionable.append(o)
-        elif st in ("paid", "shipped", "complete"):
-            rest.append(o)
-        # cancelled/rejected still useful briefly — keep a few
-        elif st in ("cancelled", "rejected"):
-            rest.append(o)
+            actionable.append(o)          # needs payment confirmation
+        elif st == "paid":
+            rest.append(o)                # paid → still needs shipping/tracking
+        # shipped / complete / cancelled / rejected auto-clear from the active
+        # list (they stay in the history export for the record).
     # list_orders is already newest-first (id DESC)
     combined = actionable + rest
     return 200, {
