@@ -6,6 +6,9 @@ Adds the website → Telegram order pipeline to this bot:
     status pending|placed|received      → owner-only phone alert (prices OK)
     status paid|shipped|complete        → ONE message PER supplier (no prices),
                                           then ask each supplier for total + OOS
+- POST /order    (public, Telegram initData auth) → mini-app checkout for all
+    launch modes (startapp / home / menu / keyboard); CORS for Pages origin
+- OPTIONS /order → CORS preflight
 - POST /resolve-chat (secret)  → username → chat id (getChat + recent-chat fallback)
 - GET  /recent-chats (secret)  → chats that recently messaged the bot (admin picker)
 - GET  / and /health           → status JSON (Render health check, no secret)
@@ -718,6 +721,12 @@ def handle_resolve_chat(payload: dict) -> tuple[int, dict]:
 
 # ── HTTP server ──────────────────────────────────────────────────────────────
 
+ORDER_STOCK_ERROR = (
+    "Couldn't place that order — something in your cart just sold "
+    "out or the quantity isn't available. Reopen the store to see live stock."
+)
+
+
 def _status_body() -> dict:
     with _state_lock:
         token_ok = bool(_bot_token)
@@ -736,17 +745,206 @@ def _status_body() -> dict:
     }
 
 
+def handle_http_order(payload: dict) -> tuple[int, dict]:
+    """POST /order — mini-app checkout for all launch modes (initData auth).
+
+    Sync only (HTTP thread). One successful call creates exactly one order.
+    Never raises — maps failures to 400/401/404/409 JSON.
+    """
+    import db
+    import vendor_stores
+    import webpanel
+
+    try:
+        if not isinstance(payload, dict):
+            return 400, {"ok": False, "error": "bad payload"}
+
+        invite = str(payload.get("invite") or "").strip()
+        init_data = payload.get("initData")
+        if init_data is not None and not isinstance(init_data, str):
+            init_data = str(init_data)
+        init_data = (init_data or "").strip()
+        raw_items = payload.get("items")
+
+        log.info(
+            "POST /order invite=%s initData_len=%s items=%s",
+            (invite[:8] + "…") if len(invite) > 8 else invite,
+            len(init_data),
+            len(raw_items) if isinstance(raw_items, list) else type(raw_items).__name__,
+        )
+
+        # 1) Resolve shop via public storefront_keys only
+        shop_chat_id = webpanel.resolve_storefront_key(invite)
+        if shop_chat_id is None:
+            log.info("POST /order unknown storefront invite")
+            return 404, {"ok": False, "error": "unknown storefront"}
+
+        # 2) Auth boundary: initData signed with this shop's vendor bot token
+        vendor_token = vendor_stores.get_bot_token_for_shop(shop_chat_id)
+        if not vendor_token:
+            log.warning(
+                "POST /order no vendor bot token for shop=%s", shop_chat_id
+            )
+            return 401, {"ok": False, "error": "invalid initData"}
+        try:
+            buyer = vendor_stores.validate_webapp_init_data(init_data, vendor_token)
+        except vendor_stores.InitDataError as exc:
+            log.info(
+                "POST /order initData rejected shop=%s: %s", shop_chat_id, exc
+            )
+            return 401, {"ok": False, "error": "invalid initData"}
+
+        buyer_id = int(buyer["user_id"])
+        username = buyer.get("username")
+        full_name = buyer.get("full_name")
+        log.info(
+            "POST /order auth ok shop=%s buyer=%s (@%s)",
+            shop_chat_id,
+            buyer_id,
+            username or "—",
+        )
+
+        # 3) Cart + ship (same helpers as on_web_app_data)
+        try:
+            items = vendor_stores.parse_miniapp_cart_items(raw_items)
+        except Exception as exc:
+            log.info("POST /order bad cart shop=%s: %s", shop_chat_id, exc)
+            return 400, {"ok": False, "error": "bad payload"}
+        if not items:
+            return 400, {"ok": False, "error": "empty cart"}
+
+        ship_name, ship_address, ship_notes = vendor_stores.parse_ship_fields(
+            payload
+        )
+
+        # 4) Create order (exactly once)
+        order = db.create_order(
+            chat_id=shop_chat_id,
+            user_id=buyer_id,
+            username=username,
+            full_name=full_name,
+            items=items,
+            payment_method=None,
+            ship_name=ship_name,
+            ship_address=ship_address,
+            ship_notes=ship_notes,
+        )
+        if not order:
+            log.info(
+                "POST /order stock/create failed shop=%s buyer=%s",
+                shop_chat_id,
+                buyer_id,
+            )
+            return 409, {"ok": False, "error": ORDER_STOCK_ERROR}
+
+        order_id = int(order["id"])
+        code = order.get("payment_code") or f"#{order_id}"
+        total = float(order.get("total") or 0)
+        log.info(
+            "POST /order created order_id=%s code=%s total=%s shop=%s",
+            order_id,
+            code,
+            total,
+            shop_chat_id,
+        )
+
+        meta = vendor_stores.vendor_meta_for_shop(shop_chat_id)
+        emoji = meta.get("emoji") or "\U0001f6cd"
+        shop_name = meta.get("name") or "the shop"
+        order_lines = db.get_order_items(order_id)
+
+        # 5) Notify owner/vendor (sync; vendor bot then main bot)
+        note = vendor_stores.build_new_order_notify_text(
+            order,
+            shop_name=shop_name,
+            emoji=emoji,
+            order_lines=order_lines,
+        )
+        base_ids = vendor_stores.base_notify_ids_for_shop(shop_chat_id)
+        recipients = vendor_stores.build_notify_recipient_ids(base_ids, shop_chat_id)
+        for rid in recipients:
+            delivered = False
+            try:
+                delivered = bool(
+                    webpanel.telegram_send_with_token(
+                        vendor_token, rid, note, parse_mode=None
+                    )
+                )
+            except Exception:
+                log.exception(
+                    "POST /order vendor notify failed shop=%s rid=%s",
+                    shop_chat_id,
+                    rid,
+                )
+            if delivered:
+                log.info(
+                    "POST /order notified rid=%s via vendor bot", rid
+                )
+                continue
+            try:
+                send_telegram(rid, note)
+                log.info("POST /order notified rid=%s via main bot", rid)
+            except Exception as exc:
+                log.warning(
+                    "POST /order notify failed rid=%s: %s", rid, exc
+                )
+
+        # 6) Buyer confirmation (same body as sendData path, plain text)
+        message = vendor_stores.build_customer_order_received_text(
+            order,
+            shop_chat_id,
+            emoji=emoji,
+            markdown=False,
+            order_lines=order_lines,
+        )
+        try:
+            ok_buyer = webpanel.telegram_send_with_token(
+                vendor_token, buyer_id, message, parse_mode=None
+            )
+            if not ok_buyer:
+                log.warning(
+                    "POST /order buyer confirm failed shop=%s buyer=%s",
+                    shop_chat_id,
+                    buyer_id,
+                )
+        except Exception:
+            log.exception(
+                "POST /order buyer confirm error shop=%s buyer=%s",
+                shop_chat_id,
+                buyer_id,
+            )
+
+        payments = vendor_stores.payment_display_lines(shop_chat_id)
+        return 200, {
+            "ok": True,
+            "code": code,
+            "total": total,
+            "payments": payments,
+            "message": message,
+        }
+    except Exception as exc:
+        log.error("POST /order unexpected error: %s", exc, exc_info=exc)
+        return 400, {"ok": False, "error": "bad payload"}
+
+
 class NotifyHTTPHandler(BaseHTTPRequestHandler):
     server_version = "SPBCNotify/1.0"
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
         return
 
-    def _json(self, code: int, body: dict) -> None:
+    def _cors_order_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def _json(self, code: int, body: dict, *, cors: bool = False) -> None:
         raw = json.dumps(body).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
+        if cors:
+            self._cors_order_headers()
         self.end_headers()
         self.wfile.write(raw)
 
@@ -799,9 +997,28 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/order":
+            self.send_response(204)
+            self._cors_order_headers()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path == "/order":
+            # CORS-visible method probe; checkout is POST only.
+            self._json(
+                405,
+                {"ok": False, "error": "method not allowed"},
+                cors=True,
+            )
+            return
         if path in ("/", "/health"):
             self._json(200, _status_body())
             return
@@ -944,6 +1161,25 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
+        if path == "/order":
+            try:
+                payload = self._read_json()
+                if payload is None:
+                    self._json(
+                        400, {"ok": False, "error": "bad payload"}, cors=True
+                    )
+                    return
+                code, body = handle_http_order(payload)
+                self._json(code, body, cors=True)
+            except Exception as exc:
+                log.error("POST /order handler crash: %s", exc, exc_info=exc)
+                try:
+                    self._json(
+                        400, {"ok": False, "error": "bad payload"}, cors=True
+                    )
+                except Exception:
+                    pass
+            return
         if path == "/track":
             import webpanel
 
