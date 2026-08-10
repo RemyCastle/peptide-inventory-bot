@@ -2405,6 +2405,142 @@ def cancel_order(order_id: int, user_id: int | None = None) -> tuple[bool, str]:
         return True, "Order cancelled. Inventory unchanged."
 
 
+# Statuses where stock was (or may have been) decremented at confirm.
+_STOCK_RESTORED_ON_CANCEL = frozenset({"paid", "shipped", "complete"})
+_CANCEL_NOOP_STATUSES = frozenset({"cancelled", "rejected"})
+_CANCEL_PENDING_STATUSES = frozenset({"pending_payment", "awaiting_confirmation"})
+
+
+def cancel_order_any(
+    order_id: int,
+    actor_id: int,
+    note: str = "",
+    restore_stock: bool = True,
+) -> tuple[bool, str]:
+    """Vendor/admin cancel for pending or paid orders. Never raises.
+
+    - pending_payment / awaiting_confirmation: mark cancelled (stock was never
+      decremented → no restore).
+    - paid / shipped / complete: restore stock per order_items (resolve
+      linked_product_id like confirm), write stock_audit reason=cancel_restock,
+      then mark cancelled.
+    - already cancelled / rejected: friendly no-op success.
+    """
+    try:
+        oid = int(order_id)
+    except (TypeError, ValueError):
+        return False, "Order not found."
+    note_s = (note or "").strip()[:500]
+    try:
+        with get_db() as conn:
+            order = conn.execute(
+                "SELECT * FROM orders WHERE id = ?", (oid,)
+            ).fetchone()
+            if not order:
+                return False, "Order not found."
+            status = str(order["status"] or "")
+            if status in _CANCEL_NOOP_STATUSES:
+                return True, f"Order already {status}."
+            if status in _CANCEL_PENDING_STATUSES:
+                if note_s:
+                    conn.execute(
+                        """
+                        UPDATE orders
+                        SET status = 'cancelled', admin_note = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (note_s, _utc_now(), oid),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE orders SET status = 'cancelled', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (_utc_now(), oid),
+                    )
+                return True, "Order cancelled. Inventory unchanged."
+
+            if status not in _STOCK_RESTORED_ON_CANCEL:
+                return False, f"Cannot cancel order in status: {status}."
+
+            if restore_stock:
+                items = conn.execute(
+                    "SELECT * FROM order_items WHERE order_id = ?", (oid,)
+                ).fetchall()
+                # Aggregate restore qty by root stock_id (mirror confirm).
+                restore_by_stock_id: dict[int, int] = {}
+                for it in items:
+                    if it["product_id"] is None:
+                        continue
+                    prod = conn.execute(
+                        "SELECT id, linked_product_id FROM products WHERE id = ?",
+                        (it["product_id"],),
+                    ).fetchone()
+                    if not prod:
+                        continue
+                    stock_id = int(prod["linked_product_id"] or prod["id"])
+                    restore_by_stock_id[stock_id] = restore_by_stock_id.get(
+                        stock_id, 0
+                    ) + int(it["quantity"])
+
+                for stock_id, qty in restore_by_stock_id.items():
+                    if qty <= 0:
+                        continue
+                    root = conn.execute(
+                        "SELECT id, chat_id, name, stock FROM products WHERE id = ?",
+                        (stock_id,),
+                    ).fetchone()
+                    if not root:
+                        continue
+                    before = int(root["stock"])
+                    after = before + qty
+                    conn.execute(
+                        """
+                        UPDATE products
+                        SET stock = stock + ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (qty, _utc_now(), stock_id),
+                    )
+                    _insert_audit(
+                        conn,
+                        chat_id=int(root["chat_id"]),
+                        product_id=int(root["id"]),
+                        product_name=root["name"],
+                        delta=qty,
+                        stock_before=before,
+                        stock_after=after,
+                        reason="cancel_restock",
+                        actor_id=int(actor_id) if actor_id is not None else None,
+                        order_id=oid,
+                    )
+
+            if note_s:
+                conn.execute(
+                    """
+                    UPDATE orders
+                    SET status = 'cancelled', admin_note = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (note_s, _utc_now(), oid),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE orders SET status = 'cancelled', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_utc_now(), oid),
+                )
+            if restore_stock:
+                return True, "Order cancelled. Inventory restored."
+            return True, "Order cancelled. Inventory not restored."
+    except Exception as exc:
+        log.exception("cancel_order_any failed order=%s: %s", order_id, exc)
+        return False, "Could not cancel order."
+
+
 # ── Formatting helpers ───────────────────────────────────────────────────────
 
 
