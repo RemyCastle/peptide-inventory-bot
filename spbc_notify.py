@@ -1493,6 +1493,56 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
             code, ctype, body = webpanel.handle_panel_post(path, payload)
             self._send_raw(code, ctype, body)
             return
+        if path == "/vendor-create":
+            # SPBC admin: stand up a vendor shop and get their handover link,
+            # so a vendor can be added without opening Telegram.
+            if not self._check_secret():
+                return
+            payload = self._read_json()
+            if payload is None:
+                self._json(400, {"error": "bad_json"})
+                return
+            try:
+                import db as _db
+                import webpanel as _wp
+                from config import OWNER_IDS as _owners
+
+                name = " ".join(str(payload.get("name") or "").split())[:80]
+                if not name:
+                    self._json(400, {"ok": False, "message": "Vendor name required"})
+                    return
+                owner = min(_owners) if _owners else 0
+                shop = _db.create_virtual_shop(name, owner)
+                sid = int(shop["chat_id"])
+                token = _wp.create_vendor_invite(owner, name, shop_chat_id=sid)
+                me = _telegram_api("getMe", {})
+                username = ((me.get("result") or {}).get("username") or "").lstrip("@")
+                link = (
+                    f"https://t.me/{username}?start=vendor{token}" if username else ""
+                )
+                panel = ""
+                try:
+                    from config import PANEL_BASE_URL as _panel
+
+                    if _panel:
+                        panel = _wp.panel_url(_panel, _wp.issue_token(sid, owner))
+                except Exception:
+                    panel = ""
+                log.info("vendor shop created via admin: %s (%s)", name, sid)
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "shop_chat_id": sid,
+                        "title": shop["title"],
+                        "handover_link": link,
+                        "panel_link": panel,
+                    },
+                )
+            except Exception as exc:
+                log.error("vendor-create failed: %s", exc, exc_info=exc)
+                self._json(502, {"ok": False, "error": str(exc)})
+            return
         if path == "/vendor-link":
             if not self._check_secret():
                 return
