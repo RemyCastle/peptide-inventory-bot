@@ -37,10 +37,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import html as html_mod
+import io
 import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -48,6 +51,7 @@ import urllib.parse
 from telegram import KeyboardButton, ReplyKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -358,6 +362,187 @@ def payment_display_lines(shop_chat_id: int) -> list[str]:
     return [
         f"{p['name']}: {p['instructions']}".rstrip(": ") for p in pays
     ]
+
+
+def _h(s) -> str:
+    """Escape text for Telegram HTML parse mode."""
+    return html_mod.escape(str(s or ""), quote=False)
+
+
+_PAY_TARGET_RE = re.compile(
+    r"(@[A-Za-z0-9_.\-]+|\$[A-Za-z0-9_]+|[\w.+-]+@[\w-]+\.[\w.]+)"
+)
+
+
+def _method_kind_and_target(method: dict) -> tuple[str, str]:
+    """(method_type, pay target) — inferred for legacy instructions-only rows."""
+    mt = (method.get("method_type") or "").lower().strip()
+    if not mt:
+        name = (method.get("name") or "").lower()
+        for kind, needle in (
+            ("venmo", "venmo"),
+            ("cashapp", "cash"),
+            ("paypal", "paypal"),
+            ("zelle", "zelle"),
+            ("apple_cash", "apple"),
+        ):
+            if needle in name:
+                mt = kind
+                break
+    target = (
+        method.get("cashtag") or method.get("handle") or method.get("address") or ""
+    ).strip()
+    if not target and mt:
+        m = _PAY_TARGET_RE.search(method.get("instructions") or "")
+        if m:
+            target = m.group(1)
+    return mt, target
+
+
+def payment_pay_link(method: dict, total: float, code: str) -> str | None:
+    """Deep link that pre-fills the amount (and note where supported).
+
+    Venmo pre-fills amount + order code in the note; Cash App and PayPal.me
+    pre-fill the amount only. Email PayPal / Zelle / Apple Cash / crypto /
+    custom have no universal pay URL → None.
+    """
+    mt, target = _method_kind_and_target(method)
+    if not target:
+        return None
+    amt = f"{float(total):.2f}"
+    q = urllib.parse.quote
+    if mt == "venmo":
+        h = target.lstrip("@$")
+        if h:
+            return (
+                f"https://venmo.com/{q(h)}?txn=pay&amount={amt}&note={q(code)}"
+            )
+    elif mt == "cashapp":
+        tag = target.lstrip("@")
+        if tag:
+            if not tag.startswith("$"):
+                tag = "$" + tag
+            return f"https://cash.app/{q(tag)}/{amt}"
+    elif mt == "paypal":
+        h = target.lstrip("@")
+        # paypal.me only works for usernames, not emails
+        if h and "@" not in h:
+            return f"https://paypal.me/{q(h)}/{amt}"
+    return None
+
+
+def _payment_method_html(p: dict, total: float, code: str) -> str:
+    """One payment method as Telegram-HTML lines with tap-to-copy target."""
+    mt, target = _method_kind_and_target(p)
+    lines = [f"• <b>{_h(p.get('name') or 'Payment')}</b>"]
+    if target:
+        lines[0] += f" — send to <code>{_h(target)}</code>"
+    if mt == "paypal":
+        ff = (p.get("network_note") or "friends_family") == "friends_family"
+        lines.append(
+            "   ⚠️ Send as <b>Friends &amp; Family</b>" if ff
+            else "   Send as <b>Goods &amp; Services</b>"
+        )
+    elif mt == "crypto":
+        if p.get("network_note"):
+            lines.append(f"   Network: {_h(p['network_note'])}")
+        lines.append("   ⚠️ Double-check the network before sending.")
+    elif not target:
+        # custom / free-text method: show its instructions verbatim (escaped)
+        instr = (p.get("instructions") or "").strip()
+        if instr:
+            lines.append(f"   {_h(instr)}")
+    link = payment_pay_link(p, total, code)
+    if link:
+        prefills = "amount + order code" if mt == "venmo" else "amount"
+        lines.append(
+            f'   👉 <a href="{html_mod.escape(link)}">Tap to pay '
+            f"{_fmt_money(total)}</a> ({prefills} prefilled)"
+        )
+    return "\n".join(lines)
+
+
+def build_customer_order_received_html(
+    order: dict,
+    shop_chat_id: int,
+    *,
+    emoji: str = "\U0001f6cd",
+    order_lines: list[dict] | None = None,
+) -> str:
+    """Telegram-HTML customer receipt: tap-to-copy payment code + pay links."""
+    oid = int(order["id"])
+    if order_lines is None:
+        order_lines = db.get_order_items(oid)
+    code = order.get("payment_code") or f"#{oid}"
+    total = float(order.get("total") or 0)
+
+    lines = [
+        f"  • {_h(ln['product_name'])} × {ln['quantity']} — "
+        f"{_fmt_money(ln['line_total'])}"
+        for ln in order_lines or []
+    ]
+    if order.get("shipping_fee"):
+        lines.append(f"  • Shipping — {_fmt_money(order['shipping_fee'])}")
+
+    ship_bits = []
+    if (order.get("ship_name") or "").strip():
+        ship_bits.append(f"  {_h(order['ship_name'].strip())}")
+    if (order.get("ship_address") or "").strip():
+        ship_bits.append(f"  {_h(order['ship_address'].strip())}")
+    ship_block = ("\n\n📦 Ship to:\n" + "\n".join(ship_bits)) if ship_bits else ""
+
+    pays = db.list_payment_methods(int(shop_chat_id))
+    if pays:
+        pay_txt = "\n".join(_payment_method_html(p, total, code) for p in pays)
+    else:
+        pay_txt = "  • Payment details will be DM'd to you."
+
+    return (
+        f"{emoji} <b>Order received!</b>\n\n"
+        + "\n".join(lines)
+        + ship_block
+        + f"\n\n<b>Total: {_fmt_money(total)}</b>\n"
+        + f"Order code: <code>{_h(code)}</code>\n"
+        + "(tap the code to copy it, then paste it in the payment note)\n\n"
+        + "Pay with:\n"
+        + pay_txt
+        + "\n\nYou'll get a confirmation here once payment lands."
+    )
+
+
+def build_payment_qr_photos(
+    shop_chat_id: int, total: float, code: str
+) -> list[tuple[bytes, str]]:
+    """(png_bytes, html_caption) per link-capable payment method.
+
+    Scannable from another device — the QR encodes the same prefilled pay
+    link. Returns [] if the optional `segno` dependency is missing.
+    """
+    try:
+        import segno
+    except ImportError:
+        log.warning("segno not installed — skipping payment QR codes")
+        return []
+    out: list[tuple[bytes, str]] = []
+    for p in db.list_payment_methods(int(shop_chat_id)):
+        link = payment_pay_link(p, total, code)
+        if not link:
+            continue
+        buf = io.BytesIO()
+        try:
+            segno.make(link, error="m").save(
+                buf, kind="png", scale=8, border=2
+            )
+        except Exception:
+            log.exception("QR render failed for method %s", p.get("name"))
+            continue
+        cap = (
+            f"📱 Scan to pay <b>{_fmt_money(total)}</b> via "
+            f"{_h(p.get('name') or 'link')} — order "
+            f"<code>{_h(code)}</code>"
+        )
+        out.append((buf.getvalue(), cap))
+    return out
 
 
 def build_notify_recipient_ids(base_ids, shop_chat_id: int) -> list[int]:
@@ -824,11 +1009,10 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
             return
 
         order_lines = db.get_order_items(int(order["id"]))
-        md_text = build_customer_order_received_text(
+        html_text = build_customer_order_received_html(
             order,
             shop_chat_id,
             emoji=emoji,
-            markdown=True,
             order_lines=order_lines,
         )
         plain_text = build_customer_order_received_text(
@@ -839,15 +1023,29 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
             order_lines=order_lines,
         )
 
-        # Customer reply must not block owner notify if Telegram rejects Markdown.
+        # Customer reply must not block owner notify if Telegram rejects HTML.
         try:
-            await msg.reply_text(md_text, parse_mode="Markdown")
+            await msg.reply_text(
+                html_text, parse_mode="HTML", disable_web_page_preview=True
+            )
         except Exception as e:
             log.warning("[%s] customer confirm reply failed (order still saved): %s", name, e)
             try:
                 await msg.reply_text(plain_text)
             except Exception as e2:
                 log.warning("[%s] plain customer confirm also failed: %s", name, e2)
+
+        # Scannable pay-link QRs (amount + order code prefilled where supported)
+        try:
+            qrs = build_payment_qr_photos(
+                shop_chat_id,
+                float(order.get("total") or 0),
+                order.get("payment_code") or f"#{order['id']}",
+            )
+            for png, cap in qrs:
+                await msg.reply_photo(photo=png, caption=cap, parse_mode="HTML")
+        except Exception as e:
+            log.warning("[%s] payment QR send failed (order still saved): %s", name, e)
 
         # Owner/vendor NEW ORDER: try vendor storefront bot, then main bot.
         # Recipients may have started either bot (storefront or claim via SPBC).
@@ -861,10 +1059,69 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
         for nid in recipients:
             await notify_order_recipient(shop_chat_id, nid, note, context=context)
 
+    async def on_offer_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Accept/Decline an SPBC fulfillment offer from inside the vendor's bot.
+
+        Offers are delivered through this bot, so the taps land here rather
+        than on the main SPBC bot. Stock only moves — and the customer's
+        address is only released — on Accept.
+        """
+        import order_router
+
+        query = update.callback_query
+        user = update.effective_user
+        action, _, quote_id = (query.data or "").partition(":")
+        allowed, why, _q = order_router.can_accept(quote_id, user.id if user else 0)
+        if not allowed:
+            await query.answer(why, show_alert=True)
+            return
+
+        owner_ids = _owner_ids()
+        if action == "voffer_no":
+            ok, msg, quote = order_router.decline_quote(quote_id, user.id)
+            if not ok:
+                await query.answer(msg, show_alert=True)
+                return
+            await query.answer("Declined — thanks for the quick answer.")
+            await query.edit_message_text(
+                f"❌ Declined order {quote['order_number']}. Nothing changed on "
+                "your side — SPBC will ask someone else."
+            )
+            for oid in owner_ids:
+                await notify_order_recipient(
+                    quote["shop_chat_id"],
+                    oid,
+                    f"❌ {quote['shop_title']} declined order "
+                    f"{quote['order_number']}. No stock moved, no address shared.",
+                    context=context,
+                )
+            return
+
+        ok, msg, quote = order_router.apply_route(quote_id, user.id)
+        if not ok:
+            await query.answer(msg, show_alert=True)
+            return
+        await query.answer("Accepted ✅")
+        # Full details INCLUDING the shipping address, now that they committed
+        await query.edit_message_text(order_router.build_vendor_message(quote))
+        order_router.dismiss_order(quote["order_number"])
+        for oid in owner_ids:
+            await notify_order_recipient(
+                quote["shop_chat_id"],
+                oid,
+                f"✅ {quote['shop_title']} accepted order "
+                f"{quote['order_number']} — ${quote['total']:.2f}. "
+                "Stock deducted, address sent to them.",
+                context=context,
+            )
+
     app = Application.builder().token(v["token"]).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))
+    # SPBC fulfillment offers arrive through THIS bot, so Accept/Decline taps
+    # come back here — not to the main SPBC bot.
+    app.add_handler(CallbackQueryHandler(on_offer_answer, pattern=r"^voffer_(ok|no):"))
     return app
 
 

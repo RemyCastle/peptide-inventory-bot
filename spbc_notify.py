@@ -155,6 +155,29 @@ def match_source(sources: Any, item_name: str) -> Optional[str]:
     return None
 
 
+def format_ship_lines(ship: Any) -> list[str]:
+    """Address block shared by supplier messages and late address updates."""
+    if not isinstance(ship, dict):
+        return []
+    city_line = ", ".join(
+        str(v)
+        for v in (ship.get("city"), ship.get("state"), ship.get("postal"))
+        if v
+    )
+    out = []
+    for s in (
+        ship.get("name"),
+        ship.get("line1"),
+        ship.get("line2"),
+        city_line,
+        ship.get("country"),
+        ship.get("phone"),
+    ):
+        if s:
+            out.append(str(s))
+    return out
+
+
 def money_from_cents(cents: Any) -> Optional[str]:
     try:
         n = float(cents)
@@ -272,20 +295,9 @@ def build_supplier_message(payload: dict, group: dict) -> str:
                 lines.append(f"  Notes: {clean}")
 
     if isinstance(ship, dict) and (ship.get("line1") or ship.get("name")):
-        lines += ["", "Ship to:"]
-        city_line = ", ".join(
-            str(v) for v in (ship.get("city"), ship.get("state"), ship.get("postal")) if v
-        )
-        for s in (
-            ship.get("name"),
-            ship.get("line1"),
-            ship.get("line2"),
-            city_line,
-            ship.get("country"),
-            ship.get("phone"),
-        ):
-            if s:
-                lines.append(str(s))
+        lines += ["", "Ship to:", *format_ship_lines(ship)]
+        if not ship.get("complete", True):
+            lines.append("(address not finalised by the customer yet)")
     else:
         lines += ["", "Shipping: (not on file yet)"]
 
@@ -530,6 +542,78 @@ def handle_notify(payload: dict) -> tuple[int, dict]:
     order_number = payload.get("order_number") or payload.get("orderNumber")
     if not order_number:
         return 400, {"error": "order_number required"}
+
+    # A shipping address that arrived after the order was already routed:
+    # forward it to whoever is fulfilling, else tell the owner.
+    if status == "address_update":
+        ship = payload.get("shipping")
+        if not isinstance(ship, dict):
+            return 400, {"error": "shipping required"}
+        lines = [
+            f"📬 Shipping address for order {order_number}",
+            "",
+            *format_ship_lines(ship),
+        ]
+        if not ship.get("complete", True):
+            lines.append("\n(customer hasn't finished the form — may change)")
+        text = "\n".join(lines)
+
+        vendor = None
+        try:
+            import order_router
+
+            vendor = order_router.routed_vendor(str(order_number))
+        except Exception as exc:
+            log.warning("routed_vendor lookup failed: %s", exc)
+
+        sent_to = []
+        if vendor:
+            try:
+                import db as _db
+                import vendor_stores as _vs
+
+                shop = int(vendor["shop_chat_id"])
+                token = _vs.get_bot_token_for_shop(shop)
+                targets = _vs.base_notify_ids_for_shop(shop) or [
+                    int(a["user_id"]) for a in _db.list_admins(shop)
+                ]
+                for tid in targets:
+                    ok = False
+                    if token:
+                        import webpanel as _wp
+
+                        ok = _wp.telegram_send_with_token(
+                            token, tid, text, parse_mode=None
+                        )
+                    if not ok:
+                        try:
+                            send_telegram(tid, text)
+                            ok = True
+                        except NotifyError:
+                            ok = False
+                    if ok:
+                        sent_to.append(tid)
+            except Exception as exc:
+                log.error("address_update vendor delivery failed: %s", exc)
+
+        owner = OWNER_TELEGRAM_CHAT_ID or SUPPLIER_TELEGRAM_CHAT_ID
+        if owner:
+            note = text
+            if vendor:
+                note += f"\n\nForwarded to {vendor['shop_title']}."
+            else:
+                note += "\n\nNo vendor has accepted this order yet."
+            try:
+                send_telegram(owner, note)
+            except NotifyError:
+                pass
+        return 200, {
+            "ok": True,
+            "kind": "address_update",
+            "order_number": order_number,
+            "vendor": (vendor or {}).get("shop_title"),
+            "messages_sent": len(sent_to) + (1 if owner else 0),
+        }
 
     if status in PLACED_STATUSES:
         owner = OWNER_TELEGRAM_CHAT_ID or SUPPLIER_TELEGRAM_CHAT_ID
@@ -889,7 +973,8 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
                     "POST /order notify failed rid=%s: %s", rid, exc
                 )
 
-        # 6) Buyer confirmation (same body as sendData path, plain text)
+        # 6) Buyer confirmation — HTML (tap-to-copy code + pay links),
+        #    plain-text fallback; then scannable pay-link QR codes.
         message = vendor_stores.build_customer_order_received_text(
             order,
             shop_chat_id,
@@ -897,10 +982,20 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             markdown=False,
             order_lines=order_lines,
         )
+        html_message = vendor_stores.build_customer_order_received_html(
+            order,
+            shop_chat_id,
+            emoji=emoji,
+            order_lines=order_lines,
+        )
         try:
             ok_buyer = webpanel.telegram_send_with_token(
-                vendor_token, buyer_id, message, parse_mode=None
+                vendor_token, buyer_id, html_message, parse_mode="HTML"
             )
+            if not ok_buyer:
+                ok_buyer = webpanel.telegram_send_with_token(
+                    vendor_token, buyer_id, message, parse_mode=None
+                )
             if not ok_buyer:
                 log.warning(
                     "POST /order buyer confirm failed shop=%s buyer=%s",
@@ -910,6 +1005,19 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
         except Exception:
             log.exception(
                 "POST /order buyer confirm error shop=%s buyer=%s",
+                shop_chat_id,
+                buyer_id,
+            )
+        try:
+            for png, cap in vendor_stores.build_payment_qr_photos(
+                shop_chat_id, total, code
+            ):
+                webpanel.telegram_send_photo_with_token(
+                    vendor_token, buyer_id, png, cap, parse_mode="HTML"
+                )
+        except Exception:
+            log.exception(
+                "POST /order payment QR failed shop=%s buyer=%s",
                 shop_chat_id,
                 buyer_id,
             )

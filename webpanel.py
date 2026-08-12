@@ -1391,6 +1391,8 @@ def telegram_send_with_token(
     }
     if parse_mode:
         body["parse_mode"] = parse_mode
+    if reply_markup:
+        body["reply_markup"] = reply_markup
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -1413,6 +1415,78 @@ def telegram_send_with_token(
         return False
     except Exception as exc:
         log.warning("customer DM send failed: %s", exc)
+        return False
+
+
+def telegram_send_photo_with_token(
+    bot_token: str,
+    chat_id: int | str,
+    photo_png: bytes,
+    caption: str = "",
+    *,
+    parse_mode: str | None = "HTML",
+) -> bool:
+    """POST sendPhoto (multipart) with an explicit bot token.
+
+    Used for payment QR codes on the vendor storefront bot — same
+    never-the-main-token rule as telegram_send_with_token.
+    """
+    import secrets as _secrets
+    import urllib.error
+    import urllib.request
+
+    token = (bot_token or "").strip()
+    if not token or not chat_id or not photo_png:
+        return False
+    boundary = "----spbcqr" + _secrets.token_hex(12)
+    fields: dict[str, str] = {"chat_id": str(chat_id)}
+    if caption:
+        fields["caption"] = caption[:1024]
+    if parse_mode:
+        fields["parse_mode"] = parse_mode
+    parts: list[bytes] = []
+    for k, v in fields.items():
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'
+            ).encode("utf-8")
+        )
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="photo"; filename="qr.png"\r\n'
+            "Content-Type: image/png\r\n\r\n"
+        ).encode("utf-8")
+    )
+    parts.append(photo_png)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendPhoto",
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            payload = json.loads(res.read().decode("utf-8"))
+        return bool(payload.get("ok"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+            log.warning(
+                "customer QR telegram HTTP %s: %s",
+                exc.code,
+                payload.get("description") or payload,
+            )
+        except Exception:
+            log.warning("customer QR telegram HTTP %s", exc.code)
+        return False
+    except Exception as exc:
+        log.warning("customer QR send failed: %s", exc)
         return False
 
 

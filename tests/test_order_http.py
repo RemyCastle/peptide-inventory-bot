@@ -89,6 +89,10 @@ class OrderHttpTests(unittest.TestCase):
             self.sent.append(("main", int(chat_id), text))
             return {}
 
+        def fake_photo_send(token, chat_id, photo, caption="", **kwargs):
+            self.sent.append(("photo", token, int(chat_id), caption, photo))
+            return True
+
         self._patches = [
             mock.patch.object(
                 vendor_stores,
@@ -111,6 +115,11 @@ class OrderHttpTests(unittest.TestCase):
             ),
             mock.patch.object(
                 webpanel, "telegram_send_with_token", side_effect=fake_vendor_send
+            ),
+            mock.patch.object(
+                webpanel,
+                "telegram_send_photo_with_token",
+                side_effect=fake_photo_send,
             ),
             mock.patch.object(
                 spbc_notify, "send_telegram", side_effect=fake_main_send
@@ -183,8 +192,18 @@ class OrderHttpTests(unittest.TestCase):
         self.assertIn(BUYER, chat_ids)
         # OWNER and/or ADMIN (admins folded into notify set)
         self.assertTrue(chat_ids & {OWNER, ADMIN})
+        # Buyer now gets the HTML receipt (tap-to-copy code + pay links);
+        # the JSON "message" field stays plain text for the store.
         buyer_msg = next(s[3] for s in vendor_sends if s[2] == BUYER)
-        self.assertEqual(buyer_msg, body["message"])
+        self.assertIn("Order received", buyer_msg)
+        self.assertIn(body["code"], buyer_msg)
+        self.assertIn("<code>", buyer_msg)
+        self.assertIn("venmo.com", buyer_msg)
+        # Scannable QR for the link-capable method goes to the buyer too
+        photo_sends = [s for s in self.sent if s[0] == "photo"]
+        self.assertTrue(any(s[2] == BUYER for s in photo_sends))
+        qr_caption = next(s[3] for s in photo_sends if s[2] == BUYER)
+        self.assertIn(body["code"], qr_caption)
         # Vendor bot token used for buyer
         buyer_tok = next(s[1] for s in vendor_sends if s[2] == BUYER)
         self.assertEqual(buyer_tok, VENDOR_TOKEN)
