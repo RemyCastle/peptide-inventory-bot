@@ -119,7 +119,17 @@ def quote_shop(shop_chat_id: int, lines: list[dict]) -> Optional[dict]:
     total = 0.0
     breakdown: list[dict] = []
     for line in lines:
-        p = by_name.get(_norm(line["base"]))
+        # An explicit admin mapping wins: a vendor calling SPBC's "HGH 360IU"
+        # their "H36" can still be quoted. Falls back to matching by name.
+        p = None
+        try:
+            import vendor_links
+
+            p = vendor_links.product_for(line["base"], int(shop_chat_id))
+        except Exception as exc:
+            log.warning("vendor link lookup failed shop=%s: %s", shop_chat_id, exc)
+        if p is None:
+            p = by_name.get(_norm(line["base"]))
         if p is None:
             return None
         stock = int(p.get("stock") or 0)

@@ -1349,6 +1349,28 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
                 return
             self._json(200, {"ok": True, "chats": recent_chats()})
             return
+        if path == "/vendor-catalogs":
+            # SPBC admin product↔vendor matching UI
+            if not self._check_secret():
+                return
+            try:
+                import vendor_links
+
+                from config import SPBC_SHOP_CHAT_ID as _own
+
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "vendors": vendor_links.vendor_catalogs(
+                            exclude_shop_id=_own or None
+                        ),
+                    },
+                )
+            except Exception as exc:
+                log.error("vendor-catalogs failed: %s", exc, exc_info=exc)
+                self._json(502, {"ok": False, "error": str(exc)})
+            return
         self._json(404, {"error": "not_found"})
 
     def do_HEAD(self) -> None:  # noqa: N802
@@ -1470,6 +1492,30 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
                 return
             code, ctype, body = webpanel.handle_panel_post(path, payload)
             self._send_raw(code, ctype, body)
+            return
+        if path == "/vendor-link":
+            if not self._check_secret():
+                return
+            payload = self._read_json()
+            if payload is None:
+                self._json(400, {"error": "bad_json"})
+                return
+            try:
+                import vendor_links
+
+                name = str(payload.get("spbc_name") or "")
+                shop = int(payload.get("shop_chat_id") or 0)
+                if payload.get("clear"):
+                    ok = vendor_links.clear_link(name, shop)
+                    self._json(200, {"ok": True, "cleared": ok})
+                    return
+                ok, msg = vendor_links.set_link(
+                    name, shop, int(payload.get("vendor_product_id") or 0)
+                )
+                self._json(200 if ok else 400, {"ok": ok, "message": msg})
+            except Exception as exc:
+                log.error("vendor-link failed: %s", exc, exc_info=exc)
+                self._json(502, {"ok": False, "error": str(exc)})
             return
         if path not in ("/notify", "/resolve-chat"):
             self._json(404, {"error": "not_found"})
