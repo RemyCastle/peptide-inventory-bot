@@ -56,7 +56,18 @@ EXPIRED = "expired"
 #              lines, shipping, created_at, applied, state, offered_at,
 #              decline_reason}
 _pending: dict[str, dict] = {}
+# order_number -> {shop_chat_id, shop_title, total, at} for orders a vendor
+# accepted. Kept after the quotes are cleared so a shipping address that
+# arrives later can still be forwarded to whoever is fulfilling.
+_routed: dict[str, dict] = {}
 _lock = threading.Lock()
+
+
+def routed_vendor(order_number: str) -> Optional[dict]:
+    """Which vendor is fulfilling this order, if any."""
+    with _lock:
+        r = _routed.get(str(order_number or ""))
+        return dict(r) if r else None
 
 
 def _prune() -> None:
@@ -445,6 +456,12 @@ def apply_route(quote_id: str, actor_id: int) -> tuple[bool, str, Optional[dict]
     with _lock:
         if quote_id in _pending:
             _pending[quote_id]["state"] = ACCEPTED
+        _routed[str(quote["order_number"])] = {
+            "shop_chat_id": quote["shop_chat_id"],
+            "shop_title": quote["shop_title"],
+            "total": quote["total"],
+            "at": time.time(),
+        }
     log.info(
         "order_route applied order=%s shop=%s total=%s",
         quote["order_number"],

@@ -1372,11 +1372,14 @@ def telegram_send_with_token(
     text: str,
     *,
     parse_mode: str | None = "HTML",
+    reply_markup: dict | None = None,
 ) -> bool:
     """POST sendMessage with an explicit bot token (vendor storefront bot).
 
     Mirrors spbc_notify._telegram_api but never uses the main SPBC token —
-    customers only started the vendor bot.
+    customers only started the vendor bot. ``reply_markup`` takes a raw
+    Telegram markup dict so fulfillment offers can carry Accept/Decline
+    buttons that come back to the vendor's own bot.
     """
     import urllib.error
     import urllib.request

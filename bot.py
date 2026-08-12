@@ -6047,6 +6047,80 @@ async def cmd_backup_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ── Order routing approvals (quote-and-suggest) ─────────────────────────────
 
 
+async def _deliver_to_vendor(
+    context, shop_chat_id: int, text: str, reply_markup: dict | None = None
+) -> bool:
+    """Send to the people who run a vendor shop, on the bot they actually use.
+
+    A shop's chat_id is only a real Telegram chat for group/DM shops — shops
+    built with /newvendor have a synthetic id no bot can message. And vendors
+    with their own storefront bot may never have opened the main SPBC bot.
+    So: message the shop's admins, trying the vendor's branded bot first and
+    falling back to the main bot. True if it reached at least one person.
+    """
+    import vendor_stores
+
+    shop = int(shop_chat_id)
+    targets: list[int] = []
+    try:
+        targets = [int(x) for x in vendor_stores.base_notify_ids_for_shop(shop)]
+    except Exception as exc:
+        log.warning("notify ids lookup failed for shop %s: %s", shop, exc)
+    if not targets:
+        targets = [int(a["user_id"]) for a in db.list_admins(shop)]
+    if not db.is_virtual_shop(shop) and shop not in targets:
+        targets.append(shop)  # real group/DM shop chat
+
+    token = None
+    try:
+        token = vendor_stores.get_bot_token_for_shop(shop)
+    except Exception:
+        token = None
+
+    sent = False
+    for tid in dict.fromkeys(targets):
+        if token:
+            try:
+                ok = await asyncio.to_thread(
+                    webpanel.telegram_send_with_token,
+                    token,
+                    tid,
+                    text,
+                    parse_mode=None,
+                    reply_markup=reply_markup,
+                )
+                if ok:
+                    sent = True
+                    continue
+            except Exception as exc:
+                log.info("vendor-bot send failed for %s: %s", tid, exc)
+        try:
+            await context.bot.send_message(
+                chat_id=tid,
+                text=text,
+                disable_web_page_preview=True,
+                reply_markup=(
+                    InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    b["text"], callback_data=b["callback_data"]
+                                )
+                                for b in row
+                            ]
+                            for row in reply_markup["inline_keyboard"]
+                        ]
+                    )
+                    if reply_markup
+                    else None
+                ),
+            )
+            sent = True
+        except Exception as exc:
+            log.info("main-bot send failed for %s: %s", tid, exc)
+    return sent
+
+
 async def _offer_expiry_watch(context, quote_id: str, owner_id: int) -> None:
     """Nudge the owner if a vendor never answers."""
     import order_router
@@ -6095,32 +6169,28 @@ async def cb_route_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not ok:
         await query.answer(msg, show_alert=True)
         return
-    try:
-        await context.bot.send_message(
-            chat_id=quote["shop_chat_id"],
-            text=order_router.build_vendor_offer(quote),
-            disable_web_page_preview=True,
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "✅ Accept", callback_data=f"voffer_ok:{quote_id}"
-                        ),
-                        InlineKeyboardButton(
-                            "❌ Decline", callback_data=f"voffer_no:{quote_id}"
-                        ),
-                    ]
-                ]
-            ),
-        )
-    except Exception as exc:
-        log.error("vendor_offer_failed: %s", exc)
+    kb = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Accept", "callback_data": f"voffer_ok:{quote_id}"},
+                {"text": "❌ Decline", "callback_data": f"voffer_no:{quote_id}"},
+            ]
+        ]
+    }
+    delivered = await _deliver_to_vendor(
+        context,
+        int(quote["shop_chat_id"]),
+        order_router.build_vendor_offer(quote),
+        reply_markup=kb,
+    )
+    if not delivered:
+        log.error("vendor_offer_failed shop=%s", quote["shop_chat_id"])
         order_router.decline_quote(quote_id, user.id, "could not reach vendor")
         await query.answer("Could not message that vendor.", show_alert=True)
         await safe_edit(
             query,
-            f"⚠️ Couldn't reach *{quote['shop_title']}* — have they opened the "
-            "bot? Nothing was deducted.",
+            f"⚠️ Couldn't reach *{quote['shop_title']}* — have they opened "
+            "their shop bot? Nothing was deducted.",
         )
         return
     await query.answer("Offer sent — waiting on them.")
@@ -6156,16 +6226,13 @@ async def _finish_route(update, context, quote_id: str, *, forced: bool) -> None
     if not ok:
         await query.answer(msg, show_alert=True)
         return
-    try:
-        await context.bot.send_message(
-            chat_id=quote["shop_chat_id"],
-            text=order_router.build_vendor_message(quote),
-            disable_web_page_preview=True,
-        )
-        delivered = True
-    except Exception as exc:
-        log.error("vendor_route_message_failed: %s", exc)
-        delivered = False
+    delivered = await _deliver_to_vendor(
+        context,
+        int(quote["shop_chat_id"]),
+        order_router.build_vendor_message(quote),
+    )
+    if not delivered:
+        log.error("vendor_route_message_failed shop=%s", quote["shop_chat_id"])
     order_router.dismiss_order(quote["order_number"])
     note = (
         f"✅ {quote['shop_title']} is fulfilling order {quote['order_number']} "
