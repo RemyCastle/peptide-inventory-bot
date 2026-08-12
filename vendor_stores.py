@@ -1128,6 +1128,48 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
     # SPBC fulfillment offers arrive through THIS bot, so Accept/Decline taps
     # come back here — not to the main SPBC bot.
     app.add_handler(CallbackQueryHandler(on_offer_answer, pattern=r"^voffer_(ok|no):"))
+
+    async def on_supplier_handoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Answer a website order handed to this vendor as their supplier."""
+        import spbc_notify as _sn
+
+        query = update.callback_query
+        action, _, hid = (query.data or "").partition(":")
+        state = "accepted" if action == "shand_ok" else "declined"
+        h = _sn.set_handoff_state(hid, state)
+        if not h:
+            await query.answer("Already answered — thanks.", show_alert=True)
+            return
+        lines = [f"• {it['qty']}× {it['name']}" for it in h.get("items") or []]
+        if state == "accepted":
+            await query.answer("Thanks — marked as on it ✅")
+            await query.edit_message_text(
+                f"✅ You're filling order {h['order_number']}.\n"
+                + "\n".join(lines)
+                + "\n\nShip to the address above. The shop owner has been told."
+            )
+            note = (
+                f"✅ {h['supplier']} is filling order {h['order_number']}.\n"
+                + "\n".join(lines)
+            )
+        else:
+            await query.answer("Noted — the owner will re-source it.")
+            await query.edit_message_text(
+                f"❌ Marked as unable to fill order {h['order_number']}. "
+                "The shop owner will source it elsewhere."
+            )
+            note = (
+                f"❌ {h['supplier']} can't fill order {h['order_number']} — "
+                "needs re-sourcing.\n" + "\n".join(lines)
+            )
+        for oid in _owner_ids():
+            await notify_order_recipient(
+                h["shop_chat_id"], oid, note, context=context
+            )
+
+    app.add_handler(
+        CallbackQueryHandler(on_supplier_handoff, pattern=r"^shand_(ok|no):")
+    )
     return app
 
 
@@ -1217,6 +1259,50 @@ def start_all() -> int:
     if vendors:
         log.info("started %d vendor store receiver(s)", len(vendors))
     return len(vendors)
+
+
+def vendor_bot_for_user(user_id: int | str) -> dict | None:
+    """Find the vendor storefront bot a person runs, by their Telegram id.
+
+    Website suppliers are identified by `suppliers.telegram_chat_id`. If that
+    same person administers a vendor shop that has its own bot, an order for
+    them can be handed off through THEIR bot (branded, actionable) instead of
+    a plain notification from the main SPBC bot.
+
+    Returns {shop_chat_id, token, name, emoji} or None when unmapped.
+    """
+    try:
+        uid = int(str(user_id).strip())
+    except (TypeError, ValueError):
+        return None
+    for v in load_vendor_configs():
+        token = (v.get("token") or "").strip()
+        if not token:
+            continue
+        try:
+            shop = _resolve_shop(v)
+        except Exception:
+            continue
+        if not shop:
+            continue
+        try:
+            admins = {int(a["user_id"]) for a in db.list_admins(int(shop))}
+        except Exception:
+            admins = set()
+        notify_ids = set()
+        for x in v.get("notify_ids") or []:
+            try:
+                notify_ids.add(int(x))
+            except (TypeError, ValueError):
+                continue
+        if uid in admins or uid in notify_ids:
+            return {
+                "shop_chat_id": int(shop),
+                "token": token,
+                "name": (v.get("name") or "").strip() or "your shop",
+                "emoji": v.get("emoji") or "\U0001f6cd",
+            }
+    return None
 
 
 if __name__ == "__main__":

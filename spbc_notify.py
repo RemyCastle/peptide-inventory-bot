@@ -547,6 +547,82 @@ def recent_chats() -> list[dict]:
         return list(_recent_chats.values())[::-1]
 
 
+# ── Supplier handoff into a vendor's own storefront bot ─────────────────────
+
+# handoff_id -> {order_number, supplier, shop_chat_id, items, created_at, state}
+_handoffs: dict[str, dict] = {}
+
+
+def get_handoff(handoff_id: str) -> Optional[dict]:
+    with _state_lock:
+        h = _handoffs.get(handoff_id)
+        return dict(h) if h else None
+
+
+def set_handoff_state(handoff_id: str, state: str) -> Optional[dict]:
+    with _state_lock:
+        h = _handoffs.get(handoff_id)
+        if not h or h.get("state") != "sent":
+            return None
+        h["state"] = state
+        return dict(h)
+
+
+def _handoff_to_vendor_bot(
+    handoff: dict, chat_id: Any, text: str, order_number: str, group: dict
+) -> dict:
+    """Deliver a paid-order supplier message through the vendor's own bot.
+
+    Same no-prices content, but branded and actionable: the vendor answers
+    with a button instead of a free-text total, and the owner is told.
+    """
+    import secrets as _secrets
+
+    import webpanel as _wp
+
+    hid = _secrets.token_hex(6)
+    with _state_lock:
+        _handoffs[hid] = {
+            "order_number": order_number,
+            "supplier": group["supplier"],
+            "shop_chat_id": handoff["shop_chat_id"],
+            "items": group["items"],
+            "created_at": time.time(),
+            "state": "sent",
+        }
+    body = (
+        f"{handoff['emoji']} {text}\n\n"
+        "Can you fill this? Tap below — the shop owner is told either way."
+    )
+    ok = _wp.telegram_send_with_token(
+        handoff["token"],
+        chat_id,
+        body,
+        parse_mode=None,
+        reply_markup={
+            "inline_keyboard": [
+                [
+                    {"text": "✅ On it", "callback_data": f"shand_ok:{hid}"},
+                    {"text": "❌ Can't fill", "callback_data": f"shand_no:{hid}"},
+                ]
+            ]
+        },
+    )
+    if not ok:
+        # Their bot didn't take it — fall back so the order is never lost
+        log.warning("handoff via vendor bot failed, using main bot: %s", chat_id)
+        with _state_lock:
+            _handoffs.pop(hid, None)
+        return send_telegram(chat_id, text)
+    log.info(
+        "supplier handoff via vendor bot order=%s supplier=%s shop=%s",
+        order_number,
+        group["supplier"],
+        handoff["shop_chat_id"],
+    )
+    return {"message_id": None, "handoff_id": hid}
+
+
 # ── /notify core (called by the HTTP handler) ────────────────────────────────
 
 def handle_notify(payload: dict) -> tuple[int, dict]:
@@ -707,6 +783,34 @@ def handle_notify(payload: dict) -> tuple[int, dict]:
             )
             continue
         try:
+            # If this supplier runs one of our vendor storefront bots, hand the
+            # order off THERE — branded, with Accept / Can't-fill buttons —
+            # instead of a plain notification from the main SPBC bot.
+            handoff = None
+            try:
+                import vendor_stores as _vs
+
+                handoff = _vs.vendor_bot_for_user(chat_id)
+            except Exception as exc:
+                log.warning("vendor bot lookup failed for %s: %s", chat_id, exc)
+
+            if handoff:
+                sent = _handoff_to_vendor_bot(
+                    handoff, chat_id, text, str(order_number), group
+                )
+                results.append(
+                    {
+                        "supplier": group["supplier"],
+                        "chat_id": chat_id,
+                        "item_count": len(group["items"]),
+                        "telegram_message_id": (sent or {}).get("message_id"),
+                        "delivered_via": handoff["name"],
+                        "handoff": True,
+                        "ok": True,
+                    }
+                )
+                continue
+
             sent = send_telegram(chat_id, text)
             follow_up = {"started": False}
             try:
