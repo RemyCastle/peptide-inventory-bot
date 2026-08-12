@@ -6671,6 +6671,98 @@ async def cmd_restock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def cmd_sitepaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: confirm a website payment when the Gmail matcher misses it.
+
+    Marking a franchisee's wholesale invoice paid is what releases the order
+    to vendors, so this is owner-only.
+    """
+    import orders_admin
+
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await update.message.reply_text("Owners only.")
+        return
+    if not context.args:
+        await safe_reply(
+            update.message,
+            "💵 *Confirm a website payment*\n\n"
+            "`/sitepaid <order number>`\n\n"
+            "Use when the Gmail receipt matcher misses a payment. For a "
+            "franchisee invoice this is what releases the order to vendors — "
+            "only do it once the money has actually landed.",
+        )
+        return
+    num = context.args[0].strip().upper()
+    await update.message.reply_text(f"Confirming payment for {num}…")
+    ok, msg, order = await asyncio.to_thread(
+        orders_admin.mark_paid, num, f"Confirmed in Telegram by {user.id}"
+    )
+    if not ok:
+        await safe_reply(update.message, f"⚠️ {msg}")
+        return
+    total = ""
+    if isinstance(order, dict) and order.get("total_cents") is not None:
+        total = f" · {money(float(order['total_cents']) / 100)}"
+    await safe_reply(
+        update.message,
+        f"✅ *{num}* marked paid{total}.\n"
+        "Suppliers/vendors have been notified where applicable.",
+    )
+
+
+async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: add tracking to a WEBSITE order and email the customer.
+
+    Website buyers have no Telegram, so the worker's shipped email is the only
+    way they hear about it. `/track <order> <tracking> [carrier]`, add `silent`
+    to save tracking without emailing.
+    """
+    import orders_admin
+
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await update.message.reply_text("Owners only.")
+        return
+    args = list(context.args or [])
+    if len(args) < 2:
+        await safe_reply(
+            update.message,
+            "📦 *Tracking for a website order*\n\n"
+            "`/track <order number> <tracking> [carrier]`\n"
+            "Example: `/track PEP-1234 1Z999AA10123456784 UPS`\n\n"
+            "Marks it shipped and emails the customer their tracking.\n"
+            "Add `silent` at the end to save it without emailing.\n\n"
+            "_Telegram orders are different — use 📦 Mark shipped on the order._",
+        )
+        return
+    notify = True
+    if args[-1].lower() in ("silent", "quiet", "noemail"):
+        notify = False
+        args = args[:-1]
+    num = args[0].strip().upper()
+    tracking = args[1].strip()
+    carrier = " ".join(args[2:]).strip()
+    await update.message.reply_text(
+        f"Saving tracking for {num}" + ("…" if notify else " (no email)…")
+    )
+    ok, msg, order = await asyncio.to_thread(
+        orders_admin.set_tracking, num, tracking, carrier, notify
+    )
+    if not ok:
+        await safe_reply(update.message, f"⚠️ {msg}")
+        return
+    who = ""
+    if isinstance(order, dict) and order.get("customer_email"):
+        who = f"\nCustomer: {order['customer_email']}"
+    await safe_reply(
+        update.message,
+        f"✅ *{num}* — {msg}\nTracking: `{tracking}`"
+        + (f" ({carrier})" if carrier else "")
+        + who,
+    )
+
+
 async def cmd_newvendor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner: build a vendor's shop NOW, stock it, invite them once it's ready."""
     user = update.effective_user
@@ -6952,6 +7044,8 @@ async def post_init(app: Application) -> None:
     owner_cmds = admin_cmds[:-2] + [
         BotCommand("invitevendor", "Invite a vendor (owner)"),
         BotCommand("newvendor", "Build a vendor's shop (owner)"),
+        BotCommand("sitepaid", "Confirm a website payment (owner)"),
+        BotCommand("track", "Tracking + email for a website order (owner)"),
         BotCommand("handover", "Hand a built shop to its vendor (owner)"),
         BotCommand("rescue", "Recovery kit after a ban (owner)"),
         BotCommand("resend", "Re-DM NEW ORDER notice (owner)"),
@@ -7281,6 +7375,8 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("webpanel", cmd_webpanel))
     app.add_handler(CommandHandler("invitevendor", cmd_invitevendor))
     app.add_handler(CommandHandler("newvendor", cmd_newvendor))
+    app.add_handler(CommandHandler("sitepaid", cmd_sitepaid))
+    app.add_handler(CommandHandler("track", cmd_track))
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("restock", cmd_restock))
     app.add_handler(CommandHandler("rescue", cmd_rescue))

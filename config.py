@@ -120,6 +120,13 @@ except ValueError:
 # Public base URL of this service (for vendor web panel links).
 # e.g. https://spbc-supplier-bot.onrender.com — empty disables /webpanel links.
 PANEL_BASE_URL = os.getenv("PANEL_BASE_URL", "").strip().rstrip("/")
+
+# spbc-orders worker admin API — lets the owner confirm a payment from
+# Telegram when the Gmail receipt matcher misses one.
+SPBC_ORDERS_URL = os.getenv(
+    "SPBC_ORDERS_URL", "https://spbc-orders.spbc.workers.dev"
+).strip().rstrip("/")
+SPBC_ORDERS_ADMIN_TOKEN = os.getenv("SPBC_ORDERS_ADMIN_TOKEN", "").strip()
 # Where panel-uploaded product photos / COA files are stored (persistent disk)
 MEDIA_DIR = os.getenv("MEDIA_DIR", str(DB_PATH.parent / "uploads"))
 
