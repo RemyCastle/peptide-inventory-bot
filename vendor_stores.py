@@ -414,8 +414,11 @@ def payment_pay_link(method: dict, total: float, code: str) -> str | None:
     if mt == "venmo":
         h = target.lstrip("@$")
         if h:
+            # account.venmo.com is Venmo's canonical web pay URL — opens the
+            # site, which hands off to the app with amount + note prefilled.
             return (
-                f"https://venmo.com/{q(h)}?txn=pay&amount={amt}&note={q(code)}"
+                "https://account.venmo.com/pay?txn=pay"
+                f"&recipients={q(h)}&amount={amt}&note={q(code)}"
             )
     elif mt == "cashapp":
         tag = target.lstrip("@")
@@ -539,7 +542,10 @@ def build_payment_qr_photos(
         cap = (
             f"📱 Scan to pay <b>{_fmt_money(total)}</b> via "
             f"{_h(p.get('name') or 'link')} — order "
-            f"<code>{_h(code)}</code>"
+            f"<code>{_h(code)}</code>\n"
+            "Scan with your phone's <b>camera app</b> (not the scanner "
+            "inside the payment app) — it opens the pay page with the "
+            "amount filled in."
         )
         out.append((buf.getvalue(), cap))
     return out
