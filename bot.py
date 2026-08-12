@@ -6671,6 +6671,56 @@ async def cmd_restock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def cmd_owed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: what SPBC owes each vendor for orders they've fulfilled."""
+    import payables
+
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await update.message.reply_text("Owners only.")
+        return
+    totals = payables.open_totals()
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"✅ Paid {t['shop_title'] or t['shop_chat_id']} "
+                f"({SYM}{float(t['owed'] or 0):.2f})",
+                callback_data=f"settle:{t['shop_chat_id']}",
+            )
+        ]
+        for t in totals[:8]
+    ]
+    await safe_reply(
+        update.message,
+        payables.summary_text(SYM),
+        reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+    )
+
+
+async def cb_settle_vendor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: mark a vendor's outstanding payables as paid."""
+    import payables
+
+    query = update.callback_query
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await query.answer("Owners only.", show_alert=True)
+        return
+    shop_id_val = int(query.data.split(":")[1])
+    n, total = await asyncio.to_thread(payables.settle_shop, shop_id_val, user.id)
+    if not n:
+        await query.answer("Nothing outstanding for them.", show_alert=True)
+        return
+    await query.answer(f"Settled {SYM}{total:.2f}")
+    shop = db.get_shop(shop_id_val) or {}
+    await safe_edit(
+        query,
+        f"✅ Marked *{SYM}{total:.2f}* paid to "
+        f"*{shop.get('title') or shop_id_val}* ({n} order"
+        f"{'s' if n != 1 else ''}).\n\n" + payables.summary_text(SYM),
+    )
+
+
 async def cmd_sitepaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner: confirm a website payment when the Gmail matcher misses it.
 
@@ -7045,6 +7095,7 @@ async def post_init(app: Application) -> None:
         BotCommand("invitevendor", "Invite a vendor (owner)"),
         BotCommand("newvendor", "Build a vendor's shop (owner)"),
         BotCommand("sitepaid", "Confirm a website payment (owner)"),
+        BotCommand("owed", "What you owe vendors (owner)"),
         BotCommand("track", "Tracking + email for a website order (owner)"),
         BotCommand("handover", "Hand a built shop to its vendor (owner)"),
         BotCommand("rescue", "Recovery kit after a ban (owner)"),
@@ -7376,6 +7427,8 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("invitevendor", cmd_invitevendor))
     app.add_handler(CommandHandler("newvendor", cmd_newvendor))
     app.add_handler(CommandHandler("sitepaid", cmd_sitepaid))
+    app.add_handler(CommandHandler("owed", cmd_owed))
+    app.add_handler(CallbackQueryHandler(cb_settle_vendor, pattern=r"^settle:-?\d+$"))
     app.add_handler(CommandHandler("track", cmd_track))
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("restock", cmd_restock))

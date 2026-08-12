@@ -463,6 +463,14 @@ def apply_route(quote_id: str, actor_id: int) -> tuple[bool, str, Optional[dict]
         log.error("apply_route failed: %s", exc, exc_info=exc)
         return False, "Routing failed — vendor stock unchanged.", None
 
+    # Record the payable: this is the only moment we know what we owe them.
+    try:
+        import payables
+
+        payables.record(quote)
+    except Exception as exc:
+        log.error("payable not recorded for %s: %s", quote["order_number"], exc)
+
     with _lock:
         if quote_id in _pending:
             _pending[quote_id]["state"] = ACCEPTED
