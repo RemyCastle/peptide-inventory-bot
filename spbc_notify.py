@@ -265,6 +265,18 @@ def build_owner_placed_message(payload: dict) -> str:
         lines.append(f"• {qty}× {label}")
     if not items:
         lines.append("• (no line items in payload)")
+
+    # Ship-to: usually absent at placed time (the form comes after ordering),
+    # in which case notifyAddressUpdate pushes it the moment it arrives.
+    ship = payload.get("shipping")
+    ship_lines = format_ship_lines(ship)
+    if ship_lines:
+        lines += ["", "Ship to:", *ship_lines]
+        if isinstance(ship, dict) and not ship.get("complete", True):
+            lines.append("(customer hasn't finished the form — may change)")
+    else:
+        lines += ["", "Ship to: not provided yet — I'll send it when it lands."]
+
     lines += ["", "Status: awaiting payment", f"Sent {_utc_stamp()}"]
     return "\n".join(lines)
 

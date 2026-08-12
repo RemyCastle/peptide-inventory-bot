@@ -72,6 +72,47 @@ class MessageTests(unittest.TestCase):
         self.assertIn("$150.00", text)
         self.assertIn("3× RETA 35 MG (Vial)", text)
 
+    def test_owner_placed_message_includes_address(self):
+        """The owner alert is what Remy reads on his phone — it must carry the
+        ship-to, and say so plainly when the customer hasn't filled it yet."""
+        addr = {
+            "name": "Jane Doe",
+            "line1": "123 Test St",
+            "city": "Springfield",
+            "state": "MO",
+            "postal": "65801",
+            "phone": "5555550100",
+            "complete": True,
+        }
+        text = spbc_notify.build_owner_placed_message(
+            {
+                "order_number": "PEP-1",
+                "customer_name": "Jane",
+                "total_cents": 18000,
+                "items": [{"name": "DSIP 10MG", "qty": 3}],
+                "shipping": addr,
+            }
+        )
+        self.assertIn("Ship to:", text)
+        self.assertIn("123 Test St", text)
+        self.assertIn("Springfield, MO, 65801", text)
+
+        # No address yet → explicit, not silence
+        pending = spbc_notify.build_owner_placed_message(
+            {"order_number": "PEP-2", "items": [{"name": "BPC", "qty": 1}]}
+        )
+        self.assertIn("not provided yet", pending)
+
+        # Partial address is flagged rather than shown as final
+        partial = spbc_notify.build_owner_placed_message(
+            {
+                "order_number": "PEP-3",
+                "items": [],
+                "shipping": {**addr, "complete": False},
+            }
+        )
+        self.assertIn("hasn't finished the form", partial)
+
     def test_supplier_message_never_has_prices(self):
         groups = spbc_notify.group_items_by_supplier(PAYLOAD_PAID)
         for g in groups.values():
