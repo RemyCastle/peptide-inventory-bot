@@ -199,11 +199,9 @@ class OrderHttpTests(unittest.TestCase):
         self.assertIn(body["code"], buyer_msg)
         self.assertIn("<code>", buyer_msg)
         self.assertIn("venmo.com", buyer_msg)
-        # Scannable QR for the link-capable method goes to the buyer too
+        # No payment QR photos — links in the receipt are the pay path
         photo_sends = [s for s in self.sent if s[0] == "photo"]
-        self.assertTrue(any(s[2] == BUYER for s in photo_sends))
-        qr_caption = next(s[3] for s in photo_sends if s[2] == BUYER)
-        self.assertIn(body["code"], qr_caption)
+        self.assertFalse(any(s[2] == BUYER for s in photo_sends))
         # Vendor bot token used for buyer
         buyer_tok = next(s[1] for s in vendor_sends if s[2] == BUYER)
         self.assertEqual(buyer_tok, VENDOR_TOKEN)

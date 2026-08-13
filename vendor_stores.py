@@ -1041,18 +1041,6 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
             except Exception as e2:
                 log.warning("[%s] plain customer confirm also failed: %s", name, e2)
 
-        # Scannable pay-link QRs (amount + order code prefilled where supported)
-        try:
-            qrs = build_payment_qr_photos(
-                shop_chat_id,
-                float(order.get("total") or 0),
-                order.get("payment_code") or f"#{order['id']}",
-            )
-            for png, cap in qrs:
-                await msg.reply_photo(photo=png, caption=cap, parse_mode="HTML")
-        except Exception as e:
-            log.warning("[%s] payment QR send failed (order still saved): %s", name, e)
-
         # Owner/vendor NEW ORDER: try vendor storefront bot, then main bot.
         # Recipients may have started either bot (storefront or claim via SPBC).
         note = build_new_order_notify_text(

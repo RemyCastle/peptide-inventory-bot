@@ -1090,7 +1090,7 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
                 )
 
         # 6) Buyer confirmation — HTML (tap-to-copy code + pay links),
-        #    plain-text fallback; then scannable pay-link QR codes.
+        #    plain-text fallback.
         message = vendor_stores.build_customer_order_received_text(
             order,
             shop_chat_id,
@@ -1121,19 +1121,6 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
         except Exception:
             log.exception(
                 "POST /order buyer confirm error shop=%s buyer=%s",
-                shop_chat_id,
-                buyer_id,
-            )
-        try:
-            for png, cap in vendor_stores.build_payment_qr_photos(
-                shop_chat_id, total, code
-            ):
-                webpanel.telegram_send_photo_with_token(
-                    vendor_token, buyer_id, png, cap, parse_mode="HTML"
-                )
-        except Exception:
-            log.exception(
-                "POST /order payment QR failed shop=%s buyer=%s",
                 shop_chat_id,
                 buyer_id,
             )
