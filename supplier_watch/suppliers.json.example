@@ -1,0 +1,6 @@
+{
+  "chats": [
+    { "chat_id": -1001234567890, "name": "Supplier X (channel)" },
+    { "chat_id": 123456789, "name": "Supplier Y (DM)" }
+  ]
+}

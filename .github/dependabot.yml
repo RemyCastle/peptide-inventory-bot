@@ -1,0 +1,13 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels: ["dependencies"]
+    groups:
+      # One PR for the routine stuff, separate PRs for majors so they get read.
+      routine:
+        update-types: ["patch", "minor"]

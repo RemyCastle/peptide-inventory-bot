@@ -14,3 +14,17 @@ backups/
 *.enc
 token_state.json
 *.pre_restore_*
+
+# Runtime locks, pids and captured stdio from the watchdog runners
+.bot_polling.lock
+.watchdog-*.pid
+watchdog-*.log
+bot_start_out.txt
+bot_start_err.txt
+
+# supplier_watch: real config and the Telethon user session are never committed
+supplier_watch/.env
+supplier_watch/suppliers.json
+supplier_watch/*.session
+supplier_watch/*.session-journal
+supplier_watch/watcher.log
