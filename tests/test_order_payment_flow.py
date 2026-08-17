@@ -51,9 +51,26 @@ class OrderPaymentFlowTests(unittest.TestCase):
 
     def test_payment_code_assigned(self) -> None:
         o = self._order()
-        self.assertTrue(o.get("payment_code"))
-        self.assertTrue(str(o["payment_code"]).startswith("UF"))
-        self.assertIn(str(o["id"]), o["payment_code"])
+        code = str(o.get("payment_code") or "")
+        self.assertTrue(code)
+        self.assertTrue(code.startswith("🎁"))
+        digits = code[1:]
+        self.assertEqual(len(digits), 6)
+        self.assertTrue(digits.isdigit())
+        self.assertIn(digits[0], "23456789")
+        # Lookup with and without the gift emoji
+        self.assertEqual(db.get_order_by_payment_code(code)["id"], o["id"])
+        self.assertEqual(db.get_order_by_payment_code(digits)["id"], o["id"])
+
+        # Old-style stored row still resolves. Do not rewrite live DB rows;
+        # this only mutates the isolated temp-db order from setUp.
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET payment_code = ? WHERE id = ?",
+                ("UF-ABC123", o["id"]),
+            )
+        self.assertEqual(db.get_order_by_payment_code("UF-ABC123")["id"], o["id"])
+        self.assertEqual(db.get_order_by_payment_code("🎁UF-ABC123")["id"], o["id"])
 
     def test_codes_unique(self) -> None:
         codes = {self._order()["payment_code"] for _ in range(5)}

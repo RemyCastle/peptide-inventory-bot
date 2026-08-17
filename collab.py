@@ -474,14 +474,21 @@ def create_order_multi(
         )
         order_id = int(cur.lastrowid)
 
-        payment_code = generate_payment_code(order_id)
-        try:
-            conn.execute(
-                "UPDATE orders SET payment_code = ? WHERE id = ?",
-                (payment_code, order_id),
-            )
-        except Exception:
-            payment_code = f"UF{order_id}-X"
+        # Unique payment memo code (retry on rare collision)
+        payment_code = None
+        for _ in range(8):
+            candidate = generate_payment_code()
+            try:
+                conn.execute(
+                    "UPDATE orders SET payment_code = ? WHERE id = ?",
+                    (candidate, order_id),
+                )
+                payment_code = candidate
+                break
+            except Exception:
+                continue
+        if payment_code is None:
+            payment_code = generate_payment_code()
             conn.execute(
                 "UPDATE orders SET payment_code = ? WHERE id = ?",
                 (payment_code, order_id),

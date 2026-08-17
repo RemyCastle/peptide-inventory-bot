@@ -1774,22 +1774,19 @@ def delete_payment_method(method_id: int) -> bool:
 # ── Orders ───────────────────────────────────────────────────────────────────
 
 
+
 def generate_payment_code(order_id: int | None = None) -> str:
     """
     Short unique code for payment app notes/memos.
-    Format: UF-XXXXXX (uppercase alnum, easy to type).
+    Format: gift emoji + 6-digit verification number, first digit 2-9
+    (payment apps strip leading zeros). Example: 🎁847291
+    order_id is accepted for call-site compatibility and is not encoded.
     """
     import secrets
-    import string
 
-    alphabet = string.ascii_uppercase + string.digits
-    # Avoid ambiguous 0/O, 1/I
-    alphabet = alphabet.replace("0", "").replace("O", "").replace("1", "").replace("I", "")
-    suffix = "".join(secrets.choice(alphabet) for _ in range(6))
-    if order_id is not None:
-        return f"UF{int(order_id)}-{suffix}"
-    return f"UF-{suffix}"
-
+    first = secrets.choice("23456789")
+    rest = "".join(secrets.choice("0123456789") for _ in range(5))
+    return f"🎁{first}{rest}"
 
 def create_order(
     chat_id: int,
@@ -1936,7 +1933,7 @@ def create_order(
             except Exception:
                 continue
         if payment_code is None:
-            payment_code = f"UF{order_id}-{order_id:04d}"
+            payment_code = generate_payment_code()
             conn.execute(
                 "UPDATE orders SET payment_code = ? WHERE id = ?",
                 (payment_code, order_id),
@@ -1970,18 +1967,31 @@ def get_order(order_id: int) -> Optional[dict]:
         return dict(row) if row else None
 
 
-def get_order_by_payment_code(payment_code: str) -> Optional[dict]:
-    """Look up order by exact payment_code (case-sensitive memo code)."""
-    code = (payment_code or "").strip()
-    if not code:
-        return None
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT * FROM orders WHERE payment_code = ?",
-            (code,),
-        ).fetchone()
-        return dict(row) if row else None
 
+def get_order_by_payment_code(payment_code: str) -> Optional[dict]:
+    """Look up order by payment_code.
+
+    Normalize input (strip, strip one leading 🎁), then try: exact input,
+    bare (no emoji), and 🎁+bare. Stored values are never modified.
+    Old UF- / UF{id}- / 🎁UF- codes still resolve via those candidates.
+    """
+    raw = (payment_code or "").strip()
+    if not raw:
+        return None
+    bare = raw[1:] if raw.startswith("🎁") else raw
+    candidates: list[str] = []
+    for c in (raw, bare, "🎁" + bare):
+        if c and c not in candidates:
+            candidates.append(c)
+    with get_db() as conn:
+        for candidate in candidates:
+            row = conn.execute(
+                "SELECT * FROM orders WHERE payment_code = ?",
+                (candidate,),
+            ).fetchone()
+            if row:
+                return dict(row)
+        return None
 
 def get_order_items(order_id: int) -> list[dict]:
     with get_db() as conn:
