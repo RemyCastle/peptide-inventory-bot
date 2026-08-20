@@ -516,6 +516,9 @@ class ApiTests(WebPanelBase):
         self.assertEqual(by_name["Zebra"]["sort_order"], 30)
         self.assertIsNone(by_name["Middle"]["category"])
         self.assertEqual(by_name["Middle"]["sort_order"], 20)
+        self.assertIsNone(by_name["Alpha"].get("sku"))
+        self.assertIsNone(by_name["Alpha"].get("variant_group"))
+        self.assertIsNone(by_name["Middle"].get("variant_label"))
 
         # Panel state also exposes the fields
         code, state = webpanel.api_state(self.tok)
@@ -524,6 +527,41 @@ class ApiTests(WebPanelBase):
         self.assertEqual(sp["Alpha"]["category"], "Peptides")
         self.assertEqual(sp["Middle"]["category"], None)
         self.assertEqual(sp["Zebra"]["sort_order"], 30)
+
+    def test_storefront_sku_and_variants(self):
+        pink = db.add_product(SHOP, "Tee", 25.0, 4)
+        blue = db.add_product(SHOP, "Tee", 25.0, 3)
+        lone = db.add_product(SHOP, "Sticker", 5.0, 10)
+        webpanel.api_product(
+            self.tok,
+            {
+                "id": pink,
+                "sku": "UMF-TEE-PK",
+                "variant_group": "tee",
+                "variant_label": "Pink",
+            },
+        )
+        webpanel.api_product(
+            self.tok,
+            {
+                "id": blue,
+                "sku": "UMF-TEE-BL",
+                "variant_group": "tee",
+                "variant_label": "Blue",
+            },
+        )
+        sf_key = webpanel._ensure_storefront_key(SHOP)
+        code, body = webpanel.api_storefront(sf_key)
+        self.assertEqual(code, 200, body)
+        by_sku = {p.get("sku"): p for p in body["products"] if p.get("sku")}
+        self.assertEqual(by_sku["UMF-TEE-PK"]["variant_group"], "tee")
+        self.assertEqual(by_sku["UMF-TEE-PK"]["variant_label"], "Pink")
+        self.assertEqual(by_sku["UMF-TEE-BL"]["variant_label"], "Blue")
+        lone_row = next(p for p in body["products"] if p["id"] == lone)
+        self.assertIsNone(lone_row["sku"])
+        self.assertIsNone(lone_row["variant_group"])
+        self.assertIsNone(lone_row["variant_label"])
+        self.assertIsNone(body["shop"]["shipping_zones"])
 
     def test_bulk_import_upserts(self):
         db.add_product(SHOP, "BPC-157 10MG", 41.0, 5)

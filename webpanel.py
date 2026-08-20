@@ -830,7 +830,7 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
     if chat_id is None:
         return _err(404, "unknown storefront")
     shop = db.get_shop(chat_id) or db.ensure_shop(chat_id)
-    products = db.list_products(chat_id, active_only=True)
+    products = db.apply_available_stock(db.list_products(chat_id, active_only=True))
     payments = db.list_payment_methods(chat_id, active_only=True)
     return 200, {
         "ok": True,
@@ -839,6 +839,7 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
             "shipping_enabled": int(shop.get("shipping_enabled") or 0),
             "shipping_fee": float(shop.get("shipping_fee") or 0),
             "free_shipping_above": float(shop.get("free_shipping_above") or 0),
+            "shipping_zones": db.parse_shipping_zones(shop),
         },
         "products": [
             {
@@ -847,6 +848,9 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
                 "price": float(p["price"]),
                 "kit_price": (float(p["kit_price"]) if p.get("kit_price") else None),
                 "stock": int(p.get("stock") or 0),
+                "sku": _optional_text(p.get("sku"), 40),
+                "variant_group": _optional_text(p.get("variant_group"), 80),
+                "variant_label": _optional_text(p.get("variant_label"), 80),
                 "photo_url": ((p.get("photo_file_id") or "").strip()
                               if (p.get("photo_file_id") or "").startswith("http") else ""),
                 "category": (
@@ -859,6 +863,43 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
             for p in products
         ],
         "payments": [m["name"] for m in payments],
+    }
+
+
+def api_order_status(raw_key: str, payment_code: str) -> tuple[int, dict]:
+    """Read-only buyer status lookup. storefront_keys + payment_code only.
+
+    Shop-scoped: a valid catalog key cannot see another shop's order.
+    Claim tokens (vendor_invites) never resolve. No write/confirm/claim.
+    """
+    chat_id = resolve_storefront_key(raw_key)
+    if chat_id is None:
+        return _err(404, "unknown storefront")
+    order = db.get_order_by_payment_code(payment_code)
+    if not order or int(order.get("chat_id") or 0) != int(chat_id):
+        return _err(404, "order not found")
+    items = db.get_order_items(int(order["id"]))
+    return 200, {
+        "ok": True,
+        "status": order.get("status") or "",
+        "code": order.get("payment_code") or "",
+        "items": [
+            {
+                "name": it.get("product_name") or "",
+                "quantity": int(it.get("quantity") or 0),
+                "unit_price": float(it.get("unit_price") or 0),
+                "line_total": float(it.get("line_total") or 0),
+            }
+            for it in items
+        ],
+        "subtotal": float(order.get("subtotal") or 0),
+        "shipping_fee": float(order.get("shipping_fee") or 0),
+        "total": float(order.get("total") or 0),
+        "created_at": order.get("created_at") or "",
+        "tracking_number": (order.get("tracking_number") or "").strip(),
+        "tracking_carrier": (order.get("tracking_carrier") or "").strip(),
+        "ship_name": (order.get("ship_name") or "").strip(),
+        "ship_address": (order.get("ship_address") or "").strip(),
     }
 
 
@@ -885,6 +926,15 @@ def _audit_stock(
         )
 
 
+def _optional_text(value: Any, max_len: int) -> str | None:
+    if value is None:
+        return None
+    s = " ".join(str(value).split())
+    if not s:
+        return None
+    return s[:max_len]
+
+
 def _product_public(p: dict) -> dict:
     photo = (p.get("photo_file_id") or "").strip()
     cat = p.get("category")
@@ -896,6 +946,9 @@ def _product_public(p: dict) -> dict:
         "price": p["price"],
         "kit_price": p.get("kit_price"),
         "stock": p.get("stock", 0),
+        "sku": _optional_text(p.get("sku"), 40),
+        "variant_group": _optional_text(p.get("variant_group"), 80),
+        "variant_label": _optional_text(p.get("variant_label"), 80),
         "unit": p.get("unit") or "vial",
         "active": int(p.get("active") or 0),
         "site_key": p.get("site_key"),
@@ -924,6 +977,7 @@ def api_state(tok: dict) -> tuple[int, dict]:
             "shipping_enabled": int(shop.get("shipping_enabled") or 0),
             "shipping_fee": float(shop.get("shipping_fee") or 0),
             "free_shipping_above": float(shop.get("free_shipping_above") or 0),
+            "shipping_zones": db.parse_shipping_zones(shop),
         },
         "products": [_product_public(p) for p in products],
         "payments": [
@@ -1010,6 +1064,12 @@ def api_product(tok: dict, payload: dict) -> tuple[int, dict]:
         if so < -1_000_000 or so > 1_000_000:
             return _err(400, "sort_order out of range")
         fields["sort_order"] = so
+    if "sku" in payload:
+        fields["sku"] = _optional_text(payload.get("sku"), 40)
+    if "variant_group" in payload:
+        fields["variant_group"] = _optional_text(payload.get("variant_group"), 80)
+    if "variant_label" in payload:
+        fields["variant_label"] = _optional_text(payload.get("variant_label"), 80)
 
     if pid is None:
         if not name:
@@ -1026,7 +1086,15 @@ def api_product(tok: dict, payload: dict) -> tuple[int, dict]:
         extra = {
             k: v
             for k, v in fields.items()
-            if k in ("kit_price", "active", "category", "sort_order")
+            if k in (
+                "kit_price",
+                "active",
+                "category",
+                "sort_order",
+                "sku",
+                "variant_group",
+                "variant_label",
+            )
         }
         if extra:
             db.update_product(new_id, **extra)
@@ -1322,6 +1390,17 @@ def api_shipping(tok: dict, payload: dict) -> tuple[int, dict]:
             if v < 0 or v > 100_000:
                 return _err(400, f"Bad {src}")
             fields[dst] = v
+    if "zones" in payload or "shipping_zones" in payload:
+        raw_zones = payload.get("zones")
+        if raw_zones is None:
+            raw_zones = payload.get("shipping_zones")
+        if raw_zones in (None, "", [], {}):
+            fields["shipping_zones"] = None
+        else:
+            encoded = db.encode_shipping_zones(raw_zones)
+            if encoded is None:
+                return _err(400, "Bad shipping zones")
+            fields["shipping_zones"] = encoded
     if not fields:
         return _err(400, "Nothing to update")
     db.update_shop(tok["chat_id"], **fields)

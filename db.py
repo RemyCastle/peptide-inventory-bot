@@ -8,7 +8,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator, Iterable, Optional
 
@@ -26,6 +26,7 @@ from config import (
     DEFAULT_SHIPPING_FEE,
     KIT_SIZE,
     OWNER_IDS,
+    RESERVATION_HOLD_MINUTES,
     SCHEMA_VERSION,
     WELCOME_TEXT,
 )
@@ -78,6 +79,183 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
     if column not in _table_columns(conn, table):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+def _ensure_stock_reservation_table(conn: sqlite3.Connection) -> None:
+    """Soft checkout holds. Never deducts products.stock."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS stock_reservations (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id        INTEGER NOT NULL,
+            product_id      INTEGER NOT NULL,
+            quantity        INTEGER NOT NULL,
+            created_at      TEXT NOT NULL,
+            expires_at      TEXT NOT NULL,
+            released_at     TEXT,
+            release_reason  TEXT,
+            FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_stock_reservations_product
+            ON stock_reservations(product_id);
+        CREATE INDEX IF NOT EXISTS idx_stock_reservations_order
+            ON stock_reservations(order_id);
+        CREATE INDEX IF NOT EXISTS idx_stock_reservations_expires
+            ON stock_reservations(expires_at);
+        """
+    )
+
+
+def _utc_plus_minutes(minutes: int) -> str:
+    return (
+        datetime.now(timezone.utc) + timedelta(minutes=int(minutes))
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def reservation_hold_minutes() -> int:
+    try:
+        return max(1, int(RESERVATION_HOLD_MINUTES))
+    except (TypeError, ValueError):
+        return 30
+
+
+def product_stock_id(product: dict | None) -> int | None:
+    """Root inventory id. linked_product_id is shared stock, not a variant."""
+    if not product:
+        return None
+    try:
+        linked = product.get("linked_product_id")
+        if linked:
+            return int(linked)
+        return int(product["id"])
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _active_reserved_on_conn(
+    conn: sqlite3.Connection,
+    stock_ids: Iterable[int],
+    *,
+    now: str | None = None,
+    exclude_order_id: int | None = None,
+) -> dict[int, int]:
+    ids = sorted({int(i) for i in stock_ids if i is not None})
+    if not ids:
+        return {}
+    ts = now or _utc_now()
+    placeholders = ",".join("?" for _ in ids)
+    sql = (
+        f"SELECT product_id, SUM(quantity) AS qty FROM stock_reservations "
+        f"WHERE released_at IS NULL AND expires_at > ? AND product_id IN ({placeholders})"
+    )
+    params: list[Any] = [ts, *ids]
+    if exclude_order_id is not None:
+        sql += " AND order_id != ?"
+        params.append(int(exclude_order_id))
+    sql += " GROUP BY product_id"
+    out: dict[int, int] = {}
+    for row in conn.execute(sql, params).fetchall():
+        out[int(row["product_id"])] = int(row["qty"] or 0)
+    return out
+
+
+def expire_stale_reservations(now: str | None = None) -> int:
+    """Release expired soft holds. Does not change products.stock."""
+    ts = now or _utc_now()
+    with get_db() as conn:
+        if not _table_exists(conn, "stock_reservations"):
+            return 0
+        cur = conn.execute(
+            """
+            UPDATE stock_reservations
+            SET released_at = ?, release_reason = 'expired'
+            WHERE released_at IS NULL AND expires_at <= ?
+            """,
+            (ts, ts),
+        )
+        return int(cur.rowcount or 0)
+
+
+def reserved_quantities(
+    stock_ids: Iterable[int],
+    *,
+    exclude_order_id: int | None = None,
+) -> dict[int, int]:
+    expire_stale_reservations()
+    with get_db() as conn:
+        if not _table_exists(conn, "stock_reservations"):
+            return {}
+        return _active_reserved_on_conn(
+            conn, stock_ids, exclude_order_id=exclude_order_id
+        )
+
+
+def available_to_sell(
+    stock: int,
+    stock_id: int,
+    *,
+    reserved_map: dict[int, int] | None = None,
+) -> int:
+    held = 0
+    if reserved_map is not None:
+        held = int(reserved_map.get(int(stock_id), 0))
+    else:
+        held = int(reserved_quantities([int(stock_id)]).get(int(stock_id), 0))
+    return max(0, int(stock) - held)
+
+
+def apply_available_stock(products: list[dict]) -> list[dict]:
+    """Copy products with stock replaced by available-to-sell (soft holds)."""
+    if not products:
+        return products
+    stock_ids = [sid for sid in (product_stock_id(p) for p in products) if sid]
+    reserved = reserved_quantities(stock_ids)
+    out: list[dict] = []
+    for p in products:
+        q = dict(p)
+        sid = product_stock_id(q)
+        if sid is not None:
+            q["stock"] = available_to_sell(
+                int(q.get("stock") or 0), sid, reserved_map=reserved
+            )
+        out.append(q)
+    return out
+
+
+def _release_reservations_on_conn(
+    conn: sqlite3.Connection,
+    order_id: int,
+    reason: str,
+    now: str | None = None,
+) -> int:
+    if not _table_exists(conn, "stock_reservations"):
+        return 0
+    ts = now or _utc_now()
+    cur = conn.execute(
+        """
+        UPDATE stock_reservations
+        SET released_at = ?, release_reason = ?
+        WHERE order_id = ? AND released_at IS NULL
+        """,
+        (ts, str(reason or "released")[:40], int(order_id)),
+    )
+    return int(cur.rowcount or 0)
+
+
+def release_order_reservations(order_id: int, reason: str) -> int:
+    with get_db() as conn:
+        return _release_reservations_on_conn(conn, order_id, reason)
+
+
+def list_order_reservations(order_id: int) -> list[dict]:
+    with get_db() as conn:
+        if not _table_exists(conn, "stock_reservations"):
+            return []
+        rows = conn.execute(
+            "SELECT * FROM stock_reservations WHERE order_id = ? ORDER BY id",
+            (int(order_id),),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def get_schema_version() -> int:
@@ -238,6 +416,13 @@ def init_db() -> None:
 
         # Vendor-set storefront category (NULL = unset; store must not guess)
         _ensure_column(conn, "products", "category", "TEXT")
+        # Optional catalog SKU + display variants (NULL = standalone card)
+        _ensure_column(conn, "products", "sku", "TEXT")
+        _ensure_column(conn, "products", "variant_group", "TEXT")
+        _ensure_column(conn, "products", "variant_label", "TEXT")
+
+        # Optional zone quotes (JSON). NULL = current flat fee / free-above.
+        _ensure_column(conn, "shops", "shipping_zones", "TEXT")
 
         # Order payment ref code, proof screenshot, shipping tracking
         _ensure_column(conn, "orders", "payment_code", "TEXT")
@@ -246,10 +431,16 @@ def init_db() -> None:
         _ensure_column(conn, "orders", "tracking_number", "TEXT")
         _ensure_column(conn, "orders", "tracking_carrier", "TEXT")
         _ensure_column(conn, "orders", "shipped_at", "TEXT")
+        _ensure_column(conn, "orders", "tg_payment_charge_id", "TEXT")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_payment_code "
             "ON orders(payment_code) WHERE payment_code IS NOT NULL"
         )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_tg_payment_charge "
+            "ON orders(tg_payment_charge_id) WHERE tg_payment_charge_id IS NOT NULL"
+        )
+        _ensure_stock_reservation_table(conn)
 
         now = _utc_now()
         row = conn.execute("SELECT version FROM schema_meta WHERE id = 1").fetchone()
@@ -583,6 +774,7 @@ def update_shop(chat_id: int, **fields: Any) -> None:
         "inventory_master_chat_id",
         "hidden_service_fee",
         "clone_of_chat_id",
+        "shipping_zones",
     }
     cols = []
     vals: list[Any] = []
@@ -969,11 +1161,81 @@ def transfer_shop_to_group(
     )
 
 
-def calc_shipping(shop: dict, subtotal: float) -> float:
+def parse_shipping_zones(shop: dict | None) -> list[dict] | None:
+    """Parsed shipping_zones JSON, or None when unset (use flat/free-above)."""
+    raw = (shop or {}).get("shipping_zones")
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, list):
+        data = raw
+    elif isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    out: list[dict] = []
+    for z in data:
+        if not isinstance(z, dict):
+            continue
+        zid = str(z.get("id") or z.get("code") or "").strip()[:40]
+        if not zid:
+            continue
+        try:
+            fee = float(z.get("fee") if z.get("fee") is not None else z.get("shipping_fee") or 0)
+            free_above = float(
+                z.get("free_above")
+                if z.get("free_above") is not None
+                else z.get("free_shipping_above")
+                or 0
+            )
+        except (TypeError, ValueError):
+            continue
+        label = " ".join(str(z.get("label") or zid).split())[:80] or zid
+        out.append(
+            {
+                "id": zid,
+                "label": label,
+                "fee": max(0.0, fee),
+                "free_above": max(0.0, free_above),
+            }
+        )
+    return out or None
+
+
+def encode_shipping_zones(zones: Any) -> str | None:
+    """Normalize a zones payload to JSON text, or None to keep flat/free-above."""
+    if zones is None or zones == "" or zones == []:
+        return None
+    if isinstance(zones, str):
+        try:
+            zones = json.loads(zones)
+        except (TypeError, ValueError):
+            return None
+    parsed = parse_shipping_zones({"shipping_zones": zones})
+    if not parsed:
+        return None
+    return json.dumps(parsed)
+
+
+def calc_shipping(
+    shop: dict, subtotal: float, *, zone_id: str | None = None
+) -> float:
     if not shop.get("shipping_enabled", 1):
         return 0.0
     fee = float(shop.get("shipping_fee") or 0)
     free_above = float(shop.get("free_shipping_above") or 0)
+    # Named zone only when zones are configured; null zones = current flat/free-above.
+    zones = parse_shipping_zones(shop)
+    if zones and zone_id:
+        want = str(zone_id).strip()
+        match = next((z for z in zones if z["id"] == want), None)
+        if match:
+            fee = float(match["fee"])
+            free_above = float(match["free_above"])
     if free_above > 0 and subtotal >= free_above:
         return 0.0
     return max(0.0, fee)
@@ -1132,6 +1394,9 @@ def update_product(product_id: int, **fields: Any) -> bool:
         "kit_price",
         "photo_file_id",
         "category",
+        "sku",
+        "variant_group",
+        "variant_label",
     }
     cols = ["updated_at = ?"]
     vals: list[Any] = [_utc_now()]
@@ -1536,7 +1801,7 @@ def search_products(
     limit: int = 20,
 ) -> list[dict]:
     """
-    Per-shop product search (name + description).
+    Per-shop product search (name + description + sku).
     Mirrors catalog: active products only when active_only=True (includes out-of-stock).
     Case-insensitive partial match. Scoped to chat_id only (no cross-shop).
     """
@@ -1554,11 +1819,12 @@ def search_products(
                   AND (
                     name LIKE ? COLLATE NOCASE
                     OR description LIKE ? COLLATE NOCASE
+                    OR sku LIKE ? COLLATE NOCASE
                   )
                 ORDER BY sort_order, name
                 LIMIT ?
                 """,
-                (chat_id, pattern, pattern, int(limit)),
+                (chat_id, pattern, pattern, pattern, int(limit)),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -1568,11 +1834,12 @@ def search_products(
                   AND (
                     name LIKE ? COLLATE NOCASE
                     OR description LIKE ? COLLATE NOCASE
+                    OR sku LIKE ? COLLATE NOCASE
                   )
                 ORDER BY active DESC, sort_order, name
                 LIMIT ?
                 """,
-                (chat_id, pattern, pattern, int(limit)),
+                (chat_id, pattern, pattern, pattern, int(limit)),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1802,8 +2069,9 @@ def create_order(
 ) -> Optional[dict]:
     """
     Create an order. Does NOT deduct stock.
-    Validates stock availability at creation time (snapshot check).
+    Validates available-to-sell (stock − active reservations) at creation.
     Assigns a unique payment_code for memo/notes matching.
+    Soft-holds qty in stock_reservations until confirm, cancel, or expiry.
     Returns order dict or None if stock insufficient / empty cart.
     """
     if not items:
@@ -1814,7 +2082,10 @@ def create_order(
     if not ok_min:
         return None
 
+    expire_stale_reservations()
+
     with get_db() as conn:
+        _ensure_stock_reservation_table(conn)
         # Resolve each line, then aggregate stock need per product
         need_by_stock_id: dict[int, int] = {}
         for it in items:
@@ -1835,6 +2106,8 @@ def create_order(
                 "SELECT stock FROM products WHERE id = ?", (stock_id,)
             ).fetchone()
             have = int(stock_row["stock"]) if stock_row else 0
+            reserved = _active_reserved_on_conn(conn, [stock_id]).get(stock_id, 0)
+            available = max(0, have - reserved)
 
             if is_kit:
                 kp = product_kit_price(dict(row))
@@ -1842,8 +2115,8 @@ def create_order(
                     return None
                 if qty % int(KIT_SIZE) != 0 or qty < int(KIT_SIZE):
                     return None
-                # Kit option requires live stock >= KIT_SIZE for the batch
-                if have < int(KIT_SIZE):
+                # Kit option requires live available stock >= KIT_SIZE
+                if available < int(KIT_SIZE):
                     return None
                 it["product_name"] = f"{row['name']} (kit of {KIT_SIZE})"
                 it["unit_price"] = float(kp) / float(KIT_SIZE)
@@ -1853,12 +2126,14 @@ def create_order(
 
             need_by_stock_id[stock_id] = need_by_stock_id.get(stock_id, 0) + qty
 
+        reserved_map = _active_reserved_on_conn(conn, need_by_stock_id.keys())
         for stock_id, need in need_by_stock_id.items():
             stock_row = conn.execute(
                 "SELECT stock FROM products WHERE id = ?", (stock_id,)
             ).fetchone()
             have = int(stock_row["stock"]) if stock_row else 0
-            if have < need:
+            available = max(0, have - int(reserved_map.get(stock_id, 0)))
+            if available < need:
                 return None
 
         subtotal = sum(float(it["unit_price"]) * int(it["quantity"]) for it in items)
@@ -1955,6 +2230,20 @@ def create_order(
                     int(it["quantity"]),
                     line,
                 ),
+            )
+
+        # Soft hold only — products.stock is unchanged until admin confirm.
+        hold_until = _utc_plus_minutes(reservation_hold_minutes())
+        for stock_id, need in need_by_stock_id.items():
+            if need <= 0:
+                continue
+            conn.execute(
+                """
+                INSERT INTO stock_reservations
+                  (order_id, product_id, quantity, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (order_id, int(stock_id), int(need), now, hold_until),
             )
 
         row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
@@ -2167,6 +2456,38 @@ def mark_order_awaiting_confirmation(
         return True
 
 
+def record_telegram_payment_charge(
+    order_id: int, charge_id: str
+) -> tuple[bool, str]:
+    """Store Telegram Payments charge id. Does NOT deduct stock or mark paid."""
+    cid = (charge_id or "").strip()
+    if not cid:
+        return False, "Missing charge id."
+    with get_db() as conn:
+        order = conn.execute(
+            "SELECT id, status FROM orders WHERE id = ?", (int(order_id),)
+        ).fetchone()
+        if not order:
+            return False, "Order not found."
+        if order["status"] in ("cancelled", "rejected"):
+            return False, f"Order is {order['status']}."
+        now = _utc_now()
+        conn.execute(
+            """
+            UPDATE orders
+            SET tg_payment_charge_id = ?,
+                status = CASE
+                    WHEN status = 'pending_payment' THEN 'awaiting_confirmation'
+                    ELSE status
+                END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (cid[:128], now, int(order_id)),
+        )
+        return True, "Telegram payment recorded. Awaiting admin confirm."
+
+
 def set_order_tracking(
     order_id: int,
     tracking_number: str,
@@ -2227,12 +2548,15 @@ def confirm_order_payment(
                 if multi:
                     from collab import confirm_payment_multi
 
-                    return confirm_payment_multi(
+                    result = confirm_payment_multi(
                         order_id,
                         admin_id,
                         tracking_number=tracking_number,
                         tracking_carrier=tracking_carrier,
                     )
+                    if result and result[0]:
+                        release_order_reservations(order_id, "confirmed")
+                    return result
     except Exception:
         pass
 
@@ -2367,6 +2691,7 @@ def confirm_order_payment(
                 """,
                 (admin_id, now, now, order_id),
             )
+        _release_reservations_on_conn(conn, order_id, "confirmed", now)
         return True, "Payment confirmed. Inventory updated.", low_stock_alerts
 
 
@@ -2381,14 +2706,16 @@ def reject_order(order_id: int, admin_id: int, note: str = "") -> tuple[bool, st
             return False, "Cannot reject a paid order."
         if order["status"] in ("cancelled", "rejected"):
             return False, f"Order already {order['status']}."
+        now = _utc_now()
         conn.execute(
             """
             UPDATE orders
             SET status = 'rejected', confirmed_by = ?, admin_note = ?, updated_at = ?
             WHERE id = ?
             """,
-            (admin_id, note, _utc_now(), order_id),
+            (admin_id, note, now, order_id),
         )
+        _release_reservations_on_conn(conn, order_id, "rejected", now)
         return True, "Order rejected. Inventory unchanged."
 
 
@@ -2405,13 +2732,15 @@ def cancel_order(order_id: int, user_id: int | None = None) -> tuple[bool, str]:
             return False, "Paid orders cannot be cancelled."
         if order["status"] in ("cancelled", "rejected"):
             return False, f"Order already {order['status']}."
+        now = _utc_now()
         conn.execute(
             """
             UPDATE orders SET status = 'cancelled', updated_at = ?
             WHERE id = ?
             """,
-            (_utc_now(), order_id),
+            (now, order_id),
         )
+        _release_reservations_on_conn(conn, order_id, "cancelled", now)
         return True, "Order cancelled. Inventory unchanged."
 
 
@@ -2452,6 +2781,7 @@ def cancel_order_any(
             if status in _CANCEL_NOOP_STATUSES:
                 return True, f"Order already {status}."
             if status in _CANCEL_PENDING_STATUSES:
+                now = _utc_now()
                 if note_s:
                     conn.execute(
                         """
@@ -2459,7 +2789,7 @@ def cancel_order_any(
                         SET status = 'cancelled', admin_note = ?, updated_at = ?
                         WHERE id = ?
                         """,
-                        (note_s, _utc_now(), oid),
+                        (note_s, now, oid),
                     )
                 else:
                     conn.execute(
@@ -2467,8 +2797,9 @@ def cancel_order_any(
                         UPDATE orders SET status = 'cancelled', updated_at = ?
                         WHERE id = ?
                         """,
-                        (_utc_now(), oid),
+                        (now, oid),
                     )
+                _release_reservations_on_conn(conn, oid, "cancelled", now)
                 return True, "Order cancelled. Inventory unchanged."
 
             if status not in _STOCK_RESTORED_ON_CANCEL:

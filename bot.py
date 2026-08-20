@@ -38,6 +38,7 @@ from telegram.ext import (
     TypeHandler,
     filters,
 )
+import tg_payments
 
 import backup as backup_mod
 import db
@@ -7517,6 +7518,8 @@ def build_app(token: str | None = None) -> Application:
                 pass
 
     app.add_error_handler(_on_error)
+    # Telegram Payments: handlers always registered; send is off without a token.
+    tg_payments.register_payment_handlers(app)
     return app
 
 
