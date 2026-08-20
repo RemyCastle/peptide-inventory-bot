@@ -147,6 +147,13 @@ def main() -> None:
     except Exception:
         log.exception("autobiller start failed (continuing boot)")
 
+    try:
+        import reservation_janitor
+
+        reservation_janitor.start_reservation_janitor(daemon=True)
+    except Exception:
+        log.exception("reservation janitor start failed (continuing boot)")
+
     import bot
 
     bot.main()

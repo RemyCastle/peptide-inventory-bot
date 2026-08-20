@@ -133,8 +133,21 @@ MEDIA_DIR = os.getenv("MEDIA_DIR", str(DB_PATH.parent / "uploads"))
 # Master Venmo handle for vendor platform-fee invoices (weekly autobill + /invoices).
 MASTER_VENMO = (os.getenv("MASTER_VENMO", "") or "").strip() or "@remycastle"
 
+# Soft checkout hold (minutes). Real stock still deducts only on admin confirm.
+try:
+    RESERVATION_HOLD_MINUTES = max(1, int(os.getenv("RESERVATION_HOLD_MINUTES", "30")))
+except ValueError:
+    RESERVATION_HOLD_MINUTES = 30
+
+# Telegram Payments provider token for physical goods (Stripe / Smart Glocal / etc.).
+# Empty = invoices disabled. Never use Telegram Stars (XTR / empty provider).
+# Do not log this value.
+TELEGRAM_PAYMENT_PROVIDER_TOKEN = os.getenv(
+    "TELEGRAM_PAYMENT_PROVIDER_TOKEN", ""
+).strip()
+
 # Schema version expected by this code release
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def resolve_bot_tokens() -> list[str]:

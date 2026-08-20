@@ -79,6 +79,16 @@ class SearchProductsTests(unittest.TestCase):
     def test_empty_query(self) -> None:
         self.assertEqual(db.search_products(self.shop_a, "  "), [])
 
+    def test_sku_match(self) -> None:
+        sku_pid = db.add_product(
+            self.shop_a, name="Mystery Vial", price=12.0, stock=2
+        )
+        db.update_product(sku_pid, sku="UMF-GLP-5")
+        hits = db.search_products(self.shop_a, "UMF-GLP")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["name"], "Mystery Vial")
+        self.assertEqual(hits[0]["sku"], "UMF-GLP-5")
+
 
 if __name__ == "__main__":
     unittest.main()

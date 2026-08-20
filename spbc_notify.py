@@ -1126,12 +1126,26 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             )
 
         payments = vendor_stores.payment_display_lines(shop_chat_id)
+        invoice_sent = False
+        try:
+            import tg_payments
+
+            invoice_sent = tg_payments.send_invoice_for_order(
+                order, shop_chat_id, buyer_id, bot_token=vendor_token
+            )
+        except Exception:
+            log.exception(
+                "POST /order telegram invoice send failed shop=%s order=%s",
+                shop_chat_id,
+                order_id,
+            )
         return 200, {
             "ok": True,
             "code": code,
             "total": total,
             "payments": payments,
             "message": message,
+            "invoice_offered": bool(invoice_sent),
         }
     except Exception as exc:
         log.error("POST /order unexpected error: %s", exc, exc_info=exc)
@@ -1268,6 +1282,24 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
             code, body_obj = webpanel.api_storefront(invite)
             raw = json.dumps(body_obj).encode("utf-8")
             self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        if path == "/order-status":
+            # Read-only buyer lookup. Same storefront_keys scope as /storefront.
+            # vendor_invites never resolve. No write/confirm/claim.
+            import webpanel
+
+            query = urllib.parse.parse_qs(parsed.query)
+            invite = (query.get("invite") or [""])[0]
+            code = (query.get("code") or [""])[0]
+            status, body_obj = webpanel.api_order_status(invite, code)
+            raw = json.dumps(body_obj).encode("utf-8")
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Access-Control-Allow-Origin", "*")

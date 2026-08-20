@@ -1158,6 +1158,12 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
     app.add_handler(
         CallbackQueryHandler(on_supplier_handoff, pattern=r"^shand_(ok|no):")
     )
+    try:
+        import tg_payments
+
+        tg_payments.register_payment_handlers(app)
+    except Exception:
+        log.exception("[%s] telegram payment handlers not registered", name)
     return app
 
 
