@@ -60,3 +60,8 @@ Append-only log. Newest at bottom.
 - Decision: Unicorn shop slices S4–S8 are additive only. `products.sku` / `variant_group` / `variant_label` via `_ensure_column` (NULL = standalone; `linked_product_id` stays shared stock). `GET /order-status?invite=&code=` is read-only and storefront_keys-scoped. `stock_reservations` is a new IF NOT EXISTS table: available-to-sell = stock − active holds; real stock still deducts only on admin confirm; janitor + lazy expire release rows. `orders.tg_payment_charge_id` + sendInvoice/pre_checkout/successful_payment handlers exist but stay off unless `TELEGRAM_PAYMENT_PROVIDER_TOKEN` is set (physical goods, never Stars). `shops.shipping_zones` JSON is optional; NULL keeps flat `shipping_fee` / `free_shipping_above`.
 - Why: Feature plan S4–S8 without wiping or rewriting live inventory.
 - Tests: tests/test_stock_reservations.py, tests/test_order_status.py, tests/test_tg_payments.py plus sku/variant storefront + search coverage
+
+### 2026-08-20
+- Decision: Keep Dockerfile explicit `COPY` of app `.py` modules (no `COPY .`). Added `reservation_janitor.py` and `tg_payments.py` after Unicorn S4–S8 so Render image boot can import `run_cloud` / `bot`. Still omit `*.db` / `.env` from the copy list.
+- Why: 9a5eaa4 auto-deploys `update_failed`; live stayed on cb4a718. Image built, then container died on missing modules.
+- Tests: Dockerfile COPY list vs run_cloud first-party import graph; no DB/migration work
