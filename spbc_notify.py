@@ -623,6 +623,13 @@ def _handoff_to_vendor_bot(
     return {"message_id": None, "handoff_id": hid}
 
 
+def import_paid_spbc_to_unicorn(payload: dict) -> dict | None:
+    """Paid-SPBC → Unicorn shop order. Isolated so tests can patch it."""
+    import spbc_unicorn
+
+    return spbc_unicorn.maybe_import_paid_spbc_order(payload)
+
+
 # ── /notify core (called by the HTTP handler) ────────────────────────────────
 
 def handle_notify(payload: dict) -> tuple[int, dict]:
@@ -729,6 +736,15 @@ def handle_notify(payload: dict) -> tuple[int, dict]:
             "status": payload.get("status"),
         }
 
+    # Paid on the website → one Unicorn shop order, already marked paid.
+    # Never blocks supplier alerts if the shop is unconfigured.
+    unicorn_order: dict | None = None
+    try:
+        unicorn_order = import_paid_spbc_to_unicorn(payload)
+    except Exception as exc:
+        log.exception("unicorn import hook failed: %s", exc)
+        unicorn_order = {"ok": False, "error": "import_failed", "message": str(exc)}
+
     # Partner-retail orders: supplier messages are batched (Thursday policy),
     # but vendor quote-and-suggest still runs so routing works for partners.
     if payload.get("quote_only"):
@@ -752,12 +768,15 @@ def handle_notify(payload: dict) -> tuple[int, dict]:
                     suggested = True
         except Exception as exc:
             log.warning("quote_only_suggest_failed: %s", exc)
-        return 200, {
+        body = {
             "ok": True,
             "kind": "quote_only",
             "order_number": order_number,
             "vendor_quotes_suggested": suggested,
         }
+        if unicorn_order is not None:
+            body["unicorn_order"] = unicorn_order
+        return 200, body
 
     groups = group_items_by_supplier(payload)
     if not groups:
@@ -875,6 +894,8 @@ def handle_notify(payload: dict) -> tuple[int, dict]:
     }
     if errors:
         body["errors"] = errors
+    if unicorn_order is not None:
+        body["unicorn_order"] = unicorn_order
     return (200 if ok else 502), body
 
 

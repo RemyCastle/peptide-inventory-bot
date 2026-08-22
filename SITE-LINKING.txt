@@ -129,4 +129,16 @@ Each product entry can be in either shape:
       per 10-pack/kit. Check you filled the right fields.
 
 Questions? Message the shop owner.
+
+----------------------------------------------------------------
+7. THE OTHER DIRECTION (PAID WEBSITE ORDERS)
+----------------------------------------------------------------
+
+  Catalog sync is site → bot. Paid Springfield PBC orders go the other
+  way: when the site posts status paid to POST /notify, this bot creates
+  one Unicorn shop order already marked paid (stock deducts like an
+  admin confirm). Same order_number will not duplicate. Unmatched SKUs
+  stay on the order as a note; nothing is invented in the catalog.
+  Set UNICORN_SHOP_CHAT_ID to the Unicorn shop (0 = skip). No extra
+  invoice is sent — the customer already paid on the website.
 ================================================================

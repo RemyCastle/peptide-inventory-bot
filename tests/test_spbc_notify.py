@@ -145,9 +145,16 @@ class NotifyHandlerTests(unittest.TestCase):
 
         self._patch = mock.patch.object(spbc_notify, "send_telegram", fake_send)
         self._patch.start()
+        # Paid /notify also imports a Unicorn shop row; keep these tests on
+        # Telegram-alert behavior and off the default inventory.db.
+        self._uni = mock.patch.object(
+            spbc_notify, "import_paid_spbc_to_unicorn", return_value=None
+        )
+        self._uni.start()
 
     def tearDown(self):
         self._patch.stop()
+        self._uni.stop()
         spbc_notify._sessions.clear()
 
     def test_requires_order_number(self):

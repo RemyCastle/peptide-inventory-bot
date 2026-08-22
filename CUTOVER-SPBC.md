@@ -84,3 +84,10 @@ redeploy. Env vars are unchanged, so the old notifier resumes as-is.
   Products removed from the site are deactivated, never deleted.
 - Telegram sales use the bot's own flow (payment ref → proof → admin confirm →
   stock deduct). Website orders keep flowing through spbc-orders → `/notify`.
+- **Paid SPBC → Unicorn:** a `paid` / `shipped` / `complete` POST `/notify` also
+  creates one Unicorn Magic Factory shop order already marked paid (customer
+  paid on the website — no Venmo/PayPal/Telegram invoice). Same
+  `order_number` is idempotent (`orders.external_ref`). Line items match
+  Unicorn name/SKU; unmatched lines stay on the order as a note. Set
+  `UNICORN_SHOP_CHAT_ID` to the Unicorn shop chat id (do not invent one;
+  `0` skips the import). Does not use `TELEGRAM_PAYMENT_PROVIDER_TOKEN`.
