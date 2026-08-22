@@ -154,6 +154,7 @@ peptide_inventory_bot/
 
 - **Multi-shop**: each Telegram group (or owner DM) is a separate shop with its own products, prices, inventory, admins, and payment methods.
 - **Soft stock check**: stock is checked at order creation and again at payment confirm. Only confirm deducts.
+- **Paid SPBC website orders**: `POST /notify` (status `paid`) creates one Unicorn shop order already marked paid. Same `order_number` does not duplicate. Set `UNICORN_SHOP_CHAT_ID` (default `0` = skip; do not invent a chat id). Unmatched SKUs stay on the order. No Telegram invoice.
 - Run only **one** instance of the bot (Telegram allows a single long-poll client per token).
 
 ---

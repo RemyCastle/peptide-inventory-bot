@@ -111,6 +111,12 @@ try:
     SPBC_SHOP_CHAT_ID = int(os.getenv("SPBC_SHOP_CHAT_ID", "0"))
 except ValueError:
     SPBC_SHOP_CHAT_ID = 0
+# Unicorn Magic Factory fulfillment shop. 0 = unset (do not invent a chat id;
+# paid-SPBC import then tries vendor Unicorn config, else skips).
+try:
+    UNICORN_SHOP_CHAT_ID = int(os.getenv("UNICORN_SHOP_CHAT_ID", "0"))
+except ValueError:
+    UNICORN_SHOP_CHAT_ID = 0
 # Auto-sync interval in minutes. 0 = manual /syncsite only.
 try:
     SITE_SYNC_INTERVAL_MIN = int(os.getenv("SITE_SYNC_INTERVAL_MIN", "0"))
@@ -147,7 +153,7 @@ TELEGRAM_PAYMENT_PROVIDER_TOKEN = os.getenv(
 ).strip()
 
 # Schema version expected by this code release
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 def resolve_bot_tokens() -> list[str]:

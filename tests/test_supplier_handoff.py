@@ -70,6 +70,7 @@ class HandoffDeliveryTests(unittest.TestCase):
         db.ensure_shop(SHOP, title="Vendy Shop")
         db.add_admin(SHOP, VENDOR_USER, "vendy", VENDOR_USER)
         spbc_notify._handoffs.clear()
+        spbc_notify._sessions.clear()
         spbc_notify.set_bot_token("TEST:TOKEN")
         self.vendor_sends: list[tuple] = []
         self.main_sends: list[tuple] = []

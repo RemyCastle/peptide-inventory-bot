@@ -432,6 +432,8 @@ def init_db() -> None:
         _ensure_column(conn, "orders", "tracking_carrier", "TEXT")
         _ensure_column(conn, "orders", "shipped_at", "TEXT")
         _ensure_column(conn, "orders", "tg_payment_charge_id", "TEXT")
+        # Paid website (SPBC) imports: one Unicorn row per external order number
+        _ensure_column(conn, "orders", "external_ref", "TEXT")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_payment_code "
             "ON orders(payment_code) WHERE payment_code IS NOT NULL"
@@ -439,6 +441,10 @@ def init_db() -> None:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_tg_payment_charge "
             "ON orders(tg_payment_charge_id) WHERE tg_payment_charge_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_external_ref "
+            "ON orders(external_ref) WHERE external_ref IS NOT NULL"
         )
         _ensure_stock_reservation_table(conn)
 
@@ -2281,6 +2287,156 @@ def get_order_by_payment_code(payment_code: str) -> Optional[dict]:
             if row:
                 return dict(row)
         return None
+
+def get_order_by_external_ref(external_ref: str) -> Optional[dict]:
+    """Look up an imported order by stable external id (e.g. spbc:PEP-1)."""
+    ref = (external_ref or "").strip()
+    if not ref:
+        return None
+    with get_db() as conn:
+        if "external_ref" not in _table_columns(conn, "orders"):
+            return None
+        row = conn.execute(
+            "SELECT * FROM orders WHERE external_ref = ?", (ref,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def create_imported_order(
+    chat_id: int,
+    *,
+    user_id: int,
+    username: str | None,
+    full_name: str | None,
+    items: list[dict],
+    payment_method_name: str,
+    ship_name: str,
+    ship_address: str,
+    ship_notes: str = "",
+    admin_note: str = "",
+    external_ref: str,
+    shipping_fee: float = 0.0,
+) -> Optional[dict]:
+    """Insert a shop order that may include unmatched (product_id=None) lines.
+
+    Does not deduct stock and does not reserve. Caller confirms payment
+    (same path as admin confirm) when the order should be marked paid.
+    Empty ``items`` is allowed so an unmatched-only payload still records.
+    Returns None only when ``external_ref`` is missing.
+    """
+    ref = (external_ref or "").strip()
+    if not ref:
+        return None
+    existing = get_order_by_external_ref(ref)
+    if existing:
+        return existing
+
+    ensure_shop(chat_id)
+    now = _utc_now()
+    subtotal = 0.0
+    for it in items:
+        try:
+            qty = int(it.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        try:
+            price = float(it.get("unit_price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        subtotal += price * max(0, qty)
+    ship = float(shipping_fee or 0)
+    total = subtotal + ship
+    pm_name = (payment_method_name or "").strip() or None
+
+    with get_db() as conn:
+        if "external_ref" not in _table_columns(conn, "orders"):
+            _ensure_column(conn, "orders", "external_ref", "TEXT")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_external_ref "
+                "ON orders(external_ref) WHERE external_ref IS NOT NULL"
+            )
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO orders (
+                    chat_id, user_id, username, full_name, status,
+                    subtotal, shipping_fee, total,
+                    payment_method_id, payment_method_name,
+                    ship_name, ship_address, ship_notes, admin_note,
+                    created_at, updated_at, hidden_service_fee, external_ref
+                ) VALUES (?, ?, ?, ?, 'pending_payment', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    int(chat_id),
+                    int(user_id),
+                    username,
+                    full_name,
+                    subtotal,
+                    ship,
+                    total,
+                    pm_name,
+                    ship_name,
+                    ship_address,
+                    ship_notes,
+                    admin_note,
+                    now,
+                    now,
+                    ref,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                "SELECT * FROM orders WHERE external_ref = ?", (ref,)
+            ).fetchone()
+            return dict(row) if row else None
+
+        order_id = int(cur.lastrowid)
+        payment_code = None
+        for _ in range(8):
+            candidate = generate_payment_code(order_id)
+            try:
+                conn.execute(
+                    "UPDATE orders SET payment_code = ? WHERE id = ?",
+                    (candidate, order_id),
+                )
+                payment_code = candidate
+                break
+            except Exception:
+                continue
+        if payment_code is None:
+            payment_code = generate_payment_code()
+            conn.execute(
+                "UPDATE orders SET payment_code = ? WHERE id = ?",
+                (payment_code, order_id),
+            )
+
+        for it in items:
+            try:
+                qty = int(it.get("quantity") or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            try:
+                price = float(it.get("unit_price") or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            name = str(it.get("product_name") or "Item").strip() or "Item"
+            raw_pid = it.get("product_id")
+            try:
+                pid = int(raw_pid) if raw_pid is not None else None
+            except (TypeError, ValueError):
+                pid = None
+            conn.execute(
+                """
+                INSERT INTO order_items
+                  (order_id, product_id, product_name, unit_price, quantity, line_total)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (order_id, pid, name, price, qty, price * max(0, qty)),
+            )
+
+        row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+        return dict(row) if row else None
+
 
 def get_order_items(order_id: int) -> list[dict]:
     with get_db() as conn:

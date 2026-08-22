@@ -65,3 +65,8 @@ Append-only log. Newest at bottom.
 - Decision: Keep Dockerfile explicit `COPY` of app `.py` modules (no `COPY .`). Added `reservation_janitor.py` and `tg_payments.py` after Unicorn S4–S8 so Render image boot can import `run_cloud` / `bot`. Still omit `*.db` / `.env` from the copy list.
 - Why: 9a5eaa4 auto-deploys `update_failed`; live stayed on cb4a718. Image built, then container died on missing modules.
 - Tests: Dockerfile COPY list vs run_cloud first-party import graph; no DB/migration work
+
+### 2026-08-22
+- Decision: Paid SPBC `/notify` creates one Unicorn shop order already marked paid. Additive `orders.external_ref` unique index (`spbc:{order_number}`) for idempotency; unmatched lines use `product_id` NULL + ship/admin notes (no fake products). Stock uses existing `confirm_order_payment` (`order_paid_confirm` audit); if confirm refuses (short stock) the order is still marked paid with a visible note so we never re-invoice. Shop id from `UNICORN_SHOP_CHAT_ID` (default 0) or vendor Unicorn config — never invent a chat id, never fall back to `SPBC_SHOP_CHAT_ID`. No Telegram invoice / payment-provider path. Live `inventory.db` not touched.
+- Why: Website customers already paid; Unicorn is the fulfillment queue.
+- Tests: tests/test_spbc_unicorn_order.py (happy / duplicate / unmatched + /notify hook)
