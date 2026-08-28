@@ -6379,12 +6379,12 @@ async def cmd_webpanel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"Revoked {n} panel link(s). Send /webpanel for a fresh one."
         )
         return
-    if not PANEL_BASE_URL:
+    link = webpanel.issue_panel_link(sid, user.id)
+    if not link:
         await update.message.reply_text(
             "Web panel is not configured on this deploy (PANEL_BASE_URL unset)."
         )
         return
-    link = webpanel.panel_url(PANEL_BASE_URL, webpanel.issue_token(sid, user.id))
     text = (
         "🖥 *Your shop panel* — edit products, stock, prices, payments, "
         f"shipping from any browser:\n{link}\n\n"

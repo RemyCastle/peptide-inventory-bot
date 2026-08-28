@@ -499,6 +499,18 @@ def panel_url(base_url: str, raw_token: str, mode: str = "") -> str:
     return url
 
 
+def issue_panel_link(shop_chat_id: int, user_id: int) -> str | None:
+    """Mint a 3-day panel URL for this shop, or None if PANEL_BASE_URL is unset.
+
+    Shared by the main bot /webpanel command and the vendor storefront bot.
+    The raw token is only in the returned URL — callers must not log it.
+    """
+    base = (PANEL_BASE_URL or "").strip()
+    if not base:
+        return None
+    return panel_url(base, issue_token(int(shop_chat_id), int(user_id)))
+
+
 # ── Vendor invites ───────────────────────────────────────────────────────────
 
 def normalize_invite_token(raw_invite: str) -> str:

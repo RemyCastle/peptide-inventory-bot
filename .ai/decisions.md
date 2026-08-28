@@ -70,3 +70,8 @@ Append-only log. Newest at bottom.
 - Decision: Vendor stock how-to lives in `webpanel.PANEL_HTML` Catalog (same screen as Stock + Save), not README. Stock is stored as vials; kits of 10 are display/pricing only (`KIT_SIZE`). Live Unicorn Magic Factory catalog is served by `spbc-supplier-bot` `/storefront` (shop title `@unicornmagicfactory`). BAC 3ml is product id 69, stock in vials. Did not write live `/data/inventory.db` from this agent (no Render SSH).
 - Why: Ghostie already opens Telegram `/webpanel` → `{PANEL_BASE_URL}/panel?t=…` Catalog. Remy asked for on-page shelf-count instructions and 90 vials of 3ml BAC.
 - Tests: `tests/test_webpanel.py::HttpLayerTests.test_panel_html_has_stock_howto_on_catalog`
+
+### 2026-08-28
+- Decision: Cache-bust vendor Mini App `WebAppInfo` URLs with `?v=20260828` (`vendor_stores.cache_bust_store_url`) at both the Unicorn default and `_build_app` keyboard. Add `/webpanel` on the vendor storefront bot only (shop admins ∪ notify_ids ∪ owners) using `webpanel.issue_panel_link` / `revoke_tokens`. Did not rewrite POST `/order`, did not port Telegram catalog-admin buttons, kept `voffer_*` / `shand_*`.
+- Why: Telegram WebView was serving cached Pages HTML; Ghostie needs a weblink on HER vendor bot, not SPBC admin buttons. Mini App no-initData fake-success is fixed on Pages, not here.
+- Tests: `tests/test_vendor_webpanel.py`; `tests/test_webpanel.py` issue_panel_link cases
