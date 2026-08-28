@@ -49,6 +49,7 @@ import time
 import urllib.parse
 
 from telegram import KeyboardButton, ReplyKeyboardMarkup, Update, WebAppInfo
+from telegram.constants import ChatType
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -65,6 +66,30 @@ log = logging.getLogger("vendor_stores")
 
 # Telegram WebApp initData max age (replay guard)
 INIT_DATA_MAX_AGE_SEC = 24 * 60 * 60
+
+# Bump this when the Pages Mini App HTML changes so Telegram WebView
+# does not keep serving a cached checkout.
+STORE_URL_CACHE_BUST = "20260828"
+DEFAULT_UNICORN_STORE_URL = "https://remy-miniapp-demos.pages.dev/unicorn/"
+
+
+def cache_bust_store_url(
+    url: str, version: str = STORE_URL_CACHE_BUST
+) -> str:
+    """Append or replace ?v= so Telegram fetches fresh Mini App HTML."""
+    raw = (url or "").strip()
+    if not raw:
+        return raw
+    parts = urllib.parse.urlsplit(raw)
+    q = [
+        (k, v)
+        for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        if k != "v"
+    ]
+    q.append(("v", version))
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(q), parts.fragment)
+    )
 
 
 class InitDataError(Exception):
@@ -854,8 +879,9 @@ def load_vendor_configs() -> list[dict]:
             "token": os.getenv("UNICORN_BOT_TOKEN", "").strip(),
             "invite": (os.getenv("UNICORN_CLAIM_TOKEN") or "").strip(),
             "shop_chat_id": (os.getenv("UNICORN_SHOP_CHAT_ID") or "").strip(),
-            "store_url": (os.getenv("UNICORN_STORE_URL")
-                          or "https://remy-miniapp-demos.pages.dev/unicorn/").strip(),
+            "store_url": cache_bust_store_url(
+                (os.getenv("UNICORN_STORE_URL") or DEFAULT_UNICORN_STORE_URL).strip()
+            ),
             "notify_ids": legacy_notify,
             "order_fee": 1.0,  # unicornfartzz pays $1/order; other vendors default $2
         })
@@ -868,6 +894,8 @@ def load_vendor_configs() -> list[dict]:
         if not tok or tok in seen:
             continue
         seen.add(tok)
+        if v.get("store_url"):
+            v["store_url"] = cache_bust_store_url(v.get("store_url") or "")
         unique.append(v)
     return unique
 
@@ -945,10 +973,61 @@ def _fmt_money(x: float) -> str:
     return f"${x:,.2f}"
 
 
+def can_access_vendor_webpanel(
+    user_id: int, shop_chat_id: int, notify_ids: list[int] | None = None
+) -> bool:
+    """True for shop admins, configured notify_ids, or global owners."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    if uid <= 0:
+        return False
+    try:
+        if db.is_admin(int(shop_chat_id), uid):
+            return True
+    except Exception:
+        log.exception(
+            "can_access_vendor_webpanel: is_admin failed shop=%s user=%s",
+            shop_chat_id,
+            uid,
+        )
+    if db.is_owner(uid):
+        return True
+    for nid in notify_ids or []:
+        try:
+            if int(nid) == uid:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def mint_vendor_webpanel_reply(shop_chat_id: int, user_id: int) -> str:
+    """Reply text for an authorized /webpanel mint. Does not log the token."""
+    import webpanel
+
+    link = webpanel.issue_panel_link(int(shop_chat_id), int(user_id))
+    if not link:
+        return "Web panel is not configured on this deploy (PANEL_BASE_URL unset)."
+    return (
+        f"🖥 Your shop panel:\n{link}\n\n"
+        "Bookmark this; send /webpanel for a fresh one."
+    )
+
+
+def revoke_vendor_webpanel_reply(shop_chat_id: int) -> str:
+    """Same revoke wording as the main bot /webpanel revoke."""
+    import webpanel
+
+    n = webpanel.revoke_tokens(int(shop_chat_id))
+    return f"Revoked {n} panel link(s). Send /webpanel for a fresh one."
+
+
 def _build_app(v: dict, shop_chat_id: int) -> Application:
     name = v.get("name") or "the shop"
     emoji = v.get("emoji") or "\U0001f6cd"
-    store_url = v.get("store_url") or ""
+    store_url = cache_bust_store_url(v.get("store_url") or "")
     notify_ids = list(dict.fromkeys([*(v.get("notify_ids") or []), *_owner_ids()]))
     welcome = v.get("welcome") or (
         f"{emoji} Welcome to *{name}* {emoji}\n\n"
@@ -967,6 +1046,39 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
 
     async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Your chat id: {update.effective_chat.id}")
+
+    async def cmd_webpanel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Shop admins / notify_ids / owners: mint or revoke a 3-day panel link.
+
+        Daily shop admin stays on the weblink. This command does not add
+        Telegram catalog/add-product buttons.
+        """
+        user = update.effective_user
+        chat = update.effective_chat
+        msg = update.message
+        if not user or not msg:
+            return
+        if not can_access_vendor_webpanel(user.id, shop_chat_id, notify_ids):
+            await msg.reply_text("Admins only.")
+            return
+        args = list(getattr(context, "args", None) or [])
+        if args and str(args[0]).lower() == "revoke":
+            await msg.reply_text(revoke_vendor_webpanel_reply(shop_chat_id))
+            return
+        text = mint_vendor_webpanel_reply(shop_chat_id, user.id)
+        if chat and chat.type != ChatType.PRIVATE and text.startswith("🖥"):
+            try:
+                await context.bot.send_message(
+                    user.id, text, disable_web_page_preview=True
+                )
+                await msg.reply_text("Sent you the panel link in DM.")
+            except Exception:
+                await msg.reply_text(
+                    "I can't DM you yet — open this bot privately, press Start, "
+                    "then send /webpanel there."
+                )
+            return
+        await msg.reply_text(text, disable_web_page_preview=True)
 
     async def on_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
@@ -1112,6 +1224,7 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
     app = Application.builder().token(v["token"]).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("webpanel", cmd_webpanel))
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))
     # SPBC fulfillment offers arrive through THIS bot, so Accept/Decline taps
     # come back here — not to the main SPBC bot.

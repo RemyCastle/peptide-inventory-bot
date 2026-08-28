@@ -65,6 +65,18 @@ class TokenTests(WebPanelBase):
         url = webpanel.panel_url("https://x.example.com/", "abc")
         self.assertEqual(url, "https://x.example.com/panel?t=abc")
 
+    def test_issue_panel_link_mints_resolvable_url(self):
+        with mock.patch.object(webpanel, "PANEL_BASE_URL", "https://panel.example.com"):
+            url = webpanel.issue_panel_link(SHOP, USER)
+        self.assertIsNotNone(url)
+        self.assertTrue(url.startswith("https://panel.example.com/panel?t="))
+        raw = url.split("t=", 1)[1]
+        self.assertEqual(webpanel.resolve_token(raw), {"chat_id": SHOP, "user_id": USER})
+
+    def test_issue_panel_link_none_when_base_unset(self):
+        with mock.patch.object(webpanel, "PANEL_BASE_URL", ""):
+            self.assertIsNone(webpanel.issue_panel_link(SHOP, USER))
+
     def test_tokens_are_markdown_safe(self):
         """'_' or '-' in a token breaks Telegram Markdown → message never sends
         (this silently killed /invitevendor and /webpanel in production)."""
