@@ -720,6 +720,17 @@ class HttpLayerTests(WebPanelBase):
         self.assertIn("text/html", ctype)
         self.assertIn(b"Shop Panel", body)
 
+    def test_panel_html_has_stock_howto_on_catalog(self):
+        """Ghostie's /webpanel page must explain shelf-count stock next to Stock."""
+        html = webpanel.PANEL_HTML
+        self.assertIn('id="stock-howto"', html)
+        self.assertIn("How to set stock", html)
+        self.assertIn("Count the vials on the shelf", html)
+        self.assertIn("Type that number in Stock", html)
+        self.assertIn("Tap Save", html)
+        self.assertIn("Stock (vials)", html)
+        self.assertIn("use Stock and Save", html)
+
     def test_state_requires_token(self):
         code, _, _ = webpanel.handle_panel_get("/panel/api/state", {"t": ["bad"]})
         self.assertEqual(code, 401)
