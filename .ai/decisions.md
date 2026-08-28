@@ -65,3 +65,8 @@ Append-only log. Newest at bottom.
 - Decision: Keep Dockerfile explicit `COPY` of app `.py` modules (no `COPY .`). Added `reservation_janitor.py` and `tg_payments.py` after Unicorn S4–S8 so Render image boot can import `run_cloud` / `bot`. Still omit `*.db` / `.env` from the copy list.
 - Why: 9a5eaa4 auto-deploys `update_failed`; live stayed on cb4a718. Image built, then container died on missing modules.
 - Tests: Dockerfile COPY list vs run_cloud first-party import graph; no DB/migration work
+
+### 2026-08-28
+- Decision: Vendor stock how-to lives in `webpanel.PANEL_HTML` Catalog (same screen as Stock + Save), not README. Stock is stored as vials; kits of 10 are display/pricing only (`KIT_SIZE`). Live Unicorn Magic Factory catalog is served by `spbc-supplier-bot` `/storefront` (shop title `@unicornmagicfactory`). BAC 3ml is product id 69, stock in vials. Did not write live `/data/inventory.db` from this agent (no Render SSH).
+- Why: Ghostie already opens Telegram `/webpanel` → `{PANEL_BASE_URL}/panel?t=…` Catalog. Remy asked for on-page shelf-count instructions and 90 vials of 3ml BAC.
+- Tests: `tests/test_webpanel.py::HttpLayerTests.test_panel_html_has_stock_howto_on_catalog`

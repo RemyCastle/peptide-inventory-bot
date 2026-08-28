@@ -2631,6 +2631,9 @@ PANEL_HTML = """<!doctype html>
   .prod{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
   .off{opacity:.55}
   .tag{font-size:.72rem;color:var(--mut)}
+  .howto{font-size:.9rem;line-height:1.4;margin:0 0 12px;padding:10px 12px;
+         background:var(--bg);border:1px solid var(--line);border-radius:8px}
+  .howto b{display:block;margin-bottom:4px}
   .msg{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);
        background:var(--ink);color:var(--bg);padding:9px 16px;border-radius:10px;
        opacity:0;transition:opacity .25s;pointer-events:none;max-width:90vw}
@@ -2768,7 +2771,7 @@ function prodRow(p){
         <input class="f-price" type="number" step="0.01" min="0" value="${p.price}"></div>
       <div class="num"><label>Kit price</label>
         <input class="f-kit" type="number" step="0.01" min="0" value="${p.kit_price==null?'':p.kit_price}"></div>
-      <div class="num"><label>Stock</label>
+      <div class="num"><label>Stock (vials)</label>
         <input class="f-stock${low}" type="number" step="1" min="0" value="${p.stock}"></div>
     </div>
     <div class="row">
@@ -2841,6 +2844,10 @@ function render(){
   </div>
   <div id="tab-catalog" class="${TAB==='catalog'?'':'hide'}">
   <div class="card"><h2>Products (${S.products.length})</h2>
+    <p class="howto" id="stock-howto"><b>How to set stock</b>
+      Count the vials on the shelf. Type that number in Stock. Tap Save.
+      Stock is vials, not kits. A kit is 10 vials, so 90 vials shows as
+      9 kits in the shop.</p>
     <datalist id="cat-suggestions">
       <option value="GLP-1"><option value="Recovery"><option value="Longevity">
       <option value="Blends"><option value="Peptides"><option value="Supplies">
@@ -2851,8 +2858,11 @@ function render(){
       <span class="tag grow">Adds to stock instead of replacing it</span>
     </div>
     <div id="restock" style="display:none">
-      <div class="tag" style="margin-bottom:6px">Type how many arrived of each
-        item, then Apply. Blank = unchanged.</div>
+      <div class="howto" style="margin-bottom:8px"><b>Shipment received</b>
+        Type how many vials just arrived, then Apply. This adds to the
+        current number. To set the exact shelf count, use Stock and Save
+        on the list below.</div>
+      <div class="tag" style="margin-bottom:6px">Blank = unchanged.</div>
       ${S.products.map(p=>`<div class="row rs" data-id="${p.id}">
         <div class="name"><label>${esc(p.name)}</label>
           <span class="tag">now: ${p.stock}</span></div>
@@ -2870,7 +2880,7 @@ function render(){
       <div class="name"><label>New product</label><input id="np-name" placeholder="BPC-157 10MG"></div>
       <div class="num"><label>Price / vial</label><input id="np-price" type="number" step="0.01" min="0"></div>
       <div class="num"><label>Kit price</label><input id="np-kit" type="number" step="0.01" min="0" placeholder="—"></div>
-      <div class="num"><label>Stock</label><input id="np-stock" type="number" step="1" min="0" value="0"></div>
+      <div class="num"><label>Stock (vials)</label><input id="np-stock" type="number" step="1" min="0" value="0"></div>
       <div><button id="np-add">Add</button></div></div>
       <span class="tag">Kit price optional — leave blank to sell vials only.</span></div>
     <div class="prod"><label>Bulk add / update — one per line:
