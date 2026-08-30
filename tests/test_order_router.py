@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -51,8 +52,19 @@ class RouterBase(unittest.TestCase):
         db.add_product(MASTER, "BAC WATER 3ML", 1.0, 999)
         self._cfg = mock.patch.object(order_router, "SPBC_SHOP_CHAT_ID", MASTER)
         self._cfg.start()
+        self._env = mock.patch.dict(
+            os.environ,
+            {
+                "SKIP_VENDOR_SHOP_CHAT_IDS": "",
+                "UNICORN_SHOP_CHAT_ID": "",
+                "SKIP_UNICORN_ROUTING": "1",
+            },
+            clear=False,
+        )
+        self._env.start()
 
     def tearDown(self) -> None:
+        self._env.stop()
         self._cfg.stop()
         order_router._pending.clear()
         self._tmp.cleanup()
@@ -116,6 +128,68 @@ class QuoteTests(RouterBase):
         payload = order_payload([{"name": "RETA 35 MG (Vial)", "qty": 1}])
         quotes = order_router.compute_quotes(payload)
         self.assertEqual([q["shop_chat_id"] for q in quotes], [VENDOR_A])
+
+    def test_unicorn_title_is_not_quoted(self):
+        unicorn = 2001
+        db.ensure_shop(unicorn, title="Unicorn Magic Factory")
+        db.add_product(unicorn, "RETA 35 MG", 10.0, 99)
+        db.add_product(unicorn, "BAC WATER 3ML", 1.0, 99)
+        payload = order_payload(
+            [{"name": "RETA 35 MG (Vial)", "qty": 1},
+             {"name": "BAC WATER 3ML", "qty": 1}]
+        )
+        quotes = order_router.compute_quotes(payload)
+        ids = [q["shop_chat_id"] for q in quotes]
+        self.assertNotIn(unicorn, ids)
+        self.assertEqual(ids, [VENDOR_A, VENDOR_B])
+        self.assertIsNone(
+            order_router.quote_shop(
+                unicorn,
+                [order_router.parse_line({"name": "RETA 35 MG (Vial)", "qty": 1})],
+            )
+        )
+
+    def test_ghostie_and_handle_titles_are_not_quoted(self):
+        ghostie = 2002
+        handle = 2003
+        db.ensure_shop(ghostie, title="Ghostie's Shelf")
+        db.ensure_shop(handle, title="@unicornmagicfactory")
+        db.add_product(ghostie, "RETA 35 MG", 9.0, 99)
+        db.add_product(handle, "RETA 35 MG", 8.0, 99)
+        payload = order_payload([{"name": "RETA 35 MG (Vial)", "qty": 1}])
+        quotes = order_router.compute_quotes(payload)
+        ids = [q["shop_chat_id"] for q in quotes]
+        self.assertNotIn(ghostie, ids)
+        self.assertNotIn(handle, ids)
+        self.assertIn(VENDOR_A, ids)
+
+    def test_patriotic_peptides_still_quoted(self):
+        patriot = 2004
+        db.ensure_shop(patriot, title="Patriotic Peptides")
+        db.add_product(patriot, "RETA 35 MG", 140.0, 10)
+        payload = order_payload([{"name": "RETA 35 MG (Vial)", "qty": 1}])
+        quotes = order_router.compute_quotes(payload)
+        ids = [q["shop_chat_id"] for q in quotes]
+        self.assertIn(patriot, ids)
+        self.assertIn(VENDOR_A, ids)
+
+    def test_only_unicorn_complete_fill_returns_no_quotes(self):
+        unicorn = 2005
+        db.ensure_shop(unicorn, title="Unicorn")
+        db.add_product(unicorn, "RARE 1MG", 12.0, 5)
+        payload = order_payload([{"name": "RARE 1MG (Vial)", "qty": 1}])
+        self.assertEqual(order_router.compute_quotes(payload), [])
+        self.assertIsNone(order_router.suggest_for_order(payload))
+
+    def test_skip_vendor_shop_chat_ids_env(self):
+        flagged = 2006
+        db.ensure_shop(flagged, title="Neutral Vendor")
+        db.add_product(flagged, "RETA 35 MG", 5.0, 99)
+        with mock.patch.dict(os.environ, {"SKIP_VENDOR_SHOP_CHAT_IDS": str(flagged)}):
+            payload = order_payload([{"name": "RETA 35 MG (Vial)", "qty": 1}])
+            ids = [q["shop_chat_id"] for q in order_router.compute_quotes(payload)]
+        self.assertNotIn(flagged, ids)
+        self.assertIn(VENDOR_A, ids)
 
 
 class SuggestApplyTests(RouterBase):

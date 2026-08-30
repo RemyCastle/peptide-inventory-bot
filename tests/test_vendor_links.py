@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -81,14 +82,25 @@ class RoutingUsesLinksTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         db.set_db_path(Path(self._tmp.name) / "vl2.db")
         db.init_db()
-        db.ensure_shop(VENDOR, title="Unicorn")
+        db.ensure_shop(VENDOR, title="Linked Vendor")
         vendor_links.ensure_tables()
         self.h36 = db.add_product(VENDOR, "H36", 30.0, 150)
         order_router._pending.clear()
         self._cfg = mock.patch.object(order_router, "SPBC_SHOP_CHAT_ID", 0)
         self._cfg.start()
+        self._env = mock.patch.dict(
+            os.environ,
+            {
+                "SKIP_VENDOR_SHOP_CHAT_IDS": "",
+                "UNICORN_SHOP_CHAT_ID": "",
+                "SKIP_UNICORN_ROUTING": "1",
+            },
+            clear=False,
+        )
+        self._env.start()
 
     def tearDown(self):
+        self._env.stop()
         self._cfg.stop()
         self._tmp.cleanup()
 
