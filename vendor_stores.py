@@ -772,7 +772,21 @@ async def notify_order_recipient(
             rid,
         )
 
-    # 2) Main bot fallback (@SPBCOrderBot / pool token)
+    # 2) Main bot fallback (@SPBCOrderBot / pool token).
+    # Unicorn never uses the SPBC bot — vendor token only.
+    try:
+        from unicorn_shop import is_unicorn_shop
+
+        if is_unicorn_shop(shop):
+            log.info(
+                "notify_order_recipient: Unicorn shop — no SPBC main-bot "
+                "fallback shop=%s to=%s",
+                shop,
+                rid,
+            )
+            return False
+    except Exception:
+        pass
     try:
         import spbc_notify
 
@@ -1226,9 +1240,13 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("webpanel", cmd_webpanel))
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))
-    # SPBC fulfillment offers arrive through THIS bot, so Accept/Decline taps
-    # come back here — not to the main SPBC bot.
-    app.add_handler(CallbackQueryHandler(on_offer_answer, pattern=r"^voffer_(ok|no):"))
+    # SPBC fulfillment / supplier-handoff callbacks stay on non-Unicorn vendor
+    # bots only. Unicorn Magic Factory is customer-facing and does not accept
+    # SPBC website orders or stock pulls.
+    from unicorn_shop import vendor_accepts_spbc_fulfillment
+
+    if vendor_accepts_spbc_fulfillment(v, shop_chat_id):
+        app.add_handler(CallbackQueryHandler(on_offer_answer, pattern=r"^voffer_(ok|no):"))
 
     async def on_supplier_handoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Answer a website order handed to this vendor as their supplier."""
@@ -1268,9 +1286,10 @@ def _build_app(v: dict, shop_chat_id: int) -> Application:
                 h["shop_chat_id"], oid, note, context=context
             )
 
-    app.add_handler(
-        CallbackQueryHandler(on_supplier_handoff, pattern=r"^shand_(ok|no):")
-    )
+    if vendor_accepts_spbc_fulfillment(v, shop_chat_id):
+        app.add_handler(
+            CallbackQueryHandler(on_supplier_handoff, pattern=r"^shand_(ok|no):")
+        )
     try:
         import tg_payments
 
@@ -1403,6 +1422,13 @@ def vendor_bot_for_user(user_id: int | str) -> dict | None:
             except (TypeError, ValueError):
                 continue
         if uid in admins or uid in notify_ids:
+            try:
+                from unicorn_shop import is_unicorn_vendor
+
+                if is_unicorn_vendor(v, shop):
+                    continue
+            except Exception:
+                pass
             return {
                 "shop_chat_id": int(shop),
                 "token": token,

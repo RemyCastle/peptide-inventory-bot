@@ -26,7 +26,7 @@ class VendorLinkTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         db.set_db_path(Path(self._tmp.name) / "vl.db")
         db.init_db()
-        db.ensure_shop(VENDOR, title="Unicorn")
+        db.ensure_shop(VENDOR, title="Vendy")
         db.ensure_shop(OTHER, title="Other")
         vendor_links.ensure_tables()
         # Vendor names things her own way
@@ -81,7 +81,7 @@ class RoutingUsesLinksTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         db.set_db_path(Path(self._tmp.name) / "vl2.db")
         db.init_db()
-        db.ensure_shop(VENDOR, title="Unicorn")
+        db.ensure_shop(VENDOR, title="Vendy")
         vendor_links.ensure_tables()
         self.h36 = db.add_product(VENDOR, "H36", 30.0, 150)
         order_router._pending.clear()

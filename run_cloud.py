@@ -154,9 +154,23 @@ def main() -> None:
     except Exception:
         log.exception("reservation janitor start failed (continuing boot)")
 
-    import bot
+    _run_foreground()
 
-    bot.main()
+
+def _run_foreground() -> None:
+    """Block on the main SPBC bot, or stay up for Unicorn-only (no SPBC token)."""
+    from config import resolve_bot_tokens
+
+    if resolve_bot_tokens():
+        import bot
+
+        bot.main()
+        return
+    log.info(
+        "No TELEGRAM_BOT_TOKEN/BOT_TOKENS — vendor-only mode "
+        "(HTTP + Unicorn/vendor bots; SPBC main bot not required)"
+    )
+    threading.Event().wait()
 
 
 if __name__ == "__main__":
