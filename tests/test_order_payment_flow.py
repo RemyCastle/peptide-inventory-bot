@@ -72,6 +72,16 @@ class OrderPaymentFlowTests(unittest.TestCase):
         self.assertEqual(db.get_order_by_payment_code("UF-ABC123")["id"], o["id"])
         self.assertEqual(db.get_order_by_payment_code("🎁UF-ABC123")["id"], o["id"])
 
+        # Legacy UF{order_id}-XXXXXX memo codes (pre-🎁) still resolve by stored value.
+        legacy = f"UF{o['id']}-XYZ789"
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET payment_code = ? WHERE id = ?",
+                (legacy, o["id"]),
+            )
+        self.assertEqual(db.get_order_by_payment_code(legacy)["id"], o["id"])
+        self.assertEqual(db.get_order_by_payment_code(f"🎁{legacy}")["id"], o["id"])
+
     def test_codes_unique(self) -> None:
         codes = {self._order()["payment_code"] for _ in range(5)}
         self.assertEqual(len(codes), 5)

@@ -1082,6 +1082,17 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
                 )
                 continue
             try:
+                from unicorn_shop import is_unicorn_shop
+
+                if is_unicorn_shop(shop_chat_id):
+                    log.info(
+                        "POST /order Unicorn shop — skip SPBC main-bot notify rid=%s",
+                        rid,
+                    )
+                    continue
+            except Exception:
+                pass
+            try:
                 send_telegram(rid, note)
                 log.info("POST /order notified rid=%s via main bot", rid)
             except Exception as exc:

@@ -186,6 +186,13 @@ def set_share(
         return False, "Product does not belong to guest shop."
     if not get_shop(guest_chat_id):
         return False, "Guest shop missing."
+    try:
+        from unicorn_shop import is_unicorn_shop
+
+        if is_unicorn_shop(guest_chat_id):
+            return False, "Unicorn Magic Factory inventory is not shared with other shops."
+    except Exception:
+        pass
     now = _utc_now()
     with get_db() as conn:
         # Ensure accepted collab exists
@@ -251,8 +258,14 @@ def list_shares(host_chat_id: int, active_only: bool = True) -> list[dict]:
                 (host_chat_id,),
             ).fetchall()
         out = []
+        try:
+            from unicorn_shop import is_unicorn_shop
+        except Exception:
+            is_unicorn_shop = None  # type: ignore[assignment]
         for r in rows:
             d = dict(r)
+            if is_unicorn_shop and is_unicorn_shop(d.get("guest_chat_id"), title=d.get("guest_title")):
+                continue
             base = float(d["base_price"])
             mk = float(d["markup_pct"] or 0)
             d["sell_price"] = round(base * (1 + mk / 100.0), 2)
@@ -262,6 +275,13 @@ def list_shares(host_chat_id: int, active_only: bool = True) -> list[dict]:
 
 def list_guest_products_for_host(host_chat_id: int, guest_chat_id: int) -> list[dict]:
     """All active products on guest shop with current share settings if any."""
+    try:
+        from unicorn_shop import is_unicorn_shop
+
+        if is_unicorn_shop(guest_chat_id):
+            return []
+    except Exception:
+        pass
     with get_db() as conn:
         rows = conn.execute(
             """
@@ -374,6 +394,13 @@ def create_order_multi(
                 return None
 
             owner = int(row["chat_id"])
+            try:
+                from unicorn_shop import is_unicorn_shop
+
+                if is_unicorn_shop(owner) and owner != int(host_chat_id):
+                    return None
+            except Exception:
+                pass
             pdata = dict(row)
             if is_kit:
                 kp = product_kit_price(pdata)

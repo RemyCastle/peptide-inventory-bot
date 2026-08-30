@@ -220,7 +220,8 @@ class VendorBotHandlerRegistrationTests(unittest.TestCase):
         self.assertIn('CommandHandler("myid", cmd_myid)', src)
         self.assertIn("cache_bust_store_url", src)
         self.assertIn("WebAppInfo(url=store_url)", src)
-        # SPBC back-room callbacks stay
+        # SPBC back-room callbacks stay on non-Unicorn vendor bots only
+        self.assertIn("vendor_accepts_spbc_fulfillment", src)
         self.assertIn("voffer_(ok|no)", src)
         self.assertIn("shand_(ok|no)", src)
         # Do not port main-bot Telegram catalog admin onto the vendor bot

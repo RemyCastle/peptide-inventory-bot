@@ -61,6 +61,13 @@ def set_link(spbc_name: str, shop_chat_id: int, vendor_product_id: int) -> tuple
         return False, "Vendor product not found."
     if int(product["chat_id"]) != int(shop_chat_id):
         return False, "That product belongs to a different shop."
+    try:
+        from unicorn_shop import is_unicorn_shop
+
+        if is_unicorn_shop(shop_chat_id):
+            return False, "Unicorn Magic Factory is not linked as an SPBC vendor."
+    except Exception:
+        pass
     ensure_tables()
     now = _utc_now()
     with db.get_db() as conn:
@@ -90,6 +97,13 @@ def clear_link(spbc_name: str, shop_chat_id: int) -> bool:
 
 def product_for(spbc_name: str, shop_chat_id: int) -> Optional[dict]:
     """The vendor's product mapped to this SPBC name, if any (and still live)."""
+    try:
+        from unicorn_shop import is_unicorn_shop
+
+        if is_unicorn_shop(shop_chat_id):
+            return None
+    except Exception:
+        pass
     ensure_tables()
     with db.get_db() as conn:
         row = conn.execute(
@@ -143,6 +157,13 @@ def vendor_catalogs(exclude_shop_id: int | None = None) -> list[dict]:
         sid = int(s["chat_id"])
         if exclude_shop_id and sid == int(exclude_shop_id):
             continue
+        try:
+            from unicorn_shop import is_unicorn_shop
+
+            if is_unicorn_shop(sid, title=s.get("title")):
+                continue
+        except Exception:
+            pass
         products = db.list_products(sid, active_only=True)
         if not products:
             continue

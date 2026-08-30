@@ -178,6 +178,14 @@ def compute_quotes(payload: dict) -> list[dict]:
         cid = int(shop["chat_id"])
         if SPBC_SHOP_CHAT_ID and cid == int(SPBC_SHOP_CHAT_ID):
             continue  # the master shop is the site itself, not a vendor
+        # Unicorn Magic Factory is customer-facing only — never an SPBC vendor.
+        try:
+            from unicorn_shop import is_unicorn_shop
+
+            if is_unicorn_shop(cid, title=shop.get("title")):
+                continue
+        except Exception as exc:
+            log.warning("unicorn skip check failed shop=%s: %s", cid, exc)
         try:
             q = quote_shop(cid, lines)
         except Exception as exc:
@@ -409,6 +417,13 @@ def apply_route(quote_id: str, actor_id: int) -> tuple[bool, str, Optional[dict]
             return False, "Quote expired or unknown.", None
         if quote["applied"]:
             return False, "Already routed.", dict(quote)
+        try:
+            from unicorn_shop import is_unicorn_shop
+
+            if is_unicorn_shop(quote.get("shop_chat_id"), title=quote.get("shop_title")):
+                return False, "Unicorn Magic Factory is not an SPBC fulfillment vendor.", dict(quote)
+        except Exception as exc:
+            log.warning("unicorn apply_route guard failed: %s", exc)
         quote["applied"] = True  # claim before slow work; revert on failure
 
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())

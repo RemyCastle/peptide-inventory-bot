@@ -24,7 +24,7 @@ def quote(order="PEP-1", shop=VENDOR_A, total=135.0, order_total=180.0):
     return {
         "order_number": order,
         "shop_chat_id": shop,
-        "shop_title": "Unicorn" if shop == VENDOR_A else "Other",
+        "shop_title": "Vendy" if shop == VENDOR_A else "Other",
         "total": total,
         "order_total": order_total,
         "lines": [{"qty": 3, "name": "DSIP 10MG"}],
@@ -36,7 +36,7 @@ class PayableTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         db.set_db_path(Path(self._tmp.name) / "pay.db")
         db.init_db()
-        db.ensure_shop(VENDOR_A, title="Unicorn")
+        db.ensure_shop(VENDOR_A, title="Vendy")
         db.ensure_shop(VENDOR_B, title="Other")
         payables.ensure_tables()
 
@@ -86,7 +86,7 @@ class PayableTests(unittest.TestCase):
         self.assertIn("square", payables.summary_text())
         payables.record(quote())
         text = payables.summary_text()
-        self.assertIn("Unicorn", text)
+        self.assertIn("Vendy", text)
         self.assertIn("$135.00", text)
         self.assertIn("Total owed", text)
 
@@ -96,7 +96,7 @@ class RoutingWritesPayableTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         db.set_db_path(Path(self._tmp.name) / "pay2.db")
         db.init_db()
-        db.ensure_shop(VENDOR_A, title="Unicorn")
+        db.ensure_shop(VENDOR_A, title="Vendy")
         self.pid = db.add_product(VENDOR_A, "DSIP 10MG", 45.0, 10)
         payables.ensure_tables()
         order_router._pending.clear()

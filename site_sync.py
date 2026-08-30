@@ -361,6 +361,17 @@ def sync_shop(chat_id: int | None = None, base_url: str | None = None) -> SyncRe
     shop_id = int(chat_id if chat_id is not None else (SPBC_SHOP_CHAT_ID or 0))
     if not shop_id:
         raise SiteSyncError("SPBC_SHOP_CHAT_ID not set")
+    try:
+        from unicorn_shop import is_unicorn_shop
+
+        if is_unicorn_shop(shop_id):
+            raise SiteSyncError(
+                "Refusing to sync springfieldpbc.com into the Unicorn shop"
+            )
+    except SiteSyncError:
+        raise
+    except Exception:
+        pass
     items = [w for w in (normalize_item(p) for p in fetch_site_products(base_url)) if w]
     db.ensure_shop(shop_id, title="SPBC Shop")
     return _sync_items(shop_id, items, ENV_PREFIX)
@@ -510,7 +521,19 @@ async def periodic_site_sync(app) -> None:
     owner_id = min(OWNER_IDS) if OWNER_IDS else None
     await asyncio.sleep(20)  # let polling settle before first sync
     while True:
+        skip_env_sync = False
         if SPBC_SITE_URL and SPBC_SHOP_CHAT_ID:
+            try:
+                from unicorn_shop import is_unicorn_shop
+
+                skip_env_sync = is_unicorn_shop(int(SPBC_SHOP_CHAT_ID))
+            except Exception:
+                skip_env_sync = False
+            if skip_env_sync:
+                log.info(
+                    "Periodic SPBC sync skipped — SPBC_SHOP_CHAT_ID is Unicorn"
+                )
+        if SPBC_SITE_URL and SPBC_SHOP_CHAT_ID and not skip_env_sync:
             try:
                 result = await asyncio.to_thread(sync_shop)
                 if result.changed and owner_id:
