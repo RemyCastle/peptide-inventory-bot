@@ -75,3 +75,8 @@ Append-only log. Newest at bottom.
 - Decision: Cache-bust vendor Mini App `WebAppInfo` URLs with `?v=20260828` (`vendor_stores.cache_bust_store_url`) at both the Unicorn default and `_build_app` keyboard. Add `/webpanel` on the vendor storefront bot only (shop admins ∪ notify_ids ∪ owners) using `webpanel.issue_panel_link` / `revoke_tokens`. Did not rewrite POST `/order`, did not port Telegram catalog-admin buttons, kept `voffer_*` / `shand_*`.
 - Why: Telegram WebView was serving cached Pages HTML; Ghostie needs a weblink on HER vendor bot, not SPBC admin buttons. Mini App no-initData fake-success is fixed on Pages, not here.
 - Tests: `tests/test_vendor_webpanel.py`; `tests/test_webpanel.py` issue_panel_link cases
+
+### 2026-08-30
+- Decision: Stop quoting Unicorn / Ghostie for SPBC `/notify` fulfillment. `order_router.compute_quotes` / `quote_shop` skip shops whose title contains unicorn / ghostie / unicornmagicfactory (case-insensitive), plus `SKIP_VENDOR_SHOP_CHAT_IDS` and `UNICORN_SHOP_CHAT_ID`. `SKIP_UNICORN_ROUTING` defaults on. If she was the only complete-fill quote, return no vendor quotes so Remy fulfills. Did not delete Unicorn, change her catalog, wipe inventory, touch Patriotic Peptides, or add BAC auto-routing through her (no such auto-add exists in this repo).
+- Why: Remy now fills springfieldpbc.com SMS-sourced peptides from Show Me Source stock. Unicorn stays a live shop for Ghostie's own customers.
+- Tests: `tests/test_order_router.py` Unicorn/Ghostie skip + Patriotic still quoted; vendor-link/payables routing shops renamed off "Unicorn" so they still quote.

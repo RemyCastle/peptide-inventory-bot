@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -96,15 +97,26 @@ class RoutingWritesPayableTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         db.set_db_path(Path(self._tmp.name) / "pay2.db")
         db.init_db()
-        db.ensure_shop(VENDOR_A, title="Unicorn")
+        db.ensure_shop(VENDOR_A, title="Alpha Lab")
         self.pid = db.add_product(VENDOR_A, "DSIP 10MG", 45.0, 10)
         payables.ensure_tables()
         order_router._pending.clear()
         order_router._routed.clear()
         self._cfg = mock.patch.object(order_router, "SPBC_SHOP_CHAT_ID", 0)
         self._cfg.start()
+        self._env = mock.patch.dict(
+            os.environ,
+            {
+                "SKIP_VENDOR_SHOP_CHAT_IDS": "",
+                "UNICORN_SHOP_CHAT_ID": "",
+                "SKIP_UNICORN_ROUTING": "1",
+            },
+            clear=False,
+        )
+        self._env.start()
 
     def tearDown(self):
+        self._env.stop()
         self._cfg.stop()
         self._tmp.cleanup()
 

@@ -1,11 +1,17 @@
 """Quote-and-suggest order routing: which vendor can fill a site order cheapest?
 
-When a paid website order arrives at /notify, this module quotes every vendor
-shop (all bot shops except the SPBC master shop) against the order's lines:
+When a paid website order arrives at /notify, this module quotes vendor shops
+(all bot shops except the SPBC master shop) against the order's lines:
 
 - a vendor qualifies only if they can fill EVERY line from current stock
 - vial lines cost qty × price; kit lines use kit_price when set (stock must
   cover qty × KIT_SIZE vials), else KIT_SIZE × vial price
+
+SPBC SMS-sourced peptides are fulfilled by Remy from Show Me Source stock —
+not passed to Unicorn (Ghostie's shop). Unicorn stays online for her own
+customers; we just skip her (and any shop flagged for skip) when quoting
+springfieldpbc.com orders. If she was the only complete-fill vendor, the
+owner gets no vendor quotes and fulfills himself.
 
 The owner gets a DM listing the top quotes (with margin) and an approve button.
 
@@ -35,6 +41,59 @@ import db
 from config import KIT_SIZE, SPBC_SHOP_CHAT_ID
 
 log = logging.getLogger("order_router")
+
+# Title fragments that identify Unicorn / Ghostie's customer shop. Shop
+# chat_id is not hardcoded in this repo (UNICORN_SHOP_CHAT_ID is optional).
+_SKIP_TITLE_MARKERS = ("unicorn", "ghostie", "unicornmagicfactory")
+
+
+def _truthy_env(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_int_ids(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for part in str(raw or "").replace(";", ",").split(","):
+        part = part.strip().strip("\"'")
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            continue
+    return ids
+
+
+def skip_ids_for_spbc_fulfillment() -> set[int]:
+    """Explicit shop ids never quoted for SPBC website fulfillment."""
+    ids = _parse_int_ids(os.getenv("SKIP_VENDOR_SHOP_CHAT_IDS", ""))
+    ids |= _parse_int_ids(os.getenv("UNICORN_SHOP_CHAT_ID", ""))
+    return ids
+
+
+def skip_shop_for_spbc_fulfillment(
+    shop_chat_id: int, shop_title: str = ""
+) -> bool:
+    """True if this vendor must not be quoted for SPBC website orders.
+
+    Identifies Unicorn by title (unicorn / ghostie / unicornmagicfactory)
+    and by SKIP_VENDOR_SHOP_CHAT_IDS / UNICORN_SHOP_CHAT_ID. Patriotic
+    Peptides and other vendors are unchanged. Unicorn's catalog and stock
+    are not modified — we only refuse to offer her SPBC SMS peptide lines.
+    """
+    try:
+        cid = int(shop_chat_id)
+    except (TypeError, ValueError):
+        return False
+    if cid in skip_ids_for_spbc_fulfillment():
+        return True
+    # SKIP_UNICORN_ROUTING defaults on: title match is how we find her
+    # when UNICORN_SHOP_CHAT_ID is unset.
+    if not _truthy_env("SKIP_UNICORN_ROUTING", "1"):
+        return False
+    title = str(shop_title or "").lower()
+    return any(marker in title for marker in _SKIP_TITLE_MARKERS)
+
 
 QUOTE_TTL_SEC = 48 * 60 * 60
 MAX_SUGGESTIONS = 3
@@ -114,6 +173,12 @@ def parse_line(item: dict) -> Optional[dict]:
 
 def quote_shop(shop_chat_id: int, lines: list[dict]) -> Optional[dict]:
     """Total + per-line breakdown if this shop can fill every line, else None."""
+    shop = db.get_shop(int(shop_chat_id)) or {}
+    # SPBC SMS peptides are fulfilled by Remy, not passed to Unicorn.
+    if skip_shop_for_spbc_fulfillment(
+        int(shop_chat_id), str(shop.get("title") or "")
+    ):
+        return None
     products = db.list_products(int(shop_chat_id), active_only=True)
     by_name = {_norm(p["name"]): p for p in products}
     total = 0.0
@@ -178,6 +243,9 @@ def compute_quotes(payload: dict) -> list[dict]:
         cid = int(shop["chat_id"])
         if SPBC_SHOP_CHAT_ID and cid == int(SPBC_SHOP_CHAT_ID):
             continue  # the master shop is the site itself, not a vendor
+        # SPBC SMS peptides are fulfilled by Remy, not passed to Unicorn.
+        if skip_shop_for_spbc_fulfillment(cid, str(shop.get("title") or "")):
+            continue
         try:
             q = quote_shop(cid, lines)
         except Exception as exc:
