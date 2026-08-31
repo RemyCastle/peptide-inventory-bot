@@ -67,6 +67,33 @@ class CacheBustStoreUrlTests(unittest.TestCase):
         )
 
 
+class NormalizeStoreUrlTests(unittest.TestCase):
+    def test_unicorn_without_slash_gets_slash(self) -> None:
+        self.assertEqual(
+            vendor_stores._normalize_store_url(
+                "https://remy-miniapp-demos.pages.dev/unicorn"
+            ),
+            "https://remy-miniapp-demos.pages.dev/unicorn/",
+        )
+
+    def test_unicorn_with_slash_unchanged(self) -> None:
+        url = "https://remy-miniapp-demos.pages.dev/unicorn/"
+        self.assertEqual(vendor_stores._normalize_store_url(url), url)
+
+    def test_legacy_env_store_url_without_slash_is_normalized(self) -> None:
+        env = {
+            "UNICORN_BOT_TOKEN": "123456:SLASHTOKEN",
+            "UNICORN_STORE_URL": "https://remy-miniapp-demos.pages.dev/unicorn",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            vendors = vendor_stores.load_vendor_configs()
+        unicorn = next(v for v in vendors if v.get("token") == "123456:SLASHTOKEN")
+        self.assertEqual(
+            unicorn["store_url"],
+            "https://remy-miniapp-demos.pages.dev/unicorn/?v=20260828",
+        )
+
+
 class VendorWebpanelAccessTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -219,6 +246,7 @@ class VendorBotHandlerRegistrationTests(unittest.TestCase):
         self.assertIn('CommandHandler("start", cmd_start)', src)
         self.assertIn('CommandHandler("myid", cmd_myid)', src)
         self.assertIn("cache_bust_store_url", src)
+        self.assertIn("_normalize_store_url", src)
         self.assertIn("WebAppInfo(url=store_url)", src)
         # SPBC back-room callbacks stay on non-Unicorn vendor bots only
         self.assertIn("vendor_accepts_spbc_fulfillment", src)
