@@ -73,6 +73,26 @@ STORE_URL_CACHE_BUST = "20260828"
 DEFAULT_UNICORN_STORE_URL = "https://remy-miniapp-demos.pages.dev/unicorn/"
 
 
+def _normalize_store_url(url: str) -> str:
+    """Keep /unicorn Mini App URLs trailing-slashed.
+
+    Cloudflare Pages 308-redirects /unicorn → /unicorn/, which strips the
+    Telegram Mini App hash (#tgWebAppData=...) on iOS WKWebView and empties
+    Telegram.WebApp.initData so checkout fails.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return raw
+    parts = urllib.parse.urlsplit(raw)
+    path = parts.path or ""
+    if path.endswith("/unicorn") and not path.endswith("/unicorn/"):
+        path = f"{path}/"
+        return urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc, path, parts.query, parts.fragment)
+        )
+    return raw
+
+
 def cache_bust_store_url(
     url: str, version: str = STORE_URL_CACHE_BUST
 ) -> str:
@@ -894,7 +914,9 @@ def load_vendor_configs() -> list[dict]:
             "invite": (os.getenv("UNICORN_CLAIM_TOKEN") or "").strip(),
             "shop_chat_id": (os.getenv("UNICORN_SHOP_CHAT_ID") or "").strip(),
             "store_url": cache_bust_store_url(
-                (os.getenv("UNICORN_STORE_URL") or DEFAULT_UNICORN_STORE_URL).strip()
+                _normalize_store_url(
+                    (os.getenv("UNICORN_STORE_URL") or DEFAULT_UNICORN_STORE_URL).strip()
+                )
             ),
             "notify_ids": legacy_notify,
             "order_fee": 1.0,  # unicornfartzz pays $1/order; other vendors default $2
@@ -909,7 +931,9 @@ def load_vendor_configs() -> list[dict]:
             continue
         seen.add(tok)
         if v.get("store_url"):
-            v["store_url"] = cache_bust_store_url(v.get("store_url") or "")
+            v["store_url"] = cache_bust_store_url(
+                _normalize_store_url(v.get("store_url") or "")
+            )
         unique.append(v)
     return unique
 
@@ -1041,7 +1065,7 @@ def revoke_vendor_webpanel_reply(shop_chat_id: int) -> str:
 def _build_app(v: dict, shop_chat_id: int) -> Application:
     name = v.get("name") or "the shop"
     emoji = v.get("emoji") or "\U0001f6cd"
-    store_url = cache_bust_store_url(v.get("store_url") or "")
+    store_url = cache_bust_store_url(_normalize_store_url(v.get("store_url") or ""))
     notify_ids = list(dict.fromkeys([*(v.get("notify_ids") or []), *_owner_ids()]))
     welcome = v.get("welcome") or (
         f"{emoji} Welcome to *{name}* {emoji}\n\n"
