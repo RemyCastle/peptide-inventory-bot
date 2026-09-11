@@ -19,6 +19,41 @@ import spbc_notify
 log = logging.getLogger("run_cloud")
 
 
+def _bind_unicorn_pages_storefront() -> None:
+    """Point the Pages Mini App catalog key at the live Unicorn shop.
+
+    remy-miniapp-demos.pages.dev/unicorn/ calls GET /storefront?invite=<public
+    key> on STOREFRONT_HOSTS. The first host (spbc-supplier-bot) is suspended;
+    unicornfartzz-bot must answer that key from /data/inventory.db.
+    Does not delete shops.
+    """
+    import db
+    import unicorn_shop
+    import webpanel
+
+    shop = unicorn_shop.find_catalog_shop()
+    if not shop:
+        log.warning("unicorn pages storefront: no catalog shop in live DB")
+        print("[run_cloud] unicorn pages storefront: no catalog shop", flush=True)
+        return
+    sid = int(shop["chat_id"])
+    title = shop.get("title")
+    n = len(db.list_products(sid, active_only=True))
+    key = unicorn_shop.pages_storefront_key()
+    webpanel.ensure_storefront_key_plain(sid, key)
+    log.info(
+        "unicorn pages storefront shop=%s title=%r products=%s host=unicornfartzz-bot",
+        sid,
+        title,
+        n,
+    )
+    print(
+        f"[run_cloud] unicorn pages storefront shop={sid} title={title!r} "
+        f"products={n}",
+        flush=True,
+    )
+
+
 def _bind_vendor_miniapps() -> None:
     """Re-attach claim tokens + issue public storefront keys for vendor shops.
 
@@ -28,8 +63,13 @@ def _bind_vendor_miniapps() -> None:
     """
     import webpanel
 
-    # Legacy single-vendor env (Unicorn first). Panel handoff lives on the
-    # service that has PANEL_BASE_URL = spbc-supplier-bot (virtual shop 9.1e12).
+    try:
+        _bind_unicorn_pages_storefront()
+    except Exception:
+        log.exception("unicorn pages storefront bind failed (continuing boot)")
+
+    # Legacy single-vendor env (Unicorn first). Catalog is served by this
+    # process (unicornfartzz-bot / PANEL_BASE_URL), not suspended supplier-bot.
     claim = (os.getenv("UNICORN_CLAIM_TOKEN") or "").strip()
     shop_raw = (os.getenv("UNICORN_SHOP_CHAT_ID") or "").strip().strip("\"'")
     token_set = bool((os.getenv("UNICORN_BOT_TOKEN") or "").strip())

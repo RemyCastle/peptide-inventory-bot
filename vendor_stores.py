@@ -938,6 +938,35 @@ def load_vendor_configs() -> list[dict]:
     return unique
 
 
+def _token_already_polled_by_main(token: str) -> bool:
+    """True when UNICORN_BOT_TOKEN == TELEGRAM_BOT_TOKEN (one poller only)."""
+    tok = (token or "").strip()
+    if not tok:
+        return False
+    try:
+        from config import TELEGRAM_BOT_TOKEN, resolve_bot_tokens
+
+        if tok == (TELEGRAM_BOT_TOKEN or "").strip():
+            return True
+        return tok in resolve_bot_tokens()
+    except Exception:
+        return False
+
+
+def unicorn_open_store_markup():
+    """Persistent Mini App keyboard for @UnicornMagicFactory2Bot customers."""
+    store_url = cache_bust_store_url(
+        _normalize_store_url(
+            (os.getenv("UNICORN_STORE_URL") or DEFAULT_UNICORN_STORE_URL).strip()
+        )
+    )
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("🦄 Open the Store", web_app=WebAppInfo(url=store_url))]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def _parse_chat_id(raw) -> int:
     s = str(raw or "").strip().strip("\"'")
     if not s:
@@ -977,6 +1006,15 @@ def _resolve_shop(v: dict) -> int:
         )
     else:
         log.warning("[%s] no shop_chat_id and no invite configured", name)
+
+    from unicorn_shop import find_catalog_shop, is_unicorn_vendor
+
+    if is_unicorn_vendor(v):
+        shop = find_catalog_shop()
+        if shop:
+            resolved = int(shop["chat_id"])
+            log.info("[%s] shop from live Unicorn catalog shop → %s", name, resolved)
+            return resolved
     return 0
 
 
@@ -1389,6 +1427,15 @@ def _run_vendor(v: dict) -> None:
         shop_chat_id = _resolve_shop(v)
         if not shop_chat_id:
             log.error("[%s] could not resolve shop (invite/shop_chat_id) - not starting", name)
+            return
+        tok = (v.get("token") or "").strip()
+        if tok and _token_already_polled_by_main(tok):
+            log.info(
+                "[%s] token matches main bot — skip second poller "
+                "(Open Store is on main /start; HTTP catalog still live) shop=%s",
+                name,
+                shop_chat_id,
+            )
             return
         _ensure_order_fee(v, shop_chat_id)
         app = _build_app(v, shop_chat_id)

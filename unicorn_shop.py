@@ -12,6 +12,12 @@ from typing import Any
 
 import db
 
+# Public read-only catalog key baked into remy-miniapp-demos.pages.dev/unicorn/.
+# Not a claim/admin token. Override with UNICORN_STOREFRONT_KEY if Pages rotates.
+PAGES_STOREFRONT_KEY = "dd6dec3482e1572886868657"
+
+_PAID_STATUSES = ("paid", "shipped", "complete")
+
 # Title fragments used when binding the live Ghostie shop (run_cloud / webpanel).
 UNICORN_TITLE_MARKERS = (
     "unicorn",
@@ -91,3 +97,105 @@ def vendor_accepts_spbc_fulfillment(
 ) -> bool:
     """Other vendor bots may still accept SPBC offers; Unicorn must not."""
     return not is_unicorn_vendor(v, shop_chat_id)
+
+
+def pages_storefront_key() -> str:
+    """24-hex catalog key the Cloudflare Pages Mini App sends as ?invite=."""
+    raw = (os.getenv("UNICORN_STOREFRONT_KEY") or "").strip().strip("\"'")
+    key = raw or PAGES_STOREFRONT_KEY
+    if key.lower().startswith("vendor_"):
+        key = key[7:]
+    elif key.lower().startswith("vendor"):
+        key = key[6:]
+    return key.strip().lower()
+
+
+def is_pages_storefront_key(raw_key: str | None) -> bool:
+    got = (raw_key or "").strip()
+    if got.lower().startswith("vendor_"):
+        got = got[7:]
+    elif got.lower().startswith("vendor"):
+        got = got[6:]
+    return got.strip().lower() == pages_storefront_key()
+
+
+def is_unicorn_customer_bot() -> bool:
+    """True when this process is @UnicornMagicFactory2Bot / Unicorn vendor token."""
+    public = (os.getenv("PUBLIC_BOT_USERNAME") or "").strip().lstrip("@").lower()
+    if "unicornmagicfactory" in public:
+        return True
+    if (os.getenv("UNICORN_BOT_TOKEN") or "").strip():
+        return True
+    return False
+
+
+def _list_shops() -> list[dict]:
+    with db.get_db() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM shops").fetchall()]
+
+
+def _product_count(chat_id: int) -> int:
+    try:
+        n = len(db.list_products(int(chat_id), active_only=True))
+        if n:
+            return n
+        return len(db.list_products(int(chat_id), active_only=False))
+    except Exception:
+        return 0
+
+
+def _newest_paid_ts(chat_id: int) -> str:
+    try:
+        with db.get_db() as conn:
+            placeholders = ",".join("?" for _ in _PAID_STATUSES)
+            row = conn.execute(
+                f"""
+                SELECT MAX(COALESCE(paid_at, shipped_at, updated_at, created_at)) AS ts
+                FROM orders
+                WHERE chat_id = ?
+                  AND status IN ({placeholders})
+                """,
+                (int(chat_id), *_PAID_STATUSES),
+            ).fetchone()
+    except Exception:
+        return ""
+    return str((row["ts"] if row and row["ts"] else "") or "")
+
+
+def find_catalog_shop() -> dict | None:
+    """Shop whose catalog the Pages Mini App should show. Does not delete shops.
+
+    Prefer explicit UNICORN_SHOP_CHAT_ID, then a Unicorn-titled shop with
+    products (newest paid/shipped/complete order wins), then any shop with
+    the newest real paid order. Never creates a shop.
+    """
+    env_id = env_unicorn_shop_chat_id()
+    if env_id is not None:
+        try:
+            sid = int(db.resolve_shop_chat_id(env_id))
+        except Exception:
+            sid = env_id
+        shop = db.get_shop(sid) or db.get_shop(env_id)
+        if shop:
+            return shop
+
+    shops = _list_shops()
+    if not shops:
+        return None
+
+    unicorns = [s for s in shops if shop_title_looks_unicorn(s.get("title"))]
+    pool = unicorns or shops
+
+    def _score(s: dict) -> tuple:
+        sid = int(s["chat_id"])
+        ts = _newest_paid_ts(sid)
+        n = _product_count(sid)
+        return (1 if ts else 0, ts, n)
+
+    ranked = sorted(pool, key=_score, reverse=True)
+    stocked = [s for s in ranked if _product_count(int(s["chat_id"])) > 0]
+    if stocked:
+        return stocked[0]
+    if ranked:
+        return ranked[0]
+    return None

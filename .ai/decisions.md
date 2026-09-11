@@ -85,3 +85,8 @@ Append-only log. Newest at bottom.
 - Decision: Normalize vendor `store_url` so a `/unicorn` path (no trailing slash) becomes `/unicorn/` before `WebAppInfo`. Helper `_normalize_store_url` at env/JSON load and `_build_app` keyboard. Default `UNICORN_STORE_URL` fallback already had the slash. Did not change slash-commands, bot tokens, hosts, inventory.db, or Mini App origin.
 - Why: Cloudflare Pages 308 from `/unicorn` → `/unicorn/` strips `#tgWebAppData=...` on iOS WKWebView, emptying `Telegram.WebApp.initData` so Unicorn checkout fails.
 - Tests: `tests/test_vendor_webpanel.py::NormalizeStoreUrlTests`
+
+### 2026-09-11
+- Decision: Serve the Unicorn Pages Mini App catalog from live `unicornfartzz-bot` (`/data/inventory.db`) using the public storefront key already in `remy-miniapp-demos.pages.dev/unicorn/` (`dd6dec3482e1572886868657`). Boot binds that key to `find_catalog_shop()` (title / newest paid / env id). `resolve_storefront_key` falls back to that shop when the Pages key is missing from this disk (it lived on suspended `spbc-supplier-bot`). No shop deletes. TELEGRAM_BOT_TOKEN and UNICORN_BOT_TOKEN stay the same @UnicornMagicFactory2Bot token — skip a second vendor poller; Open Store keyboard is on main `/start`. Did not invent UnicornFartzz admin tokens or touch BOT_TOKENS failover.
+- Why: Mini App inventory was empty: first STOREFRONT_HOST 503, then unicornfartzz-bot 404 unknown storefront. Pages HTML is not in this repo; inventory-bot host must answer the invite the Mini App already sends.
+- Tests: `tests/test_unicorn_storefront_host.py`

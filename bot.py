@@ -635,6 +635,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # @UnicornMagicFactory2Bot is the only customer + admin storefront.
+    # TELEGRAM_BOT_TOKEN == UNICORN_BOT_TOKEN (MagicFactory2); Open Store
+    # lives on this poller. Do not send customers to any other bot.
+    import unicorn_shop
+
+    if unicorn_shop.is_unicorn_customer_bot():
+        shop = unicorn_shop.find_catalog_shop()
+        if shop:
+            set_shop(context, int(shop["chat_id"]))
+        welcome = (
+            "🦄 Welcome to *Unicorn Magic Factory* 🦄\n\n"
+            "Tap *Open the Store* to browse live stock and send your order "
+            "straight back here. Research use only · 21+."
+        )
+        if shop and db.is_admin(int(shop["chat_id"]), user.id):
+            welcome += "\n\nAdmins: /webpanel for the shop console."
+        elif db.is_owner(user.id):
+            welcome += "\n\nAdmins: /webpanel for the shop console."
+        await update.message.reply_markdown(
+            welcome, reply_markup=vendor_stores.unicorn_open_store_markup()
+        )
+        return
+
     # Private chat
     shops = db.shops_for_admin(user.id)
     # Also allow picking any known shop if they have a deep link — otherwise list admin shops
