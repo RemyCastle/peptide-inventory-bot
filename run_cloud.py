@@ -39,6 +39,19 @@ def _bind_unicorn_pages_storefront() -> None:
     sid = int(shop["chat_id"])
     title = shop.get("title")
     n = len(db.list_products(sid, active_only=True))
+    try:
+        with db.get_db() as conn:
+            rows = conn.execute("SELECT chat_id, title FROM shops").fetchall()
+        for r in rows:
+            pn = len(db.list_products(int(r["chat_id"]), active_only=True))
+            log.info(
+                "unicorn shop scan chat_id=%s title=%r products=%s",
+                r["chat_id"],
+                r["title"],
+                pn,
+            )
+    except Exception:
+        log.exception("unicorn shop scan failed")
     key = unicorn_shop.pages_storefront_key()
     webpanel.ensure_storefront_key_plain(sid, key)
     log.info(

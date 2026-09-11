@@ -60,6 +60,11 @@ class UnicornIdentifyTests(unittest.TestCase):
         self.assertFalse(unicorn_shop.is_unicorn_shop(OTHER))
         self.assertFalse(unicorn_shop.is_unicorn_shop(SPBC))
         self.assertFalse(unicorn_shop.shop_title_looks_unicorn("Helix Bio Labs"))
+        self.assertFalse(
+            unicorn_shop.shop_title_looks_unicorn(
+                "Ash, UnicornFartzzBot and Samantha"
+            )
+        )
 
     def test_env_shop_id_without_unicorn_title(self) -> None:
         renamed = 61099

@@ -57,6 +57,25 @@ class FindCatalogShopTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
+    def test_brand_group_title_is_not_unicorn(self) -> None:
+        self.assertFalse(
+            unicorn_shop.shop_title_looks_unicorn(
+                "Ash, UnicornFartzzBot and Samantha"
+            )
+        )
+        self.assertTrue(
+            unicorn_shop.shop_title_looks_unicorn("Unicorn Magic Factory")
+        )
+
+    def test_empty_brand_group_does_not_steal_stocked_shop(self) -> None:
+        brand = 81099
+        db.ensure_shop(brand, title="Ash, UnicornFartzzBot and Samantha")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("UNICORN_SHOP_CHAT_ID", None)
+            shop = unicorn_shop.find_catalog_shop()
+        self.assertEqual(int(shop["chat_id"]), UNICORN)
+        self.assertNotEqual(int(shop["chat_id"]), brand)
+
     def test_prefers_unicorn_title_with_stock(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("UNICORN_SHOP_CHAT_ID", None)

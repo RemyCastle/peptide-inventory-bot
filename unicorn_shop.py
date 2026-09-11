@@ -28,9 +28,21 @@ UNICORN_TITLE_MARKERS = (
     "@unicornmagicfactory",
 )
 
+# Default BRAND_NAME / group titles like "Ash, UnicornFartzzBot and Samantha"
+# must not count as the customer shop (that bind served 0 products live).
+_BRAND_FALSE_POSITIVES = (
+    "unicornfartzzbot",
+    "unicornfartzz",
+)
+
 
 def shop_title_looks_unicorn(title: str | None) -> bool:
     t = (title or "").strip().lower()
+    if not t:
+        return False
+    for false in _BRAND_FALSE_POSITIVES:
+        t = t.replace(false, " ")
+    t = " ".join(t.split())
     if not t:
         return False
     return any(m in t for m in UNICORN_TITLE_MARKERS)
@@ -184,7 +196,17 @@ def find_catalog_shop() -> dict | None:
         return None
 
     unicorns = [s for s in shops if shop_title_looks_unicorn(s.get("title"))]
-    pool = unicorns or shops
+    stocked_unicorns = [
+        s for s in unicorns if _product_count(int(s["chat_id"])) > 0
+    ]
+    stocked_any = [s for s in shops if _product_count(int(s["chat_id"])) > 0]
+    # Empty brand-false-positive groups must not block a stocked catalog shop.
+    if stocked_unicorns:
+        pool = stocked_unicorns
+    elif stocked_any:
+        pool = stocked_any
+    else:
+        pool = unicorns or shops
 
     def _score(s: dict) -> tuple:
         sid = int(s["chat_id"])
