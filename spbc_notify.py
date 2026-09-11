@@ -932,9 +932,10 @@ def _status_body() -> dict:
         token_ok = bool(_bot_token)
         open_sessions = len(_sessions)
     return {
-        "service": "spbc-supplier-bot",
+        "service": "unicornfartzz-bot",
         "ok": True,
         "mode": "combined_inventory_bot",
+        "storefront_host": "https://unicornfartzz-bot.onrender.com",
         "telegram_bot_configured": token_ok,
         "telegram_configured": token_ok,
         "telegram_bot_ok": token_ok,

@@ -583,6 +583,43 @@ def _shop_product_count(chat_id: int, *, active_only: bool = True) -> int:
         return 0
 
 
+def ensure_storefront_key_plain(shop_chat_id: int, raw_key: str) -> str:
+    """Bind a specific public catalog key to a shop (Pages Mini App ?invite=).
+
+    Reassigns the key if it lived on another shop. Replaces this shop's
+    previous catalog key so UNIQUE(shop_chat_id) stays valid. Does not
+    delete shops or products.
+    """
+    ensure_webpanel_tables()
+    raw = normalize_invite_token(raw_key).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{24}", raw):
+        raise ValueError("storefront key must be 24 hex chars")
+    sid = int(db.resolve_shop_chat_id(int(shop_chat_id)))
+    digest = _hash(raw)
+    now = _ts(_utc_now())
+    with db.get_db() as conn:
+        conn.execute(
+            "DELETE FROM storefront_keys WHERE shop_chat_id = ? AND key_hash != ?",
+            (sid, digest),
+        )
+        row = conn.execute(
+            "SELECT shop_chat_id FROM storefront_keys WHERE key_hash = ?",
+            (digest,),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE storefront_keys SET shop_chat_id = ? WHERE key_hash = ?",
+                (sid, digest),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO storefront_keys (key_hash, key_plain, shop_chat_id, "
+                "created_at) VALUES (?, ?, ?, ?)",
+                (digest, raw, sid, now),
+            )
+    return raw
+
+
 def _ensure_storefront_key(shop_chat_id: int) -> str:
     """Idempotent public catalog key for a shop (raw hex, for Pages / logs).
 
@@ -820,14 +857,25 @@ def resolve_storefront_key(raw_key: str) -> int | None:
     raw = normalize_invite_token(raw_key)
     if not re.fullmatch(r"[0-9a-fA-F]{24}", raw):
         return None
-    with db.get_db() as conn:
-        row = conn.execute(
-            "SELECT shop_chat_id FROM storefront_keys WHERE key_hash = ?",
-            (_hash(raw),),
-        ).fetchone()
-    if not row or not row["shop_chat_id"]:
-        return None
-    return int(db.resolve_shop_chat_id(int(row["shop_chat_id"])))
+    for candidate in dict.fromkeys((raw, raw.lower())):
+        with db.get_db() as conn:
+            row = conn.execute(
+                "SELECT shop_chat_id FROM storefront_keys WHERE key_hash = ?",
+                (_hash(candidate),),
+            ).fetchone()
+        if row and row["shop_chat_id"]:
+            return int(db.resolve_shop_chat_id(int(row["shop_chat_id"])))
+
+    # Pages Mini App still sends a public catalog key that may only exist on
+    # the suspended spbc-supplier-bot disk. Serve the live Unicorn shop on
+    # unicornfartzz-bot instead of 404-empty.
+    import unicorn_shop
+
+    if unicorn_shop.is_pages_storefront_key(raw):
+        shop = unicorn_shop.find_catalog_shop()
+        if shop:
+            return int(shop["chat_id"])
+    return None
 
 
 def api_storefront(raw_key: str) -> tuple[int, dict]:
