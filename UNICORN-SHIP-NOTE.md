@@ -31,16 +31,30 @@ On Unicorn boot, `run_cloud._cleanup_unicorn_catalog` runs against `unicorn_shop
 
 Local simulation of that plan against the live JSON: remaining weird names **0**, remaining same-name/same-price dupes **0**. Tests: **523** passed.
 
+## Git
+
+Pushed `a449e82` to `RemyCastle/peptide-inventory-bot` `master` (ahead-1 follow-up on the rebased cleanup). Laptop `inventory.db` not opened for writes.
+
+## Live resample (after push)
+
+Polled public `/storefront` for ~12 minutes after `a449e82`:
+
+- brief 502 window, then health `ok: true` again
+- still **312** products, **1** `Anav@r`, **32** `$` names, **82** `(vial)`/`(kit)` suffixes
+- GitHub commit statuses/checks for `a449e82`: empty (Render is not reporting a deploy)
+
+That JSON is still the **old** process. `a449e82` would strip `Anav@r` / `$` from `/storefront` names even before DB cleanup, so dirty names mean unicornfartzz-bot has not booted this SHA. `RENDER_API_KEY` is not set on this PC, so this ship could not click Manual Deploy.
+
 ## Out of scope
 
 - Hard delete / DB wipe
 - Other vendor shops
-- Autopush as a general peptide_inventory_bot habit (this repo auto-deploys **two** Render services)
+- Autopush as a general peptide_inventory_bot habit (this repo can auto-deploy **two** Render services)
 
 ## Remy check (60s)
 
-1. GET https://unicornfartzz-bot.onrender.com → `ok: true`
-2. Mini App / `/storefront`: no `Anav@r`, no `$` inside names, one Aod 5mg card with kit price
-3. B12 / MT1 / MT2 / Oxytocin still two prices if they were two SKUs
-4. Place nothing; do not run local `start.bat` while cloud is live
-5. If names still dirty: Render dashboard → unicornfartzz-bot (`srv-d9a6h057vvec738lov80`) logs for `unicorn catalog cleanup`
+1. Render dashboard → **unicornfartzz-bot** (`srv-d9a6h057vvec738lov80`) → Manual Deploy → latest `master` (`a449e82` or newer). Watch logs for `unicorn catalog cleanup`.
+2. GET https://unicornfartzz-bot.onrender.com → `ok: true`
+3. Mini App / `/storefront`: no `Anav@r`, no `$` inside names, one Aod 5mg card with kit price
+4. B12 / MT1 / MT2 / Oxytocin still two prices if they were two SKUs
+5. Place nothing; do not run local `start.bat` while cloud is live
