@@ -449,6 +449,57 @@ def apply_cleanup(
     return True, msg, plan
 
 
+def open_order_product_refs(chat_id: int, product_ids: list[int]) -> list[dict]:
+    """Open (not cancelled/rejected/complete) order lines for these product ids."""
+    ids = [int(x) for x in product_ids if x]
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    with db.get_db() as conn:
+        if "order_items" not in {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }:
+            return []
+        rows = conn.execute(
+            f"""
+            SELECT oi.product_id AS product_id, o.id AS order_id, o.status AS status
+            FROM order_items oi
+            JOIN orders o ON o.id = oi.order_id
+            WHERE o.chat_id = ?
+              AND oi.product_id IN ({placeholders})
+              AND o.status NOT IN ('cancelled', 'rejected', 'complete', 'shipped')
+            """,
+            (int(chat_id), *ids),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def apply_bound_shop_cleanup(shop_chat_id: int, *, actor_id: int | None = None) -> dict:
+    """Owner-gated apply for a bound vendor shop (boot / live). Never deletes."""
+    from config import OWNER_IDS as owners
+
+    sid = int(shop_chat_id)
+    actor = int(actor_id) if actor_id is not None else (min(owners) if owners else 0)
+    if not actor:
+        return {"ok": False, "skipped": "no OWNER_IDS"}
+    plan = plan_cleanup(sid)
+    hide_ids = [a.product_id for a in plan.actions if a.kind == "deactivate"]
+    open_refs = open_order_product_refs(sid, hide_ids)
+    ok, msg, plan = apply_cleanup(sid, actor_id=actor, dry_run=False, plan=plan)
+    return {
+        "ok": ok,
+        "msg": msg,
+        "renames": plan.rename_count,
+        "merges": plan.merge_count,
+        "deactivated": plan.deactivate_count,
+        "open_order_refs": len(open_refs),
+        "shop_chat_id": sid,
+    }
+
+
 def format_preview(plan: CleanupPlan, *, dry_run: bool = True, max_lines: int = 12) -> str:
     header = "Catalog cleanup preview" if dry_run else "Catalog cleanup"
     lines = [

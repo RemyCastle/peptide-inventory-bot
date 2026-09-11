@@ -132,6 +132,14 @@ def _bind_vendor_miniapps() -> None:
             )
             log.info("unicorn payments seed: %s", pay)
             print(f"[run_cloud] unicorn payments seed: {pay}", flush=True)
+            try:
+                import catalog_cleanup
+
+                clean = catalog_cleanup.apply_bound_shop_cleanup(int(sid))
+                log.info("unicorn catalog cleanup: %s", clean)
+                print(f"[run_cloud] unicorn catalog cleanup: {clean}", flush=True)
+            except Exception:
+                log.exception("unicorn catalog cleanup failed (continuing boot)")
 
     # Optional multi-vendor JSON: each entry may include invite + shop_chat_id + name
     raw = (os.getenv("VENDOR_STORES_JSON") or "").strip()

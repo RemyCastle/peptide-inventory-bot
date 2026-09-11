@@ -181,6 +181,32 @@ class CleanupApplyTests(unittest.TestCase):
         self.assertGreaterEqual(plan.rename_count, 1)
         self.assertEqual(db.get_product(pid)["name"], "Anav@r 25mg")
 
+    def test_open_order_refs_logged_but_still_deactivates(self) -> None:
+        lo = db.add_product(self.shop, "Aod 5mg (vial) $15.00", 15.0, 10, unit="vial")
+        hi = db.add_product(self.shop, "Aod 5mg (vial) $130.00", 130.0, 10, unit="vial")
+        with db.get_db() as conn:
+            conn.execute(
+                "INSERT INTO orders (chat_id, user_id, status, subtotal, total, "
+                "created_at, updated_at) VALUES (?, 1, 'pending_payment', 130, 130, "
+                "'2026-01-01', '2026-01-01')",
+                (self.shop,),
+            )
+            oid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                "INSERT INTO order_items (order_id, product_id, product_name, "
+                "unit_price, quantity, line_total) "
+                "VALUES (?, ?, 'Aod 5mg (vial) $130.00', 130, 1, 130)",
+                (oid, hi),
+            )
+        with mock.patch.object(db, "OWNER_IDS", {self.owner}), mock.patch(
+            "config.OWNER_IDS", {self.owner}
+        ):
+            out = cc.apply_bound_shop_cleanup(self.shop, actor_id=self.owner)
+        self.assertTrue(out["ok"])
+        self.assertGreaterEqual(out["open_order_refs"], 1)
+        self.assertEqual(int(db.get_product(hi)["active"]), 0)
+        self.assertEqual(int(db.get_product(lo)["active"]), 1)
+
     def test_non_owner_denied(self) -> None:
         db.add_product(self.shop, "Anav@r 25mg", 35.0, 6)
         with mock.patch.object(db, "OWNER_IDS", {self.owner}):
