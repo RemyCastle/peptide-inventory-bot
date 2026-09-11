@@ -788,8 +788,9 @@ async def _show_main(
     user = update.effective_user
     assert user
     is_adm = db.is_admin(shop["chat_id"], user.id)
-    welcome = shop.get("welcome_text") or (
-        f"Welcome to *{shop['title']}*.\nBrowse the catalog, add items to your cart, and checkout."
+    title = catalog_cleanup.display_shop_text(str(shop.get("title") or ""))
+    welcome = catalog_cleanup.display_shop_text(shop.get("welcome_text") or "") or (
+        f"Welcome to *{title}*.\nBrowse the catalog, add items to your cart, and checkout."
     )
     ship = ""
     if shop.get("shipping_enabled"):
@@ -802,7 +803,7 @@ async def _show_main(
     min_line = ""
     if int(display["min_order_qty"]) > 0:
         min_line = f"\n📦 {db.format_min_order_rule(display['min_order_qty'], display['min_order_label'])}"
-    text = f"*{BRAND_NAME}*\n🏪 *{shop['title']}*\n\n{welcome}{ship}{min_line}"
+    text = f"*{BRAND_NAME}*\n🏪 *{title}*\n\n{welcome}{ship}{min_line}"
     chat = update.effective_chat
     can_switch = bool(
         chat

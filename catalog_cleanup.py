@@ -76,9 +76,50 @@ class CleanupPlan:
         return sum(1 for a in self.actions if a.kind == "deactivate")
 
 
+# Classic mojibake markers: UTF-8 bytes shown after a cp1252/latin-1 mis-decode.
+# Emoji become ð.. / â.. runs; accented Latin becomes Ã. / Â. pairs.
+_MOJIBAKE_MARKERS = ("Ã", "Â", "â€", "ð", "Å", "Ÿ", "€", "š", "œ", "ž")
+
+
+def repair_glyphs(text: str) -> str:
+    """Best-effort repair of UTF-8 text mis-decoded as cp1252/latin-1 (mojibake).
+
+    Conservative on purpose: only touches strings that still carry classic
+    mojibake markers, and only accepts a re-decode that is clean UTF-8 (no
+    U+FFFD). Text already stored correctly (real emoji, plain ASCII, accented
+    Latin) is returned unchanged — real emoji cannot round-trip through a
+    single-byte codec, so the encode step raises and we bail. Loops a few
+    times to undo double-encoding.
+    """
+    s = str(text or "")
+    for _ in range(3):
+        if not any(m in s for m in _MOJIBAKE_MARKERS):
+            break
+        fixed: str | None = None
+        for codec in ("cp1252", "latin-1"):
+            try:
+                cand = s.encode(codec, "strict").decode("utf-8", "strict")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                continue
+            if "�" in cand or cand == s:
+                continue
+            fixed = cand
+            break
+        if fixed is None:
+            break
+        s = fixed
+    return s
+
+
+def display_shop_text(text: str) -> str:
+    """Repair mojibake in shop title / welcome while preserving line breaks."""
+    s = repair_glyphs(str(text or ""))
+    return s.replace("�", "").replace("­", "")
+
+
 def sanitize_catalog_text(text: str) -> str:
     """Drop control/format/replacement glyphs that render as boxes or �."""
-    s = str(text or "")
+    s = repair_glyphs(str(text or ""))
     if not s:
         return ""
     s = s.replace("\ufffd", "").replace("\u00ad", "")

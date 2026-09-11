@@ -79,6 +79,45 @@ class NameCleanTests(unittest.TestCase):
         self.assertFalse(cc.should_merge_prices(0, 80))
 
 
+class GlyphRepairTests(unittest.TestCase):
+    """Mojibake repair for shop/product text mis-decoded as cp1252/latin-1."""
+
+    def _mojibake(self, s: str, codec: str) -> str:
+        # How correct UTF-8 bytes look when a store re-reads them as 8-bit.
+        return s.encode("utf-8").decode(codec)
+
+    def test_repairs_emoji_mojibake_both_codecs(self) -> None:
+        for original in ("🦄 Welcome to Unicorn Magic Factory 🦄", "🧬 Catalog", "🛒 Cart"):
+            for codec in ("cp1252", "latin-1"):
+                broken = self._mojibake(original, codec)
+                self.assertNotEqual(broken, original)
+                self.assertEqual(cc.repair_glyphs(broken), original)
+
+    def test_repairs_accented_latin(self) -> None:
+        broken = self._mojibake("Café résumé", "cp1252")
+        self.assertEqual(cc.repair_glyphs(broken), "Café résumé")
+
+    def test_leaves_correct_text_untouched(self) -> None:
+        for good in ("🦄 Welcome 🦄", "🧬 Catalog", "Anavar 25mg", "café au lait", ""):
+            self.assertEqual(cc.repair_glyphs(good), good)
+
+    def test_display_shop_text_repairs_and_keeps_newlines(self) -> None:
+        original = "🦄 Welcome!\nBrowse the catalog."
+        broken = self._mojibake(original, "cp1252")
+        fixed = cc.display_shop_text(broken)
+        self.assertEqual(fixed, original)
+        self.assertIn("\n", fixed)
+
+    def test_button_label_repairs_and_strips_anavar_and_dollar(self) -> None:
+        broken = self._mojibake("🧬 Anav@r 25mg (vial) $15.00", "cp1252")
+        label = cc.catalog_button_label(broken, 15.0, 10)
+        self.assertIn("🧬", label)  # emoji restored, not mojibake
+        self.assertIn("Anavar 25mg", label)
+        self.assertNotIn("Anav@r", label)
+        self.assertNotIn("ð", label)  # no leftover mojibake glyph
+        self.assertEqual(label.count("$15.00"), 1)
+
+
 class CleanupApplyTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
