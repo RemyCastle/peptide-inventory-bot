@@ -857,6 +857,15 @@ def resolve_storefront_key(raw_key: str) -> int | None:
     raw = normalize_invite_token(raw_key)
     if not re.fullmatch(r"[0-9a-fA-F]{24}", raw):
         return None
+    import unicorn_shop
+
+    # Pages invite must not stay on the empty Ash group (#14) or the generic
+    # 312-product "Shop" (#15). Always resolve via canonical import/bind.
+    if unicorn_shop.is_pages_storefront_key(raw):
+        shop = unicorn_shop.ensure_pages_catalog()
+        if shop:
+            return int(shop["chat_id"])
+
     for candidate in dict.fromkeys((raw, raw.lower())):
         with db.get_db() as conn:
             row = conn.execute(
@@ -865,16 +874,6 @@ def resolve_storefront_key(raw_key: str) -> int | None:
             ).fetchone()
         if row and row["shop_chat_id"]:
             return int(db.resolve_shop_chat_id(int(row["shop_chat_id"])))
-
-    # Pages Mini App still sends a public catalog key that may only exist on
-    # the suspended spbc-supplier-bot disk. Serve the live Unicorn shop on
-    # unicornfartzz-bot instead of 404-empty.
-    import unicorn_shop
-
-    if unicorn_shop.is_pages_storefront_key(raw):
-        shop = unicorn_shop.find_catalog_shop()
-        if shop:
-            return int(shop["chat_id"])
     return None
 
 

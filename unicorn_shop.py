@@ -7,14 +7,28 @@ and hand website orders to Ghostie's bot. Remy cut that back-room link only.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import urllib.error
+import urllib.request
 from typing import Any
 
 import db
 
+log = logging.getLogger("unicorn_shop")
+
 # Public read-only catalog key baked into remy-miniapp-demos.pages.dev/unicorn/.
 # Not a claim/admin token. Override with UNICORN_STOREFRONT_KEY if Pages rotates.
 PAGES_STOREFRONT_KEY = "dd6dec3482e1572886868657"
+
+# Live Ghostie catalog on suspended spbc-supplier-bot (2026-09-10 bind logs).
+CANONICAL_SHOP_CHAT_ID = 9_100_000_000_000
+CANONICAL_SHOP_TITLE = "@unicornmagicfactory"
+DEFAULT_CATALOG_MIRROR = (
+    "https://spbc-supplier-bot.onrender.com/storefront"
+    f"?invite={PAGES_STOREFRONT_KEY}"
+)
 
 _PAID_STATUSES = ("paid", "shipped", "complete")
 
@@ -190,10 +204,11 @@ def _pick_stocked(cands: list[dict]) -> dict | None:
 def find_catalog_shop() -> dict | None:
     """Shop whose catalog the Pages Mini App should show. Does not delete shops.
 
-    Never binds a zero-product shop when any shop has active stock.
-    Order: stocked UNICORN_SHOP_CHAT_ID pin → stocked Unicorn-titled shop
-    (newest paid wins) → any stocked shop (newest paid). Empty env pins
-    and brand-false-positive groups are skipped.
+    Never binds a zero-product shop when a Unicorn shop has active stock.
+    Order: stocked UNICORN_SHOP_CHAT_ID pin → stocked canonical
+    9100000000000 → stocked Unicorn-titled shop (newest paid). Does not
+    fall through to unrelated stocked shops (live #15 bound a 312-product
+    generic \"Shop\" that is not Ghostie's catalog).
     """
     shops = _list_shops()
     if not shops:
@@ -209,8 +224,157 @@ def find_catalog_shop() -> dict | None:
         if shop and _product_count(int(shop["chat_id"])) > 0:
             return shop
 
+    canon = db.get_shop(CANONICAL_SHOP_CHAT_ID)
+    if canon and _product_count(CANONICAL_SHOP_CHAT_ID) > 0:
+        return canon
+
     unicorns = [s for s in shops if shop_title_looks_unicorn(s.get("title"))]
-    picked = _pick_stocked(unicorns)
-    if picked:
-        return picked
-    return _pick_stocked(shops)
+    return _pick_stocked(unicorns)
+
+
+def skip_bot_polling() -> bool:
+    """HTTP-only boot (wake supplier-bot catalog without a second Telegram poller)."""
+    return (os.getenv("SKIP_BOT_POLLING") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def catalog_mirror_url() -> str:
+    raw = (os.getenv("UNICORN_CATALOG_MIRROR_URL") or "").strip().strip("\"'")
+    return raw or DEFAULT_CATALOG_MIRROR
+
+
+def ensure_canonical_shop() -> dict:
+    """Create shop 9100000000000 (@unicornmagicfactory) if missing. No deletes."""
+    shop = db.get_shop(CANONICAL_SHOP_CHAT_ID)
+    if shop:
+        title = (shop.get("title") or "").strip()
+        if not shop_title_looks_unicorn(title):
+            db.update_shop(CANONICAL_SHOP_CHAT_ID, title=CANONICAL_SHOP_TITLE)
+            shop = db.get_shop(CANONICAL_SHOP_CHAT_ID) or shop
+        return shop
+    return db.ensure_shop(CANONICAL_SHOP_CHAT_ID, title=CANONICAL_SHOP_TITLE)
+
+
+def import_storefront_payload(dest_chat_id: int, payload: dict[str, Any]) -> int:
+    """Copy public /storefront JSON into dest_chat_id. Add-only (no deletes)."""
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return 0
+    dest = int(dest_chat_id)
+    db.ensure_shop(dest, title=CANONICAL_SHOP_TITLE)
+    meta = payload.get("shop") if isinstance(payload.get("shop"), dict) else {}
+    updates: dict[str, Any] = {}
+    title = str(meta.get("title") or CANONICAL_SHOP_TITLE).strip()[:80]
+    if title:
+        updates["title"] = title
+    if meta.get("shipping_enabled") is not None:
+        updates["shipping_enabled"] = int(meta.get("shipping_enabled") or 0)
+    if meta.get("shipping_fee") is not None:
+        updates["shipping_fee"] = float(meta.get("shipping_fee") or 0)
+    if meta.get("free_shipping_above") is not None:
+        updates["free_shipping_above"] = float(meta.get("free_shipping_above") or 0)
+    zones = meta.get("shipping_zones")
+    if zones is not None:
+        updates["shipping_zones"] = (
+            zones if isinstance(zones, str) else json.dumps(zones)
+        )
+    if updates:
+        db.update_shop(dest, **updates)
+
+    existing = {(p.get("name") or "").strip().lower() for p in db.list_products(dest)}
+    created = 0
+    for raw in payload.get("products") or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name or name.lower() in existing:
+            continue
+        pid = db.add_product(
+            dest,
+            name,
+            float(raw.get("price") or 0),
+            int(raw.get("stock") or 0),
+        )
+        extras: dict[str, Any] = {}
+        kit = raw.get("kit_price")
+        if kit not in (None, ""):
+            try:
+                extras["kit_price"] = float(kit)
+            except (TypeError, ValueError):
+                pass
+        sku = raw.get("sku")
+        if sku:
+            extras["sku"] = str(sku).strip()[:40]
+        vg = raw.get("variant_group")
+        if vg:
+            extras["variant_group"] = str(vg).strip()[:80]
+        vl = raw.get("variant_label")
+        if vl:
+            extras["variant_label"] = str(vl).strip()[:80]
+        cat = raw.get("category")
+        if cat:
+            extras["category"] = str(cat).strip()[:80]
+        photo = (raw.get("photo_url") or "").strip()
+        if photo.startswith("http"):
+            extras["photo_file_id"] = photo
+        if raw.get("sort_order") is not None:
+            try:
+                extras["sort_order"] = int(raw.get("sort_order") or 0)
+            except (TypeError, ValueError):
+                pass
+        if extras:
+            db.update_product(pid, **extras)
+        existing.add(name.lower())
+        created += 1
+    return created
+
+
+def fetch_storefront_json(url: str, timeout: float = 20.0) -> dict[str, Any] | None:
+    target = (url or "").strip()
+    if not target.startswith("https://") and not target.startswith("http://"):
+        return None
+    req = urllib.request.Request(
+        target,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "unicornfartzz-catalog-pull/1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(body)
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+        log.warning("catalog mirror fetch failed url=%s err=%s", target.split("?")[0], exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def import_catalog_if_empty(dest_chat_id: int | None = None) -> int:
+    """Pull supplier-bot /storefront into the canonical shop when this disk is empty."""
+    sid = int(dest_chat_id or CANONICAL_SHOP_CHAT_ID)
+    ensure_canonical_shop()
+    if _product_count(sid) > 0:
+        return 0
+    payload = fetch_storefront_json(catalog_mirror_url())
+    if not payload:
+        return 0
+    n = import_storefront_payload(sid, payload)
+    log.info("catalog mirror imported products=%s shop=%s", n, sid)
+    return n
+
+
+def ensure_pages_catalog() -> dict | None:
+    """Make sure the Pages invite can resolve a shop; import stock if this disk is empty."""
+    ensure_canonical_shop()
+    try:
+        import_catalog_if_empty(CANONICAL_SHOP_CHAT_ID)
+    except Exception:
+        log.exception("catalog mirror import failed")
+    shop = find_catalog_shop()
+    if shop:
+        return shop
+    return db.get_shop(CANONICAL_SHOP_CHAT_ID)

@@ -930,9 +930,12 @@ ORDER_STOCK_ERROR = (
 def _catalog_shop_bound() -> bool:
     """True when live inventory.db has a Unicorn catalog shop (no SPBC chat required)."""
     try:
+        import db
         import unicorn_shop
 
-        return unicorn_shop.find_catalog_shop() is not None
+        if unicorn_shop.find_catalog_shop() is not None:
+            return True
+        return db.get_shop(unicorn_shop.CANONICAL_SHOP_CHAT_ID) is not None
     except Exception:
         return False
 

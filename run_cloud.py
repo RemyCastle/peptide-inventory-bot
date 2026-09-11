@@ -31,7 +31,7 @@ def _bind_unicorn_pages_storefront() -> None:
     import unicorn_shop
     import webpanel
 
-    shop = unicorn_shop.find_catalog_shop()
+    shop = unicorn_shop.ensure_pages_catalog()
     if not shop:
         log.warning("unicorn pages storefront: no catalog shop in live DB")
         print("[run_cloud] unicorn pages storefront: no catalog shop", flush=True)
@@ -209,6 +209,17 @@ def main() -> None:
     except Exception:
         log.exception("miniapp storefront bind failed (continuing boot)")
 
+    import unicorn_shop
+
+    if unicorn_shop.skip_bot_polling():
+        log.info(
+            "SKIP_BOT_POLLING set — HTTP + catalog bind only "
+            "(no Telegram poller; use on suspended supplier-bot to export stock)"
+        )
+        print("[run_cloud] SKIP_BOT_POLLING — HTTP only", flush=True)
+        threading.Event().wait()
+        return
+
     # Vendor mini-app order receivers (one branded bot per vendor, all sharing
     # this process and database). Configured via VENDOR_STORES_JSON, with the
     # legacy UNICORN_* vars still honored. No vendors configured = no threads.
@@ -237,7 +248,12 @@ def main() -> None:
 
 def _run_foreground() -> None:
     """Block on the main SPBC bot, or stay up for Unicorn-only (no SPBC token)."""
+    import unicorn_shop
     from config import resolve_bot_tokens
+
+    if unicorn_shop.skip_bot_polling():
+        threading.Event().wait()
+        return
 
     if resolve_bot_tokens():
         import bot
