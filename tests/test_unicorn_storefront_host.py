@@ -294,6 +294,27 @@ class HealthHostTests(unittest.TestCase):
         text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("catalog_cleanup.py", text)
 
+    def test_boot_cleanup_applies_when_owner_ids_unset(self) -> None:
+        """Render Unicorn often has empty OWNER_IDS; boot must still clean."""
+        import catalog_cleanup as cc
+        import run_cloud
+
+        db.add_product(UNICORN, "Anav@r 25mg", 35.0, 6)
+        db.add_product(UNICORN, "Aod 5mg (vial) $15.00", 15.0, 8)
+        with mock.patch("config.OWNER_IDS", set()), mock.patch.object(
+            db, "OWNER_IDS", set()
+        ), mock.patch.object(
+            unicorn_shop, "find_catalog_shop", return_value={"chat_id": UNICORN}
+        ):
+            out = cc.apply_bound_shop_cleanup(UNICORN)
+            run_cloud._cleanup_unicorn_catalog()
+        self.assertTrue(out["ok"], out)
+        names = [p["name"] for p in db.list_products(UNICORN, active_only=True)]
+        self.assertTrue(names)
+        self.assertTrue(all("Anav@r" not in n and "$" not in n for n in names))
+        recorded = __import__("spbc_notify")._status_body().get("catalog_cleanup") or {}
+        self.assertTrue(recorded.get("ok"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -413,9 +413,10 @@ def apply_cleanup(
     actor_id: int,
     dry_run: bool = True,
     plan: CleanupPlan | None = None,
+    owner_required: bool = True,
 ) -> tuple[bool, str, CleanupPlan]:
     """Apply a plan. Owner check is the caller's job (bot / tests)."""
-    if not db.is_owner(int(actor_id)):
+    if owner_required and not db.is_owner(int(actor_id)):
         return False, "Bot owner only.", plan or CleanupPlan(shop_chat_id=int(chat_id))
     plan = plan or plan_cleanup(int(chat_id))
     if dry_run:
@@ -556,12 +557,19 @@ def apply_bound_shop_cleanup(shop_chat_id: int, *, actor_id: int | None = None) 
 
     sid = int(shop_chat_id)
     actor = int(actor_id) if actor_id is not None else (min(owners) if owners else 0)
-    if not actor:
+    require_owner = bool(owners)
+    if require_owner and not actor:
         return {"ok": False, "skipped": "no OWNER_IDS"}
     plan = plan_cleanup(sid)
     hide_ids = [a.product_id for a in plan.actions if a.kind == "deactivate"]
     open_refs = open_order_product_refs(sid, hide_ids)
-    ok, msg, plan = apply_cleanup(sid, actor_id=actor, dry_run=False, plan=plan)
+    ok, msg, plan = apply_cleanup(
+        sid,
+        actor_id=actor or 0,
+        dry_run=False,
+        plan=plan,
+        owner_required=require_owner,
+    )
     return {
         "ok": ok,
         "msg": msg,
