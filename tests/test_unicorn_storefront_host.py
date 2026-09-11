@@ -57,6 +57,25 @@ class FindCatalogShopTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
+    def test_brand_group_title_is_not_unicorn(self) -> None:
+        self.assertFalse(
+            unicorn_shop.shop_title_looks_unicorn(
+                "Ash, UnicornFartzzBot and Samantha"
+            )
+        )
+        self.assertTrue(
+            unicorn_shop.shop_title_looks_unicorn("Unicorn Magic Factory")
+        )
+
+    def test_empty_brand_group_does_not_steal_stocked_shop(self) -> None:
+        brand = 81099
+        db.ensure_shop(brand, title="Ash, UnicornFartzzBot and Samantha")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("UNICORN_SHOP_CHAT_ID", None)
+            shop = unicorn_shop.find_catalog_shop()
+        self.assertEqual(int(shop["chat_id"]), UNICORN)
+        self.assertNotEqual(int(shop["chat_id"]), brand)
+
     def test_prefers_unicorn_title_with_stock(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("UNICORN_SHOP_CHAT_ID", None)
@@ -64,10 +83,29 @@ class FindCatalogShopTests(unittest.TestCase):
         self.assertIsNotNone(shop)
         self.assertEqual(int(shop["chat_id"]), UNICORN)
 
-    def test_env_id_wins(self) -> None:
+    def test_env_id_wins_when_stocked(self) -> None:
+        extra = 81005
+        db.ensure_shop(extra, title="Pinned Unicorn")
+        db.add_product(extra, "Pinned Vial", 11.0, stock=2)
+        with mock.patch.dict(os.environ, {"UNICORN_SHOP_CHAT_ID": str(extra)}):
+            shop = unicorn_shop.find_catalog_shop()
+        self.assertEqual(int(shop["chat_id"]), extra)
+
+    def test_empty_env_pin_falls_through_to_stock(self) -> None:
         with mock.patch.dict(os.environ, {"UNICORN_SHOP_CHAT_ID": str(EMPTY)}):
             shop = unicorn_shop.find_catalog_shop()
-        self.assertEqual(int(shop["chat_id"]), EMPTY)
+        self.assertEqual(int(shop["chat_id"]), UNICORN)
+
+    def test_stocked_untitled_shop_beats_empty_ash_group(self) -> None:
+        db.ensure_shop(81099, title="Ash, UnicornFartzzBot and Samantha")
+        # UNICORN is titled + stocked in setUp
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("UNICORN_SHOP_CHAT_ID", None)
+            shop = unicorn_shop.find_catalog_shop()
+        self.assertEqual(int(shop["chat_id"]), UNICORN)
+        self.assertGreater(
+            unicorn_shop._product_count(int(shop["chat_id"])), 0
+        )
 
     def test_newest_paid_unicorn_wins_among_titled(self) -> None:
         extra = 81004
@@ -186,6 +224,16 @@ class VendorResolveAndTokenTests(unittest.TestCase):
 
 
 class HealthHostTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        db.set_db_path(Path(self._tmp.name) / "health.db")
+        db.init_db()
+        db.ensure_shop(UNICORN, title="Unicorn Magic Factory")
+        db.add_product(UNICORN, "BPC-157", 40.0, stock=3)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
     def test_health_points_at_unicornfartzz(self) -> None:
         import spbc_notify
 
@@ -194,6 +242,15 @@ class HealthHostTests(unittest.TestCase):
         self.assertEqual(
             body["storefront_host"], "https://unicornfartzz-bot.onrender.com"
         )
+
+    def test_health_true_from_bound_catalog_shop(self) -> None:
+        import spbc_notify
+
+        with mock.patch.object(spbc_notify, "SUPPLIER_TELEGRAM_CHAT_ID", ""), \
+             mock.patch.object(spbc_notify, "OWNER_TELEGRAM_CHAT_ID", ""):
+            body = spbc_notify._status_body()
+        self.assertTrue(body["default_chat_configured"])
+        self.assertTrue(body["owner_chat_configured"])
 
 
 if __name__ == "__main__":
