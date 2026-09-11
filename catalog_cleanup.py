@@ -188,7 +188,14 @@ def should_merge_prices(lo: float, hi: float) -> bool:
 
 
 def _unit(p: dict) -> str:
-    return (str(p.get("unit") or "vial")).strip().lower() or "vial"
+    """Prefer the stored unit; (kit) jammed into the name still counts as kit."""
+    u = (str(p.get("unit") or "vial")).strip().lower() or "vial"
+    name = str(p.get("name") or "")
+    if re.search(r"\(kits?\)", name, re.I):
+        return "kit"
+    if re.search(r"\(vials?\)", name, re.I):
+        return "vial"
+    return u
 
 
 def _price(p: dict) -> float:
@@ -196,6 +203,10 @@ def _price(p: dict) -> float:
         return float(p.get("price") or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _same_price(a: float, b: float) -> bool:
+    return round(float(a), 2) == round(float(b), 2)
 
 
 def _esc(s: str) -> str:
@@ -246,8 +257,10 @@ def plan_cleanup(chat_id: int, products: list[dict] | None = None) -> CleanupPla
         plan.groups += 1
         keeper = _pick_keeper(group)
         keeper_id = int(keeper["id"])
+        keeper_price = _price(keeper)
         kit_price: float | None = None
         merge_ids: set[int] = set()
+        dup_ids: set[int] = set()
         stay: list[dict] = []
 
         existing_kit = keeper.get("kit_price")
@@ -263,26 +276,40 @@ def plan_cleanup(chat_id: int, products: list[dict] | None = None) -> CleanupPla
                 continue
             unit = _unit(p)
             price = _price(p)
-            if unit == "kit":
-                kit_price = max(kit_price or 0.0, price)
-                merge_ids.add(pid)
-            elif should_merge_prices(_price(keeper), price):
-                kit_price = max(kit_price or 0.0, price)
-                merge_ids.add(pid)
+            # Original row + uniqueness-hack copy at the same vial price.
+            if _same_price(price, keeper_price):
+                dup_ids.add(pid)
+                continue
+            if unit == "kit" or should_merge_prices(keeper_price, price):
+                if price > keeper_price:
+                    kit_price = max(kit_price or 0.0, price)
+                    merge_ids.add(pid)
+                else:
+                    dup_ids.add(pid)
             else:
                 stay.append(p)
 
-        if merge_ids and kit_price and kit_price > _price(keeper):
+        if _needs_rename(keeper, cleaned):
+            plan.actions.append(
+                CleanupAction(
+                    kind="rename",
+                    product_id=keeper_id,
+                    name=str(keeper["name"]),
+                    detail="strip uniqueness tail / typo",
+                    new_name=cleaned,
+                )
+            )
+
+        if merge_ids and kit_price and kit_price > keeper_price:
             plan.actions.append(
                 CleanupAction(
                     kind="merge",
                     product_id=keeper_id,
                     name=str(keeper["name"]),
                     detail=(
-                        f"vial ${_price(keeper):.2f} + kit ${kit_price:.2f}"
+                        f"vial ${keeper_price:.2f} + kit ${kit_price:.2f}"
                     ),
                     keeper_id=keeper_id,
-                    new_name=cleaned if _needs_rename(keeper, cleaned) else None,
                     kit_price=kit_price,
                 )
             )
@@ -299,15 +326,20 @@ def plan_cleanup(chat_id: int, products: list[dict] | None = None) -> CleanupPla
                         )
                     )
         else:
-            stay = [p for p in group if int(p["id"]) != keeper_id]
-            if _needs_rename(keeper, cleaned):
+            # Kit merge did not apply — those rows stay as siblings.
+            stay.extend(p for p in group if int(p["id"]) in merge_ids)
+            merge_ids.clear()
+
+        for p in group:
+            pid = int(p["id"])
+            if pid in dup_ids:
                 plan.actions.append(
                     CleanupAction(
-                        kind="rename",
-                        product_id=keeper_id,
-                        name=str(keeper["name"]),
-                        detail="strip uniqueness tail / typo",
-                        new_name=cleaned,
+                        kind="deactivate",
+                        product_id=pid,
+                        name=str(p["name"]),
+                        detail=f"duplicate of #{keeper_id} (same price)",
+                        keeper_id=keeper_id,
                     )
                 )
 

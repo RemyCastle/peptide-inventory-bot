@@ -158,6 +158,50 @@ class CleanupApplyTests(unittest.TestCase):
         self.assertEqual(db.get_product(pid)["name"], "Anavar 25mg")
         self.assertEqual(int(db.get_product(pid)["stock"]), 6)
 
+    def test_hides_same_price_uniqueness_duplicate(self) -> None:
+        original = db.add_product(self.shop, "Aod 5mg", 15.0, 10, unit="vial")
+        hack = db.add_product(
+            self.shop, "Aod 5mg (vial) $15.00", 15.0, 10, unit="vial"
+        )
+        kit = db.add_product(
+            self.shop, "Aod 5mg (vial) $130.00", 130.0, 10, unit="vial"
+        )
+        with mock.patch.object(db, "OWNER_IDS", {self.owner}):
+            ok, msg, plan = cc.apply_cleanup(
+                self.shop, actor_id=self.owner, dry_run=False
+            )
+        self.assertTrue(ok, msg)
+        self.assertEqual(plan.merge_count, 1)
+        keeper = db.get_product(original)
+        self.assertEqual(keeper["name"], "Aod 5mg")
+        self.assertEqual(float(keeper["kit_price"]), 130.0)
+        self.assertEqual(int(keeper["active"]), 1)
+        self.assertEqual(int(db.get_product(hack)["active"]), 0)
+        self.assertEqual(int(db.get_product(kit)["active"]), 0)
+        names = [p["name"] for p in db.list_products(self.shop, active_only=True)]
+        self.assertEqual(names, ["Aod 5mg"])
+
+    def test_oxytocin_sibling_not_merged_but_dup_hidden(self) -> None:
+        lo = db.add_product(self.shop, "Oxytocin", 10.0, 10, unit="vial")
+        dup = db.add_product(
+            self.shop, "Oxytocin (vial) $10.00", 10.0, 10, unit="vial"
+        )
+        hi = db.add_product(
+            self.shop, "Oxytocin (vial) $30.00", 30.0, 10, unit="vial"
+        )
+        with mock.patch.object(db, "OWNER_IDS", {self.owner}):
+            ok, _, plan = cc.apply_cleanup(
+                self.shop, actor_id=self.owner, dry_run=False
+            )
+        self.assertTrue(ok)
+        self.assertEqual(plan.merge_count, 0)
+        self.assertEqual(int(db.get_product(lo)["active"]), 1)
+        self.assertEqual(int(db.get_product(dup)["active"]), 0)
+        self.assertEqual(int(db.get_product(hi)["active"]), 1)
+        self.assertEqual(db.get_product(lo)["name"], "Oxytocin")
+        self.assertNotIn(chr(36), db.get_product(hi)["name"])
+        self.assertIsNone(db.get_product(lo)["kit_price"])
+
     def test_never_deletes(self) -> None:
         lo = db.add_product(self.shop, "cag 5 (vial) $17.00", 17.0, 10)
         hi = db.add_product(self.shop, "cag 5 (vial) $150.00", 150.0, 10)
@@ -206,6 +250,27 @@ class CleanupApplyTests(unittest.TestCase):
         self.assertGreaterEqual(out["open_order_refs"], 1)
         self.assertEqual(int(db.get_product(hi)["active"]), 0)
         self.assertEqual(int(db.get_product(lo)["active"]), 1)
+
+    def test_pages_catalog_bind_cleans_bound_shop_only(self) -> None:
+        import run_cloud
+        import unicorn_shop
+
+        db.add_product(self.shop, "Anav@r 25mg", 35.0, 6)
+        db.add_product(self.other, "Anav@r 25mg", 35.0, 3)
+        with mock.patch.object(db, "OWNER_IDS", {self.owner}), mock.patch(
+            "config.OWNER_IDS", {self.owner}
+        ), mock.patch.object(
+            unicorn_shop, "find_catalog_shop", return_value={"chat_id": self.shop}
+        ):
+            run_cloud._cleanup_unicorn_catalog()
+        self.assertEqual(
+            db.list_products(self.shop, active_only=True)[0]["name"],
+            "Anavar 25mg",
+        )
+        self.assertEqual(
+            db.list_products(self.other, active_only=True)[0]["name"],
+            "Anav@r 25mg",
+        )
 
     def test_non_owner_denied(self) -> None:
         db.add_product(self.shop, "Anav@r 25mg", 35.0, 6)

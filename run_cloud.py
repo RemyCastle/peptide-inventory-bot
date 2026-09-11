@@ -67,6 +67,26 @@ def _bind_unicorn_pages_storefront() -> None:
     )
 
 
+def _cleanup_unicorn_catalog() -> None:
+    """Rename/merge uniqueness-hack rows on the Pages catalog shop only.
+
+    Never deletes. Other shops on the same disk are left alone. Safe to run
+    twice (idempotent once names are clean).
+    """
+    import catalog_cleanup
+    import unicorn_shop
+
+    shop = unicorn_shop.find_catalog_shop()
+    if not shop:
+        log.warning("unicorn catalog cleanup: no catalog shop")
+        print("[run_cloud] unicorn catalog cleanup: no catalog shop", flush=True)
+        return
+    sid = int(shop["chat_id"])
+    clean = catalog_cleanup.apply_bound_shop_cleanup(sid)
+    log.info("unicorn catalog cleanup: %s", clean)
+    print(f"[run_cloud] unicorn catalog cleanup: {clean}", flush=True)
+
+
 def _bind_vendor_miniapps() -> None:
     """Re-attach claim tokens + issue public storefront keys for vendor shops.
 
@@ -132,14 +152,11 @@ def _bind_vendor_miniapps() -> None:
             )
             log.info("unicorn payments seed: %s", pay)
             print(f"[run_cloud] unicorn payments seed: {pay}", flush=True)
-            try:
-                import catalog_cleanup
 
-                clean = catalog_cleanup.apply_bound_shop_cleanup(int(sid))
-                log.info("unicorn catalog cleanup: %s", clean)
-                print(f"[run_cloud] unicorn catalog cleanup: {clean}", flush=True)
-            except Exception:
-                log.exception("unicorn catalog cleanup failed (continuing boot)")
+    try:
+        _cleanup_unicorn_catalog()
+    except Exception:
+        log.exception("unicorn catalog cleanup failed (continuing boot)")
 
     # Optional multi-vendor JSON: each entry may include invite + shop_chat_id + name
     raw = (os.getenv("VENDOR_STORES_JSON") or "").strip()
