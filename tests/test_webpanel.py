@@ -540,6 +540,7 @@ class ApiTests(WebPanelBase):
         self.assertEqual(sp["Middle"]["category"], None)
         self.assertEqual(sp["Zebra"]["sort_order"], 30)
 
+<<<<<<< HEAD
     def test_storefront_sku_and_variants(self):
         pink = db.add_product(SHOP, "Tee", 25.0, 4)
         blue = db.add_product(SHOP, "Tee", 25.0, 3)
@@ -574,6 +575,22 @@ class ApiTests(WebPanelBase):
         self.assertIsNone(lone_row["variant_group"])
         self.assertIsNone(lone_row["variant_label"])
         self.assertIsNone(body["shop"]["shipping_zones"])
+
+    def test_storefront_strips_jammed_price_and_weird_glyphs(self) -> None:
+        db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 4)
+        db.add_product(SHOP, "Anav@r 25mg", 35.0, 2)
+        sf_key = webpanel._ensure_storefront_key(SHOP)
+        code, body = webpanel.api_storefront(sf_key)
+        self.assertEqual(code, 200, body)
+        names = {p["name"] for p in body["products"]}
+        self.assertIn("Aod 5mg", names)
+        self.assertIn("Anavar 25mg", names)
+        self.assertNotIn("Aod 5mg (vial) $15.00", names)
+        # Admin panel still shows the stored name so owner can clean
+        code, state = webpanel.api_state(self.tok)
+        self.assertEqual(code, 200)
+        admin_names = {p["name"] for p in state["products"]}
+        self.assertIn("Aod 5mg (vial) $15.00", admin_names)
 
     def test_bulk_import_upserts(self):
         db.add_product(SHOP, "BPC-157 10MG", 41.0, 5)

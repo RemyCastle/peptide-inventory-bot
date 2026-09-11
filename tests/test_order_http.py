@@ -287,6 +287,37 @@ class OrderHttpTests(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertFalse(body.get("ok"))
 
+    def test_extra_bot_token_initdata_ok(self) -> None:
+        """UnicornMagicFactoryBot alias can sign checkout for the same shop."""
+        extra = "555555555:UnicornMagicFactoryBotToken"
+        with mock.patch.object(
+            vendor_stores,
+            "get_bot_tokens_for_shop",
+            return_value=[VENDOR_TOKEN, extra],
+        ):
+            code, body = spbc_notify.handle_http_order(
+                self._payload(initData=build_valid_init_data(extra))
+            )
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body.get("ok"))
+        with db.get_db() as conn:
+            n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
+        self.assertEqual(n, 1)
+
+    def test_unrelated_bot_token_still_401(self) -> None:
+        extra = "555555555:UnicornMagicFactoryBotToken"
+        with mock.patch.object(
+            vendor_stores,
+            "get_bot_tokens_for_shop",
+            return_value=[VENDOR_TOKEN, extra],
+        ):
+            forged = build_valid_init_data(OTHER_TOKEN)
+            code, body = spbc_notify.handle_http_order(
+                self._payload(initData=forged)
+            )
+        self.assertEqual(code, 401)
+        self.assertFalse(body.get("ok"))
+
     def test_claim_token_not_accepted_as_invite(self) -> None:
         """storefront_keys separation: claim invite must not resolve."""
         claim = webpanel.create_vendor_invite(OWNER, "should-not-work")

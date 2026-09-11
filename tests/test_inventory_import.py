@@ -68,6 +68,12 @@ HCG 5000 | 55 | 0 | fridge
         self.assertEqual(len(p.rows), 1)
         self.assertEqual(p.rows[0].price, 12.5)
 
+    def test_strips_nbsp_and_replacement_from_name(self) -> None:
+        p = inv.parse_inventory_text("NAD+\u00a0500\ufffd | 100 | 10 | vial |\n")
+        self.assertEqual(len(p.rows), 1)
+        self.assertEqual(p.rows[0].name, "NAD+ 500")
+        self.assertNotIn("\ufffd", p.rows[0].name)
+
     def test_template_parses_examples(self) -> None:
         p = inv.parse_inventory_text(inv.TEMPLATE_TEXT)
         self.assertGreaterEqual(len(p.rows), 2)
@@ -196,6 +202,51 @@ class ImportProductsTests(unittest.TestCase):
         by_name = {r.name: r for r in parsed.rows}
         self.assertEqual(by_name["Oil"].unit, "bottle")
         self.assertEqual(by_name["Reta 10mg"].stock, 7)
+
+    def test_fold_kit_and_vial_units(self) -> None:
+        text = (
+            "AICAR 50mg (vial) | 13 | 10 | vial |\n"
+            "AICAR 50mg (kit) | 100 | 10 | kit |\n"
+        )
+        _, imported = inv.import_from_text(self.shop_a, text)
+        self.assertEqual(imported.created_count, 1)
+        prods = db.list_products(self.shop_a)
+        self.assertEqual(len(prods), 1)
+        self.assertEqual(float(prods[0]["price"]), 13.0)
+        self.assertEqual(float(prods[0]["kit_price"]), 100.0)
+        self.assertEqual(prods[0]["unit"], "vial")
+
+    def test_fold_dollar_suffix_kit_ratio(self) -> None:
+        text = (
+            "Aod 5mg (vial) $15.00 | 15 | 10 | vial |\n"
+            "Aod 5mg (vial) $130.00 | 130 | 10 | vial |\n"
+        )
+        _, imported = inv.import_from_text(self.shop_a, text)
+        self.assertEqual(imported.created_count, 1)
+        p = db.list_products(self.shop_a)[0]
+        self.assertEqual(float(p["price"]), 15.0)
+        self.assertEqual(float(p["kit_price"]), 130.0)
+
+    def test_does_not_fold_sibling_prices(self) -> None:
+        text = (
+            "B12 5ml vial (vial) $10.00 | 10 | 10 | vial | cyano\n"
+            "B12 5ml vial (vial) $15.00 | 15 | 10 | vial | hydroxy\n"
+        )
+        _, imported = inv.import_from_text(self.shop_a, text)
+        self.assertEqual(imported.created_count, 2)
+        prods = db.list_products(self.shop_a, active_only=False)
+        self.assertEqual(len(prods), 2)
+        self.assertTrue(all(not p.get("kit_price") for p in prods))
+
+    def test_add_only_skips_cleaned_name_match(self) -> None:
+        db.add_product(self.shop_a, "Aod 5mg", 15.0, 4)
+        text = "Aod 5mg (vial) $15.00 | 99 | 10 | vial |\n"
+        _, imported = inv.import_from_text(self.shop_a, text)
+        self.assertEqual(imported.created_count, 0)
+        self.assertEqual(imported.skipped_count, 1)
+        p = db.list_products(self.shop_a)[0]
+        self.assertEqual(float(p["price"]), 15.0)
+        self.assertEqual(int(p["stock"]), 4)
 
 
 if __name__ == "__main__":

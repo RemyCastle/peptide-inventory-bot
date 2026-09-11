@@ -19,13 +19,21 @@ Configuration (env):
           "shop_chat_id": -5551234567,               # optional, overrides invite
           "store_url":  "https://.../unicorn/",      # mini app URL
           "notify_ids": [111111111],                 # extra chat ids to DM
+          "extra_tokens": ["123456:XYZ..."],         # HMAC aliases (no extra poller)
           "welcome":    "optional custom /start text"
         }
       ]
 
+  extra_tokens / UNICORN_EXTRA_BOT_TOKENS: additional BotFather tokens that
+  may sign Mini App initData for the same shop (e.g. @UnicornMagicFactoryBot
+  when the polling bot is @MagicFactory2Bot). They do not start extra pollers.
+  A second JSON entry with its own token AND the same shop_chat_id both polls
+  and verifies.
+
   Legacy single-vendor vars (UNICORN_BOT_TOKEN, UNICORN_CLAIM_TOKEN,
-  UNICORN_SHOP_CHAT_ID, UNICORN_STORE_URL, UNICORN_NOTIFY_IDS) are still
-  honored and merged in, so the first vendor keeps working unchanged.
+  UNICORN_SHOP_CHAT_ID, UNICORN_STORE_URL, UNICORN_NOTIFY_IDS,
+  UNICORN_EXTRA_BOT_TOKENS) are still honored and merged in, so the first
+  vendor keeps working unchanged.
 
   OWNER_TELEGRAM_CHAT_ID is always added to every vendor's notify list.
 
@@ -907,6 +915,11 @@ def load_vendor_configs() -> list[dict]:
             int(x) for x in (os.getenv("UNICORN_NOTIFY_IDS") or "").split(",")
             if x.strip().lstrip("-").isdigit()
         ]
+        extra_legacy = [
+            x.strip()
+            for x in (os.getenv("UNICORN_EXTRA_BOT_TOKENS") or "").split(",")
+            if x.strip()
+        ]
         vendors.append({
             "name": "Unicorn Magic Factory",
             "emoji": "\U0001f984",
@@ -919,6 +932,7 @@ def load_vendor_configs() -> list[dict]:
                 )
             ),
             "notify_ids": legacy_notify,
+            "extra_tokens": extra_legacy,
             "order_fee": 1.0,  # unicornfartzz pays $1/order; other vendors default $2
         })
 
@@ -1018,29 +1032,87 @@ def _resolve_shop(v: dict) -> int:
     return 0
 
 
-def get_bot_token_for_shop(shop_chat_id: int) -> str | None:
-    """Return the vendor bot token bound to this shop, or None.
+def _tokens_from_vendor(v: dict) -> list[str]:
+    """Primary token plus extra_tokens aliases (HMAC-only extras allowed)."""
+    out: list[str] = []
+    primary = (v.get("token") or "").strip()
+    if primary:
+        out.append(primary)
+    extra = v.get("extra_tokens")
+    if extra is None:
+        extra = v.get("tokens")
+    if isinstance(extra, str):
+        extra = [x.strip() for x in extra.split(",") if x.strip()]
+    if isinstance(extra, list):
+        for x in extra:
+            tok = str(x or "").strip()
+            if tok and tok not in out:
+                out.append(tok)
+    return out
 
-    Customers only ever talk to the vendor storefront bot (not the main SPBC
-    bot), so panel-side DMs must use this token. Matches load_vendor_configs()
-    entries via _resolve_shop (explicit shop_chat_id or invite bind).
+
+def get_bot_tokens_for_shop(shop_chat_id: int) -> list[str]:
+    """All vendor bot tokens that may sign initData for this shop.
+
+    Includes every JSON entry that resolves to the shop (so two bots sharing
+    inventory both verify) plus each entry's extra_tokens. Order: primary of
+    the first matching vendor, then extras, then later vendors.
     """
     try:
         target = int(db.resolve_shop_chat_id(int(shop_chat_id)))
     except Exception:
         target = int(shop_chat_id)
+    found: list[str] = []
     for v in load_vendor_configs():
-        token = (v.get("token") or "").strip()
-        if not token:
-            continue
         try:
             resolved = _resolve_shop(v)
         except Exception:
-            log.exception("get_bot_token_for_shop: resolve failed for %s", v.get("name"))
+            log.exception("get_bot_tokens_for_shop: resolve failed for %s", v.get("name"))
             continue
-        if resolved and int(resolved) == target:
-            return token
-    return None
+        if not resolved or int(resolved) != target:
+            continue
+        for tok in _tokens_from_vendor(v):
+            if tok not in found:
+                found.append(tok)
+    return found
+
+
+def get_bot_token_for_shop(shop_chat_id: int) -> str | None:
+    """Return the primary vendor bot token bound to this shop, or None.
+
+    Customers only ever talk to the vendor storefront bot (not the main SPBC
+    bot), so panel-side DMs must use this token. Matches load_vendor_configs()
+    entries via _resolve_shop (explicit shop_chat_id or invite bind).
+    Extra HMAC aliases are in get_bot_tokens_for_shop — not used for sending.
+    """
+    tokens = get_bot_tokens_for_shop(shop_chat_id)
+    return tokens[0] if tokens else None
+
+
+def validate_webapp_init_data_any(
+    init_data: str,
+    bot_tokens: list[str],
+    *,
+    max_age_sec: int = INIT_DATA_MAX_AGE_SEC,
+) -> dict:
+    """Validate initData against the first matching vendor bot token."""
+    last_err: Exception | None = None
+    seen: set[str] = set()
+    for token in bot_tokens:
+        tok = (token or "").strip()
+        if not tok or tok in seen:
+            continue
+        seen.add(tok)
+        try:
+            return validate_webapp_init_data(
+                init_data, tok, max_age_sec=max_age_sec
+            )
+        except InitDataError as exc:
+            last_err = exc
+            continue
+    if last_err is not None:
+        raise last_err
+    raise InitDataError("missing initData or bot token")
 
 
 # ── per-vendor bot ───────────────────────────────────────────────────────────

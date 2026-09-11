@@ -57,6 +57,7 @@ Weekly rollup: paid orders with `hidden_service_fee > 0` →
 | `UNICORN_SHOP_CHAT_ID` | optional | Force Unicorn shop; else title/virtual match |
 | `UNICORN_STORE_URL` | optional | Default `https://remy-miniapp-demos.pages.dev/unicorn/` |
 | `UNICORN_NOTIFY_IDS` | optional | Extra DM targets (comma-separated chat ids) |
+| `UNICORN_EXTRA_BOT_TOKENS` | optional | Extra BotFather tokens that may sign Mini App `initData` for the Unicorn shop (comma-separated). Use this when customers open the store from `@UnicornMagicFactoryBot` but the polling receiver is `@MagicFactory2Bot`. HMAC only — does not start a second poller. |
 | `NOTIFY_SECRET` | SPBC site | Worker → bot notify auth |
 | `BACKUP_PASSPHRASE` | recommended | Encrypted vault |
 
@@ -76,6 +77,7 @@ point tests at production `/data/inventory.db`.
     "shop_chat_id": null,
     "store_url": "https://remy-miniapp-demos.pages.dev/unicorn/",
     "notify_ids": [],
+    "extra_tokens": [],
     "order_fee": 1.0,
     "welcome": "optional custom /start text"
   },
@@ -98,6 +100,7 @@ point tests at production `/data/inventory.db`.
 | `store_url` | Mini-app HTTPS URL opened by the bot’s Web App button |
 | `order_fee` | Platform fee seed; omit → $2 default ($1 if name contains “unicorn”) |
 | `notify_ids` | Extra chat ids for new-order DMs; owner is always included |
+| `extra_tokens` | Extra BotFather tokens that may sign Mini App `initData` for this shop. HMAC aliases only (no extra poller). Put `@UnicornMagicFactoryBot` here if the JSON `token` is `@MagicFactory2Bot`. To poll both bots, add a second JSON entry with the same `shop_chat_id`. |
 
 JSON entries **win** over legacy `UNICORN_*` when the bot token is the same.
 

@@ -997,15 +997,23 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             log.info("POST /order unknown storefront invite")
             return 404, {"ok": False, "error": "unknown storefront"}
 
-        # 2) Auth boundary: initData signed with this shop's vendor bot token
-        vendor_token = vendor_stores.get_bot_token_for_shop(shop_chat_id)
-        if not vendor_token:
+        # 2) Auth boundary: initData signed with any token bound to this shop
+        # (primary polling bot + extra_tokens aliases, e.g. MagicFactory2Bot
+        # and UnicornMagicFactoryBot sharing one catalog).
+        vendor_tokens = list(vendor_stores.get_bot_tokens_for_shop(shop_chat_id) or [])
+        one = vendor_stores.get_bot_token_for_shop(shop_chat_id)
+        if one and one not in vendor_tokens:
+            vendor_tokens.insert(0, one)
+        if not vendor_tokens:
             log.warning(
                 "POST /order no vendor bot token for shop=%s", shop_chat_id
             )
             return 401, {"ok": False, "error": "invalid initData"}
+        vendor_token = vendor_tokens[0]
         try:
-            buyer = vendor_stores.validate_webapp_init_data(init_data, vendor_token)
+            buyer = vendor_stores.validate_webapp_init_data_any(
+                init_data, vendor_tokens
+            )
         except vendor_stores.InitDataError as exc:
             log.info(
                 "POST /order initData rejected shop=%s: %s", shop_chat_id, exc

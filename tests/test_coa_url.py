@@ -180,6 +180,24 @@ class CoaKeyboardTests(unittest.TestCase):
         third = kb.inline_keyboard[2]
         self.assertEqual(len(third), 1)
 
+    def test_list_keyboard_truncates_long_names(self) -> None:
+        products = [
+            {
+                "id": 9,
+                "name": (
+                    "BPC/kpv capsules 100 caps for 100 doses/100 days supply "
+                    "(vial) $80.00"
+                ),
+                "price": 80,
+                "stock": 10,
+            }
+        ]
+        kb = self.bot.product_list_keyboard(products)
+        label = kb.inline_keyboard[0][0].text
+        self.assertLessEqual(len(label), 64)
+        self.assertNotIn("\ufffd", label)
+        self.assertEqual(label.count("$80.00"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

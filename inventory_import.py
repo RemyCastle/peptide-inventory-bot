@@ -152,6 +152,12 @@ def parse_inventory_text(text: str) -> ParseResult:
             continue
 
         name, price_s, stock_s = parts[0], parts[1], parts[2]
+        try:
+            from catalog_cleanup import sanitize_catalog_text
+
+            name = sanitize_catalog_text(name)
+        except Exception:
+            name = " ".join(name.split())
         unit = DEFAULT_UNIT
         description = ""
         unit_explicit = False
@@ -182,6 +188,12 @@ def parse_inventory_text(text: str) -> ParseResult:
         if len(name) > MAX_NAME_LEN:
             result.errors.append(f"L{line_no}: name too long (max {MAX_NAME_LEN})")
             continue
+        try:
+            from catalog_cleanup import sanitize_catalog_text
+
+            description = sanitize_catalog_text(description)
+        except Exception:
+            description = " ".join(description.split())
         if len(description) > MAX_DESC_LEN:
             description = description[:MAX_DESC_LEN]
 
@@ -257,11 +269,48 @@ def import_products(
     if not rows:
         return out
 
+    existing_rows = db.list_products(int(chat_id), active_only=False)
     existing = {
         _norm_name(p["name"]): p
-        for p in db.list_products(int(chat_id), active_only=False)
+        for p in existing_rows
     }
+    existing_clean: dict[str, Any] = {}
+    try:
+        from catalog_cleanup import (
+            clean_product_name,
+            grouping_key,
+            should_merge_prices,
+        )
+    except Exception:  # pragma: no cover - circular import guard
+        clean_product_name = None  # type: ignore[assignment]
+        grouping_key = None  # type: ignore[assignment]
+        should_merge_prices = None  # type: ignore[assignment]
+    if grouping_key is not None:
+        for p in existing_rows:
+            ck = grouping_key(str(p.get("name") or ""))
+            if ck and ck not in existing_clean:
+                existing_clean[ck] = p
     batch_seen: set[str] = set()
+
+    def _cleaned_match(cand: dict, row: ParsedRow, unit: str) -> bool:
+        """Match uniqueness-hack names to an already-cleaned row, not sibling SKUs."""
+        if grouping_key is None or clean_product_name is None:
+            return False
+        cand_name = str(cand.get("name") or "")
+        incoming_clean = clean_product_name(row.name)
+        already_clean = _norm_name(cand_name) == _norm_name(incoming_clean)
+        cand_unit = normalize_unit(cand.get("unit")).lower()
+        kit_pair = {cand_unit, unit.lower()} == {"vial", "kit"}
+        ratio_pair = False
+        if should_merge_prices is not None:
+            try:
+                cp = float(cand.get("price") or 0)
+            except (TypeError, ValueError):
+                cp = 0.0
+            ratio_pair = should_merge_prices(cp, row.price) or should_merge_prices(
+                row.price, cp
+            )
+        return already_clean or kit_pair or ratio_pair
 
     for row in rows:
         key = _norm_name(row.name)
@@ -274,6 +323,10 @@ def import_products(
 
         unit = normalize_unit(row.unit)
         found = existing.get(key)
+        if found is None and grouping_key is not None:
+            cand = existing_clean.get(grouping_key(row.name))
+            if cand is not None and _cleaned_match(cand, row, unit):
+                found = cand
 
         try:
             if found is None:
@@ -293,7 +346,7 @@ def import_products(
                     db.update_product(pid, kit_price=row.kit_price)
                 out.created.append(row.name)
                 batch_seen.add(key)
-                existing[key] = {
+                rec = {
                     "id": pid,
                     "name": row.name,
                     "price": row.price,
@@ -301,6 +354,11 @@ def import_products(
                     "unit": unit,
                     "description": row.description or "",
                 }
+                existing[key] = rec
+                if grouping_key is not None:
+                    ck = grouping_key(row.name)
+                    if ck and ck not in existing_clean:
+                        existing_clean[ck] = rec
                 continue
 
             # Exists
@@ -337,6 +395,57 @@ def import_products(
     return out
 
 
+def fold_kit_vial_rows(rows: list[ParsedRow]) -> list[ParsedRow]:
+    """Fold kit+vial file rows into one product with kit_price.
+
+    Only pairs (a) explicit kit unit + vial unit with the same cleaned name, or
+    (b) two vial prices whose ratio looks like a kit-of-10. Sibling SKUs with
+    close prices (B12 $10 vs $15) stay two rows.
+    """
+    if len(rows) < 2:
+        return rows
+    try:
+        from catalog_cleanup import grouping_key, should_merge_prices
+    except Exception:
+        return rows
+
+    buckets: dict[str, list[ParsedRow]] = {}
+    order: list[str] = []
+    for row in rows:
+        key = grouping_key(row.name) or _norm_name(row.name)
+        if key not in buckets:
+            order.append(key)
+            buckets[key] = []
+        buckets[key].append(row)
+
+    folded: list[ParsedRow] = []
+    for key in order:
+        group = buckets[key]
+        if len(group) == 1:
+            folded.append(group[0])
+            continue
+        vials = [r for r in group if normalize_unit(r.unit).lower() == "vial"]
+        kits = [r for r in group if normalize_unit(r.unit).lower() == "kit"]
+        if vials and kits:
+            keeper = min(vials, key=lambda r: r.price)
+            kit_price = max(r.price for r in kits)
+            if keeper.kit_price is None or kit_price > keeper.kit_price:
+                keeper.kit_price = kit_price
+            folded.append(keeper)
+            continue
+        if len(vials) >= 2:
+            prices = sorted(r.price for r in vials)
+            lo, hi = prices[0], prices[-1]
+            if should_merge_prices(lo, hi):
+                keeper = min(vials, key=lambda r: r.price)
+                if keeper.kit_price is None or hi > keeper.kit_price:
+                    keeper.kit_price = hi
+                folded.append(keeper)
+                continue
+        folded.extend(group)
+    return folded
+
+
 def import_from_text(
     chat_id: int,
     text: str,
@@ -345,6 +454,7 @@ def import_from_text(
 ) -> tuple[ParseResult, ImportResult]:
     """Parse then apply with the given mode."""
     parsed = parse_inventory_text(text)
+    parsed.rows = fold_kit_vial_rows(parsed.rows)
     imported = import_products(int(chat_id), parsed.rows, mode=mode)
     return parsed, imported
 

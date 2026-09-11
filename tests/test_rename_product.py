@@ -53,6 +53,12 @@ class RenameProductTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("long", msg.lower())
 
+    def test_strips_replacement_and_nbsp(self) -> None:
+        ok, name = db.rename_product(self.pid, self.shop, "New\u00a0Name\ufffd")
+        self.assertTrue(ok)
+        self.assertEqual(name, "New Name")
+        self.assertEqual(db.get_product(self.pid)["name"], "New Name")
+
 
 if __name__ == "__main__":
     unittest.main()

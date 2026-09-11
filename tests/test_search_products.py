@@ -88,6 +88,8 @@ class SearchProductsTests(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["name"], "Mystery Vial")
         self.assertEqual(hits[0]["sku"], "UMF-GLP-5")
+        miss = db.search_products(self.shop_b, "UMF-GLP")
+        self.assertEqual(miss, [])
 
 
 if __name__ == "__main__":

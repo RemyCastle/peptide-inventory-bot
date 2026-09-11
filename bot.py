@@ -41,6 +41,7 @@ from telegram.ext import (
 import tg_payments
 
 import backup as backup_mod
+import catalog_cleanup
 import db
 import inventory_import
 import payment_templates as pt
@@ -841,11 +842,15 @@ def product_list_keyboard(
     buttons = []
     for p in products:
         stock = int(p["stock"])
-        label = f"{p['name']} · {money(p['price'])}"
-        if stock <= 0:
-            label += " (out)"
-        else:
-            label += f" · {stock} left"
+        guest = None
+        if p.get("is_guest"):
+            guest = str(p.get("guest_title") or "partner")
+        label = catalog_cleanup.catalog_button_label(
+            str(p.get("name") or ""),
+            p.get("sell_price", p.get("price")),
+            stock,
+            guest=guest,
+        )
         row = [InlineKeyboardButton(label, callback_data=f"prod:{p['id']}")]
         if db.product_has_coa(p):
             row.append(
@@ -1002,15 +1007,12 @@ async def _send_catalog(
     page = max(0, min(page, pages - 1))
     page_products = ranked[page * page_size : (page + 1) * page_size]
 
-    # Present guest shares with sell price in list labels via name suffix
+    # Guest shares keep their own name; button helper adds (+partner) if needed.
     display_products = []
     for p in page_products:
         q = dict(p)
         sell = float(p.get("sell_price", p.get("price", 0)))
-        if p.get("is_guest"):
-            guest = p.get("guest_title") or "partner"
-            q["name"] = f"{p['name']} · {money(sell)} (+{guest})"
-            q["price"] = sell
+        q["price"] = sell
         display_products.append(q)
 
     has_sales = any(int(v) > 0 for v in (sales or {}).values())
@@ -1227,15 +1229,18 @@ def _catalog_entry_for_shop(sid: int | None, pid: int) -> dict | None:
 
 
 def _product_card_text(p: dict, stock: int, in_cart_vials: int) -> str:
+    shown = catalog_cleanup.display_product_name(str(p.get("name") or ""))
+    esc = catalog_cleanup.md_escape
+    unit = esc(str(p.get("unit") or "vial"))
     text = (
-        f"*{p['name']}*\n"
-        f"Price: *{money(p['price'])}* / {p.get('unit') or 'vial'}\n"
+        f"*{esc(shown)}*\n"
+        f"Price: *{money(p['price'])}* / {unit}\n"
         f"Stock: {stock}\n"
     )
     if in_cart_vials > 0:
         text += f"🛒 *In your cart: {in_cart_vials}*\n"
     if p.get("is_guest"):
-        guest = p.get("guest_title") or "partner"
+        guest = esc(str(p.get("guest_title") or "partner"))
         text += f"_Partner stock ({guest})_\n"
     if db.kit_option_available(p, stock=stock):
         kp = db.product_kit_price(p)
@@ -1243,7 +1248,7 @@ def _product_card_text(p: dict, stock: int, in_cart_vials: int) -> str:
     elif db.product_kit_price(p) is not None and stock < KIT_SIZE:
         text += f"_Kit of {KIT_SIZE} unavailable (need {KIT_SIZE}+ in stock)_\n"
     if p.get("description"):
-        text += f"\n{p['description']}\n"
+        text += f"\n{esc(str(p['description']))}\n"
     if stock <= 0:
         text += "\n_Currently out of stock._"
     if db.product_has_coa(p):
@@ -1404,10 +1409,11 @@ async def _render_cart(
         if e["singles"] > 0:
             bits.append(f"{e['singles']} vial(s) @ {money(p['price'])}")
         bits_s = " + ".join(bits) if bits else f"{db.cart_entry_vials(e)} vials"
-        lines.append(f"• {p['name']}: {bits_s} = {money(line)}")
+        shown = catalog_cleanup.display_product_name(str(p.get("name") or ""))
+        lines.append(f"• {shown}: {bits_s} = {money(line)}")
         buttons.append(
             [
-                InlineKeyboardButton(f"− {p['name'][:18]}", callback_data=f"sub:{pid}"),
+                InlineKeyboardButton(f"− {shown[:18]}", callback_data=f"sub:{pid}"),
                 InlineKeyboardButton("🗑", callback_data=f"rm:{pid}"),
             ]
         )
@@ -2746,6 +2752,9 @@ async def cb_adm_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             [InlineKeyboardButton("👑 Master fees / invoices", callback_data="master_home")]
         )
         rows.append(
+            [InlineKeyboardButton("🧹 Clean catalog (owner)", callback_data="owner_clean_cat")]
+        )
+        rows.append(
             [InlineKeyboardButton("🗑 Clear inventory (owner)", callback_data="owner_clear_inv")]
         )
     rows.append([InlineKeyboardButton("« Admin", callback_data="admin")])
@@ -2764,6 +2773,98 @@ async def cb_adm_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         query,
         f"🔗 *Customer shop link*\n\n`{link}`\n\nShare this so buyers open the right catalog.",
         back_main_kb([[InlineKeyboardButton("« Admin", callback_data="admin")]]),
+    )
+
+
+async def cb_owner_clean_cat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """OWNER_IDS only: preview uniqueness-hack cleanup (no writes)."""
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await safe_edit(
+            query,
+            "Bot owner only. Your Telegram ID must be in `OWNER_IDS`.",
+            back_main_kb([[InlineKeyboardButton("« Admin", callback_data="admin")]]),
+        )
+        return
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await safe_edit(query, "No shop selected. /start then Admin.", back_main_kb())
+        return
+    shop = db.get_shop(sid) or db.ensure_shop(sid)
+    ok, msg, plan = catalog_cleanup.apply_cleanup(
+        int(sid), actor_id=int(user.id), dry_run=True
+    )
+    n = len(db.list_products(int(sid), active_only=True))
+    head = (
+        f"Shop: *{(shop.get('title') or sid)}* (`{sid}`)\n"
+        f"Active products: *{n}*\n\n"
+    )
+    if not ok:
+        await safe_edit(query, "❌ " + msg, back_main_kb())
+        return
+    extra = ""
+    if plan.actions:
+        extra = (
+            "\nThis *renames* jammed `$price` tails, fixes Anav@r, and *hides* "
+            "duplicate vial rows after copying kit price onto the keeper. "
+            "Orders keep their product ids. Stock is not changed.\n"
+        )
+    kb_rows = []
+    if plan.actions:
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    f"✅ Apply {len(plan.actions)} change(s)",
+                    callback_data="owner_clean_cat_yes",
+                )
+            ]
+        )
+    kb_rows.append([InlineKeyboardButton("❌ Cancel", callback_data="admin")])
+    await safe_edit(query, head + extra + msg, InlineKeyboardMarkup(kb_rows))
+
+
+async def cb_owner_clean_cat_yes(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """OWNER_IDS only: apply catalog cleanup after preview."""
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    if not user or not db.is_owner(user.id):
+        await safe_edit(
+            query,
+            "Bot owner only.",
+            back_main_kb([[InlineKeyboardButton("« Admin", callback_data="admin")]]),
+        )
+        return
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await safe_edit(query, "No shop selected.", back_main_kb())
+        return
+    ok, msg, plan = catalog_cleanup.apply_cleanup(
+        int(sid), actor_id=int(user.id), dry_run=False
+    )
+    log.info(
+        "owner_catalog_cleanup shop=%s by=%s ok=%s renames=%s merges=%s hide=%s",
+        sid,
+        user.id,
+        ok,
+        plan.rename_count,
+        plan.merge_count,
+        plan.deactivate_count,
+    )
+    prefix = "✅ " if ok else "❌ "
+    await safe_edit(
+        query,
+        prefix + msg,
+        InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📦 Products", callback_data="adm_prods")],
+                [InlineKeyboardButton("« Admin", callback_data="admin")],
+            ]
+        ),
     )
 
 
@@ -7415,6 +7516,8 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_master_home, pattern=r"^master_home$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_owner_clear_inv, pattern=r"^owner_clear_inv$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_owner_clear_inv_yes, pattern=r"^owner_clear_inv_yes$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_owner_clean_cat, pattern=r"^owner_clean_cat$"), group=NAV)
+    app.add_handler(CallbackQueryHandler(cb_owner_clean_cat_yes, pattern=r"^owner_clean_cat_yes$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_master_setfee, pattern=r"^master_setfee$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_master_ledger, pattern=r"^master_ledger$"), group=NAV)
     app.add_handler(CallbackQueryHandler(cb_master_geninv, pattern=r"^master_geninv$"), group=NAV)
@@ -7497,6 +7600,8 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^admin$"))
     app.add_handler(CallbackQueryHandler(cb_owner_clear_inv, pattern=r"^owner_clear_inv$"))
     app.add_handler(CallbackQueryHandler(cb_owner_clear_inv_yes, pattern=r"^owner_clear_inv_yes$"))
+    app.add_handler(CallbackQueryHandler(cb_owner_clean_cat, pattern=r"^owner_clean_cat$"))
+    app.add_handler(CallbackQueryHandler(cb_owner_clean_cat_yes, pattern=r"^owner_clean_cat_yes$"))
     app.add_handler(CallbackQueryHandler(cb_adm_prods, pattern=r"^adm_prods$"))
     app.add_handler(CallbackQueryHandler(cb_adm_product, pattern=r"^admp:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_toggle_product, pattern=r"^togglep:\d+$"))

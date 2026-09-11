@@ -878,6 +878,17 @@ def resolve_storefront_key(raw_key: str) -> int | None:
     return None
 
 
+def _buyer_product_name(p: dict) -> str:
+    """Public catalog name: strip uniqueness-hack tails and replacement glyphs."""
+    raw = str(p.get("name") or "")
+    try:
+        from catalog_cleanup import display_product_name
+
+        return display_product_name(raw)
+    except Exception:
+        return raw
+
+
 def api_storefront(raw_key: str) -> tuple[int, dict]:
     """Public, read-only catalog for a vendor's mini-app storefront.
 
@@ -904,7 +915,7 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
         "products": [
             {
                 "id": int(p["id"]),
-                "name": p["name"],
+                "name": _buyer_product_name(p),
                 "price": float(p["price"]),
                 "kit_price": (float(p["kit_price"]) if p.get("kit_price") else None),
                 "stock": int(p.get("stock") or 0),
@@ -1018,6 +1029,9 @@ def _product_public(p: dict) -> dict:
         "coa_url": (p.get("coa_url") or "").strip(),
         "has_coa_file": bool((p.get("coa_file_id") or "").strip()),
         "category": cat,
+        "sku": (str(p.get("sku") or "").strip()),
+        "variant_group": (str(p.get("variant_group") or "").strip()),
+        "variant_label": (str(p.get("variant_label") or "").strip()),
         "sort_order": int(p.get("sort_order") or 0),
     }
 

@@ -424,6 +424,12 @@ def init_db() -> None:
         # Optional zone quotes (JSON). NULL = current flat fee / free-above.
         _ensure_column(conn, "shops", "shipping_zones", "TEXT")
 
+        # Optional article / SKU (searchable). Nullable so existing rows stay valid.
+        _ensure_column(conn, "products", "sku", "TEXT")
+        # Optional variant grouping (independent stock per row; NULL = standalone card)
+        _ensure_column(conn, "products", "variant_group", "TEXT")
+        _ensure_column(conn, "products", "variant_label", "TEXT")
+
         # Order payment ref code, proof screenshot, shipping tracking
         _ensure_column(conn, "orders", "payment_code", "TEXT")
         _ensure_column(conn, "orders", "payment_proof_file_id", "TEXT")
@@ -1370,6 +1376,16 @@ def add_product(
 ) -> int:
     ensure_shop(chat_id)
     now = _utc_now()
+    clean_name = (name or "").strip()
+    clean_desc = (description or "").strip()
+    try:
+        from catalog_cleanup import sanitize_catalog_text
+
+        clean_name = sanitize_catalog_text(clean_name)
+        clean_desc = sanitize_catalog_text(clean_desc)
+    except Exception:
+        clean_name = " ".join(clean_name.split())
+        clean_desc = " ".join(clean_desc.split())
     with get_db() as conn:
         cur = conn.execute(
             """
@@ -1377,7 +1393,7 @@ def add_product(
               (chat_id, name, description, price, stock, unit, active, sort_order, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
             """,
-            (chat_id, name.strip(), description.strip(), float(price), int(stock), unit, now, now),
+            (chat_id, clean_name, clean_desc, float(price), int(stock), unit, now, now),
         )
         return int(cur.lastrowid)
 
@@ -1441,6 +1457,12 @@ def rename_product(
     Rejects empty / whitespace-only names. Does not touch stock or price.
     """
     name = (new_name or "").strip()
+    try:
+        from catalog_cleanup import sanitize_catalog_text
+
+        name = sanitize_catalog_text(name)
+    except Exception:
+        name = " ".join(name.split())
     if not name:
         return False, "Name can't be empty. Send a new name or /cancel."
     if len(name) > max_len:
@@ -1819,7 +1841,7 @@ def search_products(
                   AND (
                     name LIKE ? COLLATE NOCASE
                     OR description LIKE ? COLLATE NOCASE
-                    OR sku LIKE ? COLLATE NOCASE
+                    OR IFNULL(sku, '') LIKE ? COLLATE NOCASE
                   )
                 ORDER BY sort_order, name
                 LIMIT ?
@@ -1834,7 +1856,7 @@ def search_products(
                   AND (
                     name LIKE ? COLLATE NOCASE
                     OR description LIKE ? COLLATE NOCASE
-                    OR sku LIKE ? COLLATE NOCASE
+                    OR IFNULL(sku, '') LIKE ? COLLATE NOCASE
                   )
                 ORDER BY active DESC, sort_order, name
                 LIMIT ?
@@ -2892,9 +2914,17 @@ def money(amount: float, symbol: str = CURRENCY_SYMBOL) -> str:
 def format_product_line(p: dict, symbol: str = CURRENCY_SYMBOL) -> str:
     stock = int(p["stock"])
     stock_txt = f"{stock} in stock" if stock > 0 else "OUT OF STOCK"
-    desc = f"\n   {p['description']}" if p.get("description") else ""
+    try:
+        from catalog_cleanup import display_product_name, md_escape
+
+        shown = md_escape(display_product_name(str(p.get("name") or "")))
+        desc_raw = str(p.get("description") or "")
+        desc = f"\n   {md_escape(desc_raw)}" if desc_raw else ""
+    except Exception:
+        shown = str(p.get("name") or "")
+        desc = f"\n   {p['description']}" if p.get("description") else ""
     return (
-        f"• *{p['name']}* — {money(float(p['price']), symbol)} / {p.get('unit') or 'vial'}\n"
+        f"• *{shown}* — {money(float(p['price']), symbol)} / {p.get('unit') or 'vial'}\n"
         f"   _{stock_txt}_{desc}"
     )
 
