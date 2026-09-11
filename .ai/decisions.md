@@ -90,3 +90,8 @@ Append-only log. Newest at bottom.
 - Decision: Serve the Unicorn Pages Mini App catalog from live `unicornfartzz-bot` (`/data/inventory.db`) using the public storefront key already in `remy-miniapp-demos.pages.dev/unicorn/` (`dd6dec3482e1572886868657`). Boot binds that key to `find_catalog_shop()` (title / newest paid / env id). `resolve_storefront_key` falls back to that shop when the Pages key is missing from this disk (it lived on suspended `spbc-supplier-bot`). No shop deletes. TELEGRAM_BOT_TOKEN and UNICORN_BOT_TOKEN stay the same @UnicornMagicFactory2Bot token — skip a second vendor poller; Open Store keyboard is on main `/start`. Did not invent UnicornFartzz admin tokens or touch BOT_TOKENS failover.
 - Why: Mini App inventory was empty: first STOREFRONT_HOST 503, then unicornfartzz-bot 404 unknown storefront. Pages HTML is not in this repo; inventory-bot host must answer the invite the Mini App already sends.
 - Tests: `tests/test_unicorn_storefront_host.py`
+
+### 2026-09-11
+- Decision: `/health` `default_chat_configured` (and `owner_chat_configured`) is true when a Unicorn catalog shop is bound in inventory.db, not only when `SUPPLIER_TELEGRAM_CHAT_ID` is set. Unicorn-only MagicFactory2 does not need the SPBC supplier chat env or old InventoryBot tokens.
+- Why: Remy wants health green after catalog bind; `SUPPLIER_TELEGRAM_CHAT_ID` is an SPBC leftover and was empty on unicornfartzz-bot.
+- Tests: `tests/test_unicorn_storefront_host.py::HealthHostTests`

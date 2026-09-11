@@ -927,10 +927,21 @@ ORDER_STOCK_ERROR = (
 )
 
 
+def _catalog_shop_bound() -> bool:
+    """True when live inventory.db has a Unicorn catalog shop (no SPBC chat required)."""
+    try:
+        import unicorn_shop
+
+        return unicorn_shop.find_catalog_shop() is not None
+    except Exception:
+        return False
+
+
 def _status_body() -> dict:
     with _state_lock:
         token_ok = bool(_bot_token)
         open_sessions = len(_sessions)
+    catalog_bound = _catalog_shop_bound()
     return {
         "service": "unicornfartzz-bot",
         "ok": True,
@@ -939,8 +950,14 @@ def _status_body() -> dict:
         "telegram_bot_configured": token_ok,
         "telegram_configured": token_ok,
         "telegram_bot_ok": token_ok,
-        "default_chat_configured": bool(SUPPLIER_TELEGRAM_CHAT_ID),
-        "owner_chat_configured": bool(OWNER_TELEGRAM_CHAT_ID or SUPPLIER_TELEGRAM_CHAT_ID),
+        # SPBC leftover used SUPPLIER_TELEGRAM_CHAT_ID. Unicorn-only deploys
+        # treat a bound catalog shop as the default chat so /health is green
+        # without restoring InventoryBot tokens or a supplier chat id.
+        "default_chat_configured": bool(SUPPLIER_TELEGRAM_CHAT_ID) or catalog_bound,
+        "owner_chat_configured": bool(
+            OWNER_TELEGRAM_CHAT_ID or SUPPLIER_TELEGRAM_CHAT_ID
+        )
+        or catalog_bound,
         "notify_secret_configured": bool(NOTIFY_SECRET),
         "open_sessions": open_sessions,
     }

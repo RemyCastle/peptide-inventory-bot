@@ -186,6 +186,16 @@ class VendorResolveAndTokenTests(unittest.TestCase):
 
 
 class HealthHostTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        db.set_db_path(Path(self._tmp.name) / "health.db")
+        db.init_db()
+        db.ensure_shop(UNICORN, title="Unicorn Magic Factory")
+        db.add_product(UNICORN, "BPC-157", 40.0, stock=3)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
     def test_health_points_at_unicornfartzz(self) -> None:
         import spbc_notify
 
@@ -194,6 +204,15 @@ class HealthHostTests(unittest.TestCase):
         self.assertEqual(
             body["storefront_host"], "https://unicornfartzz-bot.onrender.com"
         )
+
+    def test_health_true_from_bound_catalog_shop(self) -> None:
+        import spbc_notify
+
+        with mock.patch.object(spbc_notify, "SUPPLIER_TELEGRAM_CHAT_ID", ""), \
+             mock.patch.object(spbc_notify, "OWNER_TELEGRAM_CHAT_ID", ""):
+            body = spbc_notify._status_body()
+        self.assertTrue(body["default_chat_configured"])
+        self.assertTrue(body["owner_chat_configured"])
 
 
 if __name__ == "__main__":
