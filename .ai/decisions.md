@@ -100,3 +100,8 @@ Append-only log. Newest at bottom.
 - Decision: `shop_title_looks_unicorn` strips `unicornfartzzbot` / `unicornfartzz` so group titles like "Ash, UnicornFartzzBot and Samantha" do not bind as the catalog shop. `find_catalog_shop` prefers stocked Unicorn-titled shops, then any stocked shop (newest paid), never an empty brand-false-positive. No shop deletes.
 - Why: #14 live bind used chat_id=-5215898165 title=Ash… products=0; Mini App got ok:true with empty shelf.
 - Tests: `tests/test_unicorn_storefront_host.py` brand-group cases
+
+### 2026-09-11
+- Decision: Real Unicorn catalog is shop `9100000000000` title `@unicornmagicfactory` (105 products on 2026-09-10) on suspended `spbc-supplier-bot` disk — not the empty Ash/UnicornFartzzBot group on unicornfartzz-bot. Boot creates that canonical shop on unicornfartzz-bot, pulls `GET /storefront?invite=dd6dec…` from `UNICORN_CATALOG_MIRROR_URL` when local products=0, rebinds the Pages key. `SKIP_BOT_POLLING=1` lets supplier-bot serve HTTP/catalog without a second Telegram poller (its SPBC token is 401). No shop deletes. Did not print or rotate BOT_TOKENS.
+- Why: #14 bound empty Ash group; #15 then bound generic title=`Shop` chat_id=-5121165394 (312 wholesale SKUs). Real Ghostie catalog is 9100000000000 / `@unicornmagicfactory` (105 products on supplier-bot 2026-09-10). Do not fall through to unrelated stocked shops.
+- Tests: `tests/test_unicorn_storefront_host.py` canonical import + reject generic Shop bind

@@ -107,6 +107,28 @@ class FindCatalogShopTests(unittest.TestCase):
             unicorn_shop._product_count(int(shop["chat_id"])), 0
         )
 
+    def test_generic_stocked_shop_is_not_unicorn_catalog(self) -> None:
+        """#15 bound Pages to title='Shop' (312 SKUs) — that is not Ghostie."""
+        generic = -5121165394
+        db.ensure_shop(generic, title="Shop")
+        db.add_product(generic, "10ct slide case for 2/3ml vials", 22.0, 10)
+        with db.get_db() as conn:
+            conn.execute("UPDATE products SET active = 0 WHERE chat_id = ?", (UNICORN,))
+            conn.execute("UPDATE products SET active = 0 WHERE chat_id = ?", (OTHER,))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("UNICORN_SHOP_CHAT_ID", None)
+            shop = unicorn_shop.find_catalog_shop()
+        self.assertIsNone(shop)
+
+    def test_canonical_stocked_shop_wins_over_ash(self) -> None:
+        db.ensure_shop(81099, title="Ash, UnicornFartzzBot and Samantha")
+        shop = unicorn_shop.ensure_canonical_shop()
+        db.add_product(int(shop["chat_id"]), "BAC 3ml", 12.0, stock=90)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("UNICORN_SHOP_CHAT_ID", None)
+            got = unicorn_shop.find_catalog_shop()
+        self.assertEqual(int(got["chat_id"]), unicorn_shop.CANONICAL_SHOP_CHAT_ID)
+
     def test_newest_paid_unicorn_wins_among_titled(self) -> None:
         extra = 81004
         db.ensure_shop(extra, title="Unicorn Magic Factory")
@@ -151,8 +173,13 @@ class StorefrontBindTests(unittest.TestCase):
         db.ensure_shop(UNICORN, title="Unicorn Magic Factory")
         db.add_product(UNICORN, "Klow 80mg", 150.0, stock=7)
         webpanel.ensure_webpanel_tables()
+        self._fetch_patch = mock.patch.object(
+            unicorn_shop, "fetch_storefront_json", return_value=None
+        )
+        self._fetch_patch.start()
 
     def tearDown(self) -> None:
+        self._fetch_patch.stop()
         self._tmp.cleanup()
 
     def test_pages_key_resolves_without_prior_row(self) -> None:
@@ -188,6 +215,92 @@ class StorefrontBindTests(unittest.TestCase):
         webpanel.ensure_storefront_key_plain(UNICORN, PAGES_KEY)
         self.assertEqual(webpanel.resolve_storefront_key(PAGES_KEY), UNICORN)
 
+    def test_import_payload_then_pages_key_leaves_empty_ash(self) -> None:
+        ash = -5215898165
+        db.ensure_shop(ash, title="Ash, UnicornFartzzBot and Samantha")
+        webpanel.ensure_storefront_key_plain(ash, PAGES_KEY)
+        payload = {
+            "ok": True,
+            "shop": {
+                "title": "@unicornmagicfactory",
+                "shipping_enabled": 1,
+                "shipping_fee": 8.0,
+                "free_shipping_above": 150.0,
+                "shipping_zones": None,
+            },
+            "products": [
+                {
+                    "id": 69,
+                    "name": "BAC 3ml",
+                    "price": 12.0,
+                    "kit_price": None,
+                    "stock": 90,
+                    "sku": "BAC3",
+                    "category": "Other",
+                    "sort_order": 1,
+                },
+                {
+                    "id": 2,
+                    "name": "BPC-157 5MG",
+                    "price": 40.0,
+                    "kit_price": 360.0,
+                    "stock": 12,
+                },
+            ],
+        }
+        n = unicorn_shop.import_storefront_payload(
+            unicorn_shop.CANONICAL_SHOP_CHAT_ID, payload
+        )
+        self.assertEqual(n, 2)
+        with mock.patch.object(unicorn_shop, "fetch_storefront_json", return_value=None):
+            sid = webpanel.resolve_storefront_key(PAGES_KEY)
+        self.assertEqual(sid, unicorn_shop.CANONICAL_SHOP_CHAT_ID)
+        code, body = webpanel.api_storefront(PAGES_KEY)
+        self.assertEqual(code, 200, body)
+        names = {p["name"] for p in body["products"]}
+        self.assertEqual(names, {"BAC 3ml", "BPC-157 5MG"})
+        self.assertEqual(body["shop"]["title"], "@unicornmagicfactory")
+        self.assertNotEqual(sid, ash)
+
+    def test_pages_key_ignores_generic_shop_bind(self) -> None:
+        generic = -5121165394
+        db.ensure_shop(generic, title="Shop")
+        db.add_product(generic, "10ct slide case for 2/3ml vials", 22.0, 10)
+        webpanel.ensure_storefront_key_plain(generic, PAGES_KEY)
+        payload = {
+            "ok": True,
+            "shop": {"title": "@unicornmagicfactory"},
+            "products": [{"name": "BAC 3ml", "price": 12.0, "stock": 90}],
+        }
+        unicorn_shop.import_storefront_payload(
+            unicorn_shop.CANONICAL_SHOP_CHAT_ID, payload
+        )
+        sid = webpanel.resolve_storefront_key(PAGES_KEY)
+        self.assertEqual(sid, unicorn_shop.CANONICAL_SHOP_CHAT_ID)
+        self.assertNotEqual(sid, generic)
+
+    def test_import_is_add_only(self) -> None:
+        unicorn_shop.ensure_canonical_shop()
+        db.add_product(unicorn_shop.CANONICAL_SHOP_CHAT_ID, "BAC 3ml", 12.0, 1)
+        n = unicorn_shop.import_storefront_payload(
+            unicorn_shop.CANONICAL_SHOP_CHAT_ID,
+            {
+                "ok": True,
+                "shop": {"title": "@unicornmagicfactory"},
+                "products": [
+                    {"name": "BAC 3ml", "price": 99.0, "stock": 5},
+                    {"name": "Klow 80mg", "price": 150.0, "stock": 7},
+                ],
+            },
+        )
+        self.assertEqual(n, 1)
+        names = {
+            p["name"]: p
+            for p in db.list_products(unicorn_shop.CANONICAL_SHOP_CHAT_ID)
+        }
+        self.assertEqual(float(names["BAC 3ml"]["price"]), 12.0)
+        self.assertEqual(int(names["Klow 80mg"]["stock"]), 7)
+
 
 class VendorResolveAndTokenTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -221,6 +334,13 @@ class VendorResolveAndTokenTests(unittest.TestCase):
         env = {"PUBLIC_BOT_USERNAME": "UnicornMagicFactory2Bot", "UNICORN_BOT_TOKEN": ""}
         with mock.patch.dict(os.environ, env, clear=False):
             self.assertTrue(unicorn_shop.is_unicorn_customer_bot())
+
+    def test_skip_bot_polling_flag(self) -> None:
+        with mock.patch.dict(os.environ, {"SKIP_BOT_POLLING": "1"}):
+            self.assertTrue(unicorn_shop.skip_bot_polling())
+        with mock.patch.dict(os.environ, {"SKIP_BOT_POLLING": ""}, clear=False):
+            os.environ.pop("SKIP_BOT_POLLING", None)
+            self.assertFalse(unicorn_shop.skip_bot_polling())
 
 
 class HealthHostTests(unittest.TestCase):
