@@ -95,3 +95,8 @@ Append-only log. Newest at bottom.
 - Decision: `/health` `default_chat_configured` (and `owner_chat_configured`) is true when a Unicorn catalog shop is bound in inventory.db, not only when `SUPPLIER_TELEGRAM_CHAT_ID` is set. Unicorn-only MagicFactory2 does not need the SPBC supplier chat env or old InventoryBot tokens.
 - Why: Remy wants health green after catalog bind; `SUPPLIER_TELEGRAM_CHAT_ID` is an SPBC leftover and was empty on unicornfartzz-bot.
 - Tests: `tests/test_unicorn_storefront_host.py::HealthHostTests`
+
+### 2026-09-11
+- Decision: `shop_title_looks_unicorn` strips `unicornfartzzbot` / `unicornfartzz` so group titles like "Ash, UnicornFartzzBot and Samantha" do not bind as the catalog shop. `find_catalog_shop` prefers stocked Unicorn-titled shops, then any stocked shop (newest paid), never an empty brand-false-positive. No shop deletes.
+- Why: #14 live bind used chat_id=-5215898165 title=Ash… products=0; Mini App got ok:true with empty shelf.
+- Tests: `tests/test_unicorn_storefront_host.py` brand-group cases

@@ -83,10 +83,29 @@ class FindCatalogShopTests(unittest.TestCase):
         self.assertIsNotNone(shop)
         self.assertEqual(int(shop["chat_id"]), UNICORN)
 
-    def test_env_id_wins(self) -> None:
+    def test_env_id_wins_when_stocked(self) -> None:
+        extra = 81005
+        db.ensure_shop(extra, title="Pinned Unicorn")
+        db.add_product(extra, "Pinned Vial", 11.0, stock=2)
+        with mock.patch.dict(os.environ, {"UNICORN_SHOP_CHAT_ID": str(extra)}):
+            shop = unicorn_shop.find_catalog_shop()
+        self.assertEqual(int(shop["chat_id"]), extra)
+
+    def test_empty_env_pin_falls_through_to_stock(self) -> None:
         with mock.patch.dict(os.environ, {"UNICORN_SHOP_CHAT_ID": str(EMPTY)}):
             shop = unicorn_shop.find_catalog_shop()
-        self.assertEqual(int(shop["chat_id"]), EMPTY)
+        self.assertEqual(int(shop["chat_id"]), UNICORN)
+
+    def test_stocked_untitled_shop_beats_empty_ash_group(self) -> None:
+        db.ensure_shop(81099, title="Ash, UnicornFartzzBot and Samantha")
+        # UNICORN is titled + stocked in setUp
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("UNICORN_SHOP_CHAT_ID", None)
+            shop = unicorn_shop.find_catalog_shop()
+        self.assertEqual(int(shop["chat_id"]), UNICORN)
+        self.assertGreater(
+            unicorn_shop._product_count(int(shop["chat_id"])), 0
+        )
 
     def test_newest_paid_unicorn_wins_among_titled(self) -> None:
         extra = 81004
