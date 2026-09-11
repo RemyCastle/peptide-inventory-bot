@@ -540,7 +540,6 @@ class ApiTests(WebPanelBase):
         self.assertEqual(sp["Middle"]["category"], None)
         self.assertEqual(sp["Zebra"]["sort_order"], 30)
 
-<<<<<<< HEAD
     def test_storefront_sku_and_variants(self):
         pink = db.add_product(SHOP, "Tee", 25.0, 4)
         blue = db.add_product(SHOP, "Tee", 25.0, 3)
