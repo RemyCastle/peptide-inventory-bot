@@ -80,9 +80,13 @@ def _cleanup_unicorn_catalog() -> None:
     if not shop:
         log.warning("unicorn catalog cleanup: no catalog shop")
         print("[run_cloud] unicorn catalog cleanup: no catalog shop", flush=True)
+        spbc_notify.set_catalog_cleanup_result(
+            {"ok": False, "skipped": "no catalog shop"}
+        )
         return
     sid = int(shop["chat_id"])
     clean = catalog_cleanup.apply_bound_shop_cleanup(sid)
+    spbc_notify.set_catalog_cleanup_result(clean)
     log.info("unicorn catalog cleanup: %s", clean)
     print(f"[run_cloud] unicorn catalog cleanup: {clean}", flush=True)
 

@@ -252,6 +252,48 @@ class HealthHostTests(unittest.TestCase):
         self.assertTrue(body["default_chat_configured"])
         self.assertTrue(body["owner_chat_configured"])
 
+    def test_health_exposes_render_git_sha_and_cleanup(self) -> None:
+        import spbc_notify
+
+        spbc_notify.set_catalog_cleanup_result(None)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RENDER_GIT_COMMIT", None)
+            os.environ.pop("GIT_COMMIT", None)
+            body = spbc_notify._status_body()
+        self.assertNotIn("git_sha", body)
+        self.assertNotIn("catalog_cleanup", body)
+        with mock.patch.dict(
+            os.environ, {"RENDER_GIT_COMMIT": "a" * 40}, clear=False
+        ):
+            spbc_notify.set_catalog_cleanup_result(
+                {
+                    "ok": True,
+                    "renames": 2,
+                    "merges": 1,
+                    "deactivated": 3,
+                    "shop_chat_id": 999,
+                    "msg": "Catalog cleanup applied on this shop.",
+                }
+            )
+            body = spbc_notify._status_body()
+        self.assertEqual(body["git_sha"], "a" * 40)
+        self.assertEqual(
+            body["catalog_cleanup"],
+            {
+                "ok": True,
+                "renames": 2,
+                "merges": 1,
+                "deactivated": 3,
+                "msg": "Catalog cleanup applied on this shop.",
+            },
+        )
+        self.assertNotIn("shop_chat_id", body["catalog_cleanup"])
+        spbc_notify.set_catalog_cleanup_result(None)
+
+    def test_dockerfile_copies_catalog_cleanup(self) -> None:
+        text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("catalog_cleanup.py", text)
+
 
 if __name__ == "__main__":
     unittest.main()

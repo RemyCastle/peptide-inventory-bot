@@ -271,6 +271,11 @@ class CleanupApplyTests(unittest.TestCase):
             db.list_products(self.other, active_only=True)[0]["name"],
             "Anav@r 25mg",
         )
+        import spbc_notify
+
+        recorded = spbc_notify._status_body().get("catalog_cleanup") or {}
+        self.assertTrue(recorded.get("ok"))
+        self.assertGreaterEqual(int(recorded.get("renames") or 0), 1)
 
     def test_non_owner_denied(self) -> None:
         db.add_product(self.shop, "Anav@r 25mg", 35.0, 6)

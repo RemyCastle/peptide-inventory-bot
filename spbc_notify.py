@@ -25,6 +25,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -937,12 +938,45 @@ def _catalog_shop_bound() -> bool:
         return False
 
 
+def live_git_sha() -> str:
+    """Commit Render built this process from. Empty when not a Render deploy."""
+    for key in ("RENDER_GIT_COMMIT", "GIT_COMMIT"):
+        raw = (os.getenv(key) or "").strip()
+        if raw:
+            return raw[:40]
+    return ""
+
+
+_catalog_cleanup_last: dict[str, Any] | None = None
+
+
+def set_catalog_cleanup_result(result: dict | None) -> None:
+    """Remember last Unicorn catalog cleanup for /health (no chat ids)."""
+    global _catalog_cleanup_last
+    if not result:
+        _catalog_cleanup_last = None
+        return
+    out: dict[str, Any] = {
+        "ok": bool(result.get("ok")),
+        "renames": int(result.get("renames") or 0),
+        "merges": int(result.get("merges") or 0),
+        "deactivated": int(result.get("deactivated") or 0),
+    }
+    skipped = result.get("skipped")
+    if skipped:
+        out["skipped"] = str(skipped)[:80]
+    msg = result.get("msg")
+    if msg:
+        out["msg"] = str(msg)[:200]
+    _catalog_cleanup_last = out
+
+
 def _status_body() -> dict:
     with _state_lock:
         token_ok = bool(_bot_token)
         open_sessions = len(_sessions)
     catalog_bound = _catalog_shop_bound()
-    return {
+    body: dict[str, Any] = {
         "service": "unicornfartzz-bot",
         "ok": True,
         "mode": "combined_inventory_bot",
@@ -961,6 +995,12 @@ def _status_body() -> dict:
         "notify_secret_configured": bool(NOTIFY_SECRET),
         "open_sessions": open_sessions,
     }
+    sha = live_git_sha()
+    if sha:
+        body["git_sha"] = sha
+    if _catalog_cleanup_last is not None:
+        body["catalog_cleanup"] = dict(_catalog_cleanup_last)
+    return body
 
 
 def handle_http_order(payload: dict) -> tuple[int, dict]:
