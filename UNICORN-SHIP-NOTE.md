@@ -7,54 +7,63 @@
 
 ## What was wrong
 
-Public `/storefront` still served uniqueness-hack import tails:
+Public `/storefront` still served uniqueness-hack import tails after `a449e82`:
 
 - `Anav@r 25mg`
 - `$price` jammed into names (`Aod 5mg (vial) $15.00`)
 - original card + `(vial)`/`(kit)` copy of the same dose
 
-Sample **before this follow-up** (public catalog, 2026-09-11): **312** active products, **1** `Anav@r`, **32** names with `$`, plus `(vial)`/`(kit)` suffix dupes. Shop title on that feed: `Shop`.
+Sample **before this follow-up** (public catalog): **312** active products, **1** `Anav@r`, **32** names with `$`, plus `(vial)`/`(kit)` suffix dupes. Shop title on that feed: `Shop`.
 
-Earlier local commit `ee22a98` only sanitized **display** labels and was not what live was running. Boot cleanup on `d0fcf37` ran only inside the claim-token bind, so the Pages catalog shop could stay dirty, and same-price uniqueness copies stayed as a second card after kit merge.
+`a449e82` was on GitHub but **did not boot**. `bot.py` imports `catalog_cleanup` at module load, and `Dockerfile` did not `COPY catalog_cleanup.py`. Render kept the old process. Display sanitization and boot cleanup never ran.
+
+A later boot on `d30a728` (module now in the image) still **skipped DB cleanup** because Render `OWNER_IDS` is empty (`catalog_cleanup.skipped=no OWNER_IDS`). Buyer names were already stripped in `/storefront`; the MagicFactory2 rows stayed dirty.
 
 ## What this ship does
 
-On Unicorn boot, `run_cloud._cleanup_unicorn_catalog` runs against `unicorn_shop.find_catalog_shop()` only (MagicFactory2 Pages catalog). Owner-gated. Idempotent.
+On Unicorn boot, `run_cloud._cleanup_unicorn_catalog` runs against `unicorn_shop.find_catalog_shop()` only (MagicFactory2 Pages catalog). Shop-scoped. Idempotent. **Never DELETE.** Empty `OWNER_IDS` no longer blocks boot apply.
 
 - `Anav@r` → `Anavar 25mg`
 - strip `$price` / `(vial)` / `(kit)` uniqueness tails
 - merge true vial/kit pairs (kit ≈ 6–12× vial, or explicit kit unit with a **higher** price): keeper keeps the **lower** vial price, `kit_price` = higher; loser `active=0`
-- hide same-price uniqueness copies of the keeper (original `Aod 5mg` $15 + `Aod 5mg (vial) $15.00`)
+- hide same-price uniqueness copies of the keeper
 - **do not** merge sibling SKUs (B12 $10/$15, MT1/MT2 $11/$30, Oxytocin $10/$30) — strip `$` only
-- never DELETE rows; open order lines keep `product_id` + copied `product_name`
-- other shops on the same disk are not written
-
-Local simulation of that plan against the live JSON: remaining weird names **0**, remaining same-name/same-price dupes **0**. Tests: **523** passed.
+- `/health` exposes `git_sha` (`RENDER_GIT_COMMIT`) and last `catalog_cleanup` counts
+- Claude glyph repair (`b127c5d`): shop title/welcome + labels self-heal mojibake; Grok did not restore/overwrite those files
 
 ## Git
 
-Pushed `a449e82` to `RemyCastle/peptide-inventory-bot` `master` (ahead-1 follow-up on the rebased cleanup). Laptop `inventory.db` not opened for writes.
+Pushed `89a7ab8` to `RemyCastle/peptide-inventory-bot` `master` (includes `d30a728` Docker COPY + `b127c5d` Claude glyph repair + boot apply without `OWNER_IDS`). Laptop `inventory.db` not opened for writes.
 
-## Live resample (after push)
+## Live resample (2026-09-11, after `89a7ab8` boot)
 
-Polled public `/storefront` for ~12 minutes after `a449e82`:
+`GET /health`:
 
-- brief 502 window, then health `ok: true` again
-- still **312** products, **1** `Anav@r`, **32** `$` names, **82** `(vial)`/`(kit)` suffixes
-- GitHub commit statuses/checks for `a449e82`: empty (Render is not reporting a deploy)
+- `ok: true`
+- `git_sha`: `89a7ab80a7b05a0bb10b1b3f736afcf849840a15`
+- `catalog_cleanup`: **31** rename(s), **38** merge(s), **78** deactivated, 147 row(s) touched, **no products deleted**
 
-That JSON is still the **old** process. `a449e82` would strip `Anav@r` / `$` from `/storefront` names even before DB cleanup, so dirty names mean unicornfartzz-bot has not booted this SHA. `RENDER_API_KEY` is not set on this PC, so this ship could not click Manual Deploy.
+`GET /storefront`:
+
+- **234** active products (was 312)
+- **0** `Anav@r`, **0** `$` in names, **0** `(vial)`/`(kit)` suffixes
+- `Anavar 25mg` $35
+- one `Aod 5mg` card, vial $15, `kit_price` $130
+- B12 5ml still two prices ($10 and $15 hydroxycolabin)
+- MT1 / MT2 / Oxytocin still two prices ($11/$30, $10/$30)
+- Mini App production `https://remy-miniapp-demos.pages.dev/unicorn/` title `Unicorn Magic Factory 🦄` (Claude UI fix deployed to Pages **main**, not the `master` preview)
 
 ## Out of scope
 
 - Hard delete / DB wipe
 - Other vendor shops
-- Autopush as a general peptide_inventory_bot habit (this repo can auto-deploy **two** Render services)
+- Setting `OWNER_IDS` on Render (boot no longer needs it for this cleanup)
+- Telegram menu source (Claude `b127c5d`; Grok did not restore those files)
 
 ## Remy check (60s)
 
-1. Render dashboard → **unicornfartzz-bot** (`srv-d9a6h057vvec738lov80`) → Manual Deploy → latest `master` (`a449e82` or newer). Watch logs for `unicorn catalog cleanup`.
-2. GET https://unicornfartzz-bot.onrender.com → `ok: true`
-3. Mini App / `/storefront`: no `Anav@r`, no `$` inside names, one Aod 5mg card with kit price
-4. B12 / MT1 / MT2 / Oxytocin still two prices if they were two SKUs
-5. Place nothing; do not run local `start.bat` while cloud is live
+1. GET https://unicornfartzz-bot.onrender.com/health → `ok: true`, `git_sha` starts `89a7ab8`, `catalog_cleanup.ok: true`
+2. Mini App / `/storefront`: no `Anav@r`, no `$` inside names, one Aod 5mg card with kit price
+3. B12 / MT1 / MT2 / Oxytocin still two prices if they were two SKUs
+4. Place nothing; do not run local `start.bat` while cloud is live
+5. Do not wipe `/data`
