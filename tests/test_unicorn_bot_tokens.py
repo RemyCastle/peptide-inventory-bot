@@ -118,7 +118,21 @@ class UnicornBotTokenTests(unittest.TestCase):
             vendor_stores.initdata_error_code(
                 vendor_stores.InitDataError("missing initData or bot token")
             ),
-            "bad_hash",
+            "empty_initdata",
+        )
+        self.assertEqual(
+            vendor_stores.initdata_error_code(
+                vendor_stores.InitDataError("missing user", hash_ok=True)
+            ),
+            "bad_payload",
+        )
+        self.assertIn(
+            "Telegram bot",
+            vendor_stores.checkout_buyer_message("empty_initdata"),
+        )
+        self.assertIn(
+            "expired",
+            vendor_stores.checkout_buyer_message("expired").lower(),
         )
 
 
@@ -241,7 +255,8 @@ class UnicornMainTokenOrderTests(unittest.TestCase):
         payload["initData"] = ""
         code, body = spbc_notify.handle_http_order(payload)
         self.assertEqual(code, 401)
-        self.assertEqual(body.get("error"), "bad_hash")
+        self.assertEqual(body.get("error"), "empty_initdata")
+        self.assertTrue(body.get("message"))
 
 
 if __name__ == "__main__":

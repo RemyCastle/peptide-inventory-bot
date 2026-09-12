@@ -140,11 +140,47 @@ class InitDataError(Exception):
 
 
 def initdata_error_code(exc: BaseException | None) -> str:
-    """Map InitDataError to POST /order JSON: bad_hash | expired."""
+    """Map InitDataError to POST /order JSON (never a secret).
+
+    ``expired`` — HMAC matched, auth_date too old (re-open).
+    ``empty_initdata`` — no initData / missing hash (open from the bot).
+    ``bad_payload`` — HMAC matched, user/auth fields broken (re-open).
+    ``bad_hash`` — no candidate token matched (wrong bot or stripped hash).
+    """
     msg = str(getattr(exc, "reason", None) or exc or "").strip().lower()
     if "expired" in msg:
         return "expired"
+    if (
+        "missing initdata" in msg
+        or "empty initdata" in msg
+        or msg == "missing hash"
+    ):
+        return "empty_initdata"
+    if "user" in msg or "auth_date" in msg:
+        return "bad_payload"
     return "bad_hash"
+
+
+def checkout_buyer_message(code: str) -> str:
+    """Short Mini App alert text for checkout errors. Never a secret."""
+    key = (code or "").strip()
+    if key == "expired":
+        return "This checkout session expired. Re-open the store from the bot."
+    if key == "empty_initdata":
+        return "Open the store from the Telegram bot and try again."
+    if key == "bad_payload":
+        return (
+            "Re-open the store from the Telegram bot — "
+            "this session is incomplete."
+        )
+    if key == "no_payment_methods":
+        return NO_PAYMENTS_BUYER_LINE
+    if key == "no_vendor_token":
+        return "This store is not ready for checkout. Message the seller."
+    return (
+        "This store couldn't verify the Telegram session. "
+        "Re-open it from the bot."
+    )
 
 
 def _coerce_cart_int(value) -> int:

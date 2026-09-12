@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import db  # noqa: E402
+import payment_templates  # noqa: E402
 import run_cloud  # noqa: E402
 import spbc_notify  # noqa: E402
 import unicorn_shop  # noqa: E402
@@ -77,6 +78,8 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         blob = str(body["payments"])
         self.assertNotIn("wineboos", blob)
         self.assertNotIn("proton", blob)
+        self.assertEqual(body["invoices"]["enabled"], False)
+        self.assertNotIn("LIVE", str(body.get("invoices")))
 
     def test_panel_seed_defaults_unicorn_only(self) -> None:
         uni_tok = {"chat_id": UNICORN, "user_id": 1}
@@ -132,6 +135,22 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertIn('callback_data="paytpl:paypal"', src)
         self.assertIn('callback_data="paytpl:apple_cash"', src)
         self.assertIn("cb_adm_seedpays", src)
+
+    def test_pay_url_venmo_prefill_paypal_username_not_email(self) -> None:
+        venmo = payment_templates.render_venmo("@wineboos")
+        link = vendor_stores.payment_pay_link(venmo, 12.5, "ABC123")
+        self.assertIn("venmo.com", link or "")
+        self.assertIn("12.50", link or "")
+        self.assertIn("ABC123", link or "")
+        pp_user = payment_templates.render_paypal("unicornshop")
+        self.assertIn(
+            "paypal.me/",
+            vendor_stores.payment_pay_link(pp_user, 10, "X") or "",
+        )
+        pp_email = payment_templates.render_paypal("unicornfartzz@proton.me")
+        self.assertIsNone(vendor_stores.payment_pay_link(pp_email, 10, "X"))
+        cash = payment_templates.render_cashapp("$tag")
+        self.assertIn("cash.app", vendor_stores.payment_pay_link(cash, 3, "Z") or "")
 
 
 if __name__ == "__main__":

@@ -219,6 +219,7 @@ class OrderHttpTests(unittest.TestCase):
         self.assertEqual(code, 409, body)
         self.assertFalse(body.get("ok"))
         self.assertEqual(body.get("error"), "no_payment_methods")
+        self.assertIn("Message the seller", body.get("message") or "")
         with db.get_db() as conn:
             n = conn.execute(
                 "SELECT COUNT(*) AS c FROM orders WHERE chat_id = ?", (SHOP,)
@@ -240,6 +241,7 @@ class OrderHttpTests(unittest.TestCase):
         self.assertFalse(body.get("ok"))
         self.assertEqual(body.get("error"), "bad_hash")
         self.assertTrue(body.get("detail"))
+        self.assertIn("Telegram", body.get("message") or "")
         with db.get_db() as conn:
             n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
         self.assertEqual(n, 0)
@@ -267,18 +269,20 @@ class OrderHttpTests(unittest.TestCase):
         self.assertFalse(body.get("ok"))
         self.assertEqual(body.get("error"), "expired")
         self.assertIn("expired", (body.get("detail") or "").lower())
+        self.assertIn("expired", (body.get("message") or "").lower())
         with db.get_db() as conn:
             n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
         self.assertEqual(n, 0)
 
     def test_empty_initdata_401_bad_hash_logs_reason(self) -> None:
-        """Empty initData stays 401; JSON is bad_hash; InitDataError reason is logged."""
+        """Empty initData stays 401; JSON is empty_initdata; reason is logged."""
         with mock.patch.object(spbc_notify.log, "info") as info:
             code, body = spbc_notify.handle_http_order(self._payload(initData=""))
         self.assertEqual(code, 401)
         self.assertFalse(body.get("ok"))
-        self.assertEqual(body.get("error"), "bad_hash")
+        self.assertEqual(body.get("error"), "empty_initdata")
         self.assertEqual(body.get("detail"), "missing initData or bot token")
+        self.assertIn("Telegram bot", body.get("message") or "")
         blobs = [" ".join(str(a) for a in (c.args or ())) for c in info.call_args_list]
         joined = " ".join(blobs)
         self.assertIn("reason=%s", joined)

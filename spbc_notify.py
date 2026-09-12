@@ -1016,6 +1016,12 @@ def _status_body() -> dict:
             }
     except Exception:
         pass
+    try:
+        import tg_payments
+
+        body["invoices"] = {"enabled": bool(tg_payments.invoices_enabled())}
+    except Exception:
+        body["invoices"] = {"enabled": False}
     return body
 
 
@@ -1082,6 +1088,7 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
                 "ok": False,
                 "error": err,
                 "detail": str(getattr(exc, "reason", None) or err)[:80],
+                "message": vendor_stores.checkout_buyer_message(err),
             }
 
         buyer_id = int(buyer["user_id"])
@@ -1105,7 +1112,13 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
 
         if not db.list_payment_methods(shop_chat_id, active_only=True):
             log.info("POST /order no payment methods shop=%s", shop_chat_id)
-            return 409, {"ok": False, "error": "no_payment_methods"}
+            return 409, {
+                "ok": False,
+                "error": "no_payment_methods",
+                "message": vendor_stores.checkout_buyer_message(
+                    "no_payment_methods"
+                ),
+            }
 
         ship_name, ship_address, ship_notes = vendor_stores.parse_ship_fields(
             payload

@@ -967,10 +967,18 @@ def api_order_status(raw_key: str, payment_code: str) -> tuple[int, dict]:
     if not order or int(order.get("chat_id") or 0) != int(chat_id):
         return _err(404, "order not found")
     items = db.get_order_items(int(order["id"]))
+    code = order.get("payment_code") or ""
+    total = float(order.get("total") or 0)
+    try:
+        import vendor_stores
+
+        pay_objs = vendor_stores.payment_methods_public(chat_id, total, code)
+    except Exception:
+        pay_objs = []
     return 200, {
         "ok": True,
         "status": order.get("status") or "",
-        "code": order.get("payment_code") or "",
+        "code": code,
         "items": [
             {
                 "name": it.get("product_name") or "",
@@ -982,12 +990,14 @@ def api_order_status(raw_key: str, payment_code: str) -> tuple[int, dict]:
         ],
         "subtotal": float(order.get("subtotal") or 0),
         "shipping_fee": float(order.get("shipping_fee") or 0),
-        "total": float(order.get("total") or 0),
+        "total": total,
         "created_at": order.get("created_at") or "",
         "tracking_number": (order.get("tracking_number") or "").strip(),
         "tracking_carrier": (order.get("tracking_carrier") or "").strip(),
         "ship_name": (order.get("ship_name") or "").strip(),
         "ship_address": (order.get("ship_address") or "").strip(),
+        "payments": [p.get("line") for p in pay_objs],
+        "payment_methods": pay_objs,
     }
 
 

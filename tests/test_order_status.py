@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -36,6 +37,13 @@ class OrderStatusTests(unittest.TestCase):
         self.sf_a = webpanel._ensure_storefront_key(SHOP_A)
         self.sf_b = webpanel._ensure_storefront_key(SHOP_B)
         self.pid = db.add_product(SHOP_A, "BPC-157", 40.0, stock=8)
+        db.add_payment_method(
+            SHOP_A,
+            "Venmo",
+            "Send to @shop-venmo",
+            method_type="venmo",
+            handle="@shop-venmo",
+        )
         self.order = db.create_order(
             SHOP_A,
             BUYER,
@@ -74,6 +82,15 @@ class OrderStatusTests(unittest.TestCase):
         self.assertNotIn("admin_note", body)
         self.assertNotIn("confirmed_by", body)
         self.assertNotIn("hidden_service_fee", body)
+        self.assertTrue(body.get("payments"))
+        self.assertTrue(any("Venmo" in p for p in body["payments"]))
+        pms = body.get("payment_methods") or []
+        self.assertTrue(pms)
+        self.assertEqual(pms[0].get("method_type"), "venmo")
+        self.assertEqual(pms[0].get("target"), "@shop-venmo")
+        self.assertTrue(pms[0].get("pay_url"))
+        self.assertIn("venmo.com", pms[0]["pay_url"])
+        self.assertIn(body["code"], unquote(pms[0]["pay_url"]))
 
     def test_other_shop_key_cannot_see_order(self) -> None:
         code, body = webpanel.api_order_status(

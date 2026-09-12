@@ -213,11 +213,15 @@ Map from `initdata_error_code` (`vendor_stores.py:138`) and `api_order`:
 |------|---------|---------|-----|
 | 404 | `unknown storefront` | `invite` did not resolve to a shop | Confirm the Pages store's `?invite=` matches the bound 24-hex; re-check `_bind_vendor_miniapps` ran (boot log) |
 | 401 | `no_vendor_token` | No bot token is bound to that shop | Set `token` in `VENDOR_STORES_JSON` or legacy `UNICORN_BOT_TOKEN`; restart |
-| 401 | `bad_hash` | HMAC failed for **every** candidate token | Buyer's bot token isn't in the shop's token set → add it to `extra_tokens`; **or** `initData` was empty (trailing-slash gotcha above) |
+| 401 | `empty_initdata` | `initData` missing/empty or no hash | Trailing-slash gotcha, or opened outside Telegram — buyer should re-open from the bot |
+| 401 | `bad_payload` | HMAC matched but `user` / `auth_date` is broken | Out-of-date Telegram app or incomplete WebView payload — re-open; **not** an `extra_tokens` fix |
+| 401 | `bad_hash` | HMAC failed for **every** candidate token | Buyer's bot token isn't in the shop's token set → add it to `extra_tokens` |
 | 401 | `expired` | HMAC matched but `auth_date` > 24 h old | Buyer sat on the checkout page > 24 h — tell them to re-open the store; not a config bug |
 | 400 | `bad payload` / `empty cart` | Cart failed to parse or was empty | Client bug; check the Pages checkout JS |
 | 409 | `no_payment_methods` | Shop has zero *active* payment rows | Seed/unpause a method (Admin → Payments or panel). Order is **not** created. |
 | 409 | stock error | `create_order` rejected (sold out / stock race) | Expected when stock ran out mid-checkout; server re-checks authoritatively |
+
+401/409 JSON also includes `message` (buyer-facing, never a secret) and 401 includes `detail` (short `InitDataError.reason`). Mini App should alert `message`, not the raw `error` code. `GET /order-status` returns the same `payments` / `payment_methods` objects as `POST /order` so “check my order” can show pay links.
 
 **Why `bad_hash` vs `expired` is trustworthy:** once the HMAC matches a token,
 later field errors (expired, missing user) carry `hash_ok=True`
@@ -225,15 +229,12 @@ later field errors (expired, missing user) carry `hash_ok=True`
 other tokens (`vendor_stores.py:1224`) so it never masks the real reason with
 "bad hash". So `expired` genuinely means "signed but stale," not "wrong bot."
 
-**But `bad_hash` is overloaded — read the log `reason`, not the buyer's code.**
-`initdata_error_code` (`vendor_stores.py:138`) only ever returns **two**
-buyer-facing codes: anything containing `"expired"` → `expired`, and
-**everything else → `bad_hash`**. So a session that *was* correctly signed but
-whose `user` field is missing or malformed (`missing user`, `bad user json`,
-`bad user id`, `bad auth_date` — `vendor_stores.py:330`–`342`, all raised with
-`hash_ok=True`) still hands the buyer `bad_hash`, even though the token matched.
-The **only** way to tell "wrong/absent token" from "signed but broken payload"
-is the server log `reason`:
+**`error` is no longer only `bad_hash` vs `expired`.** `initdata_error_code`
+splits empty/missing initData → `empty_initdata`, signed-but-broken user
+fields → `bad_payload`, and a genuine HMAC miss → `bad_hash`. `detail` is the
+short `InitDataError.reason` (never a secret). Logs still print `reason=`.
+
+The **log `reason`** still diagnoses trailing-slash vs wrong token:
 
 - `reason=bad hash` → genuinely no candidate token matched → add the buyer's
   bot to `extra_tokens` (or it was the empty-initData redirect).
