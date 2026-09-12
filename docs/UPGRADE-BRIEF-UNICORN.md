@@ -5,11 +5,11 @@ Repo: `C:\Users\Remy\peptide_inventory_bot`
 Prod: https://unicornfartzz-bot.onrender.com  
 Priority: P0  
 Ship agent: grok  
-AUTOPUSH: this ship (Mini App I've paid + admin rails preview +
-`STORE_URL_CACHE_BUST=20260913`)
+AUTOPUSH: this ship (Mini App I've paid claim ping gets `/confirm` URL
+button + buyer DM; no stock change)
 
-Goal: Mini App buyers can tap I've paid (`POST /order-paid`); admin payments
-list shows handles + buyer hint; never wipe inventory.
+Goal: After Mini App I've paid, vendor tap-to-confirm works on the vendor
+bot; buyer gets a short claim DM; never wipe inventory.
 
 Context (already verified — do not rediscover):
 
@@ -54,39 +54,43 @@ PayPal types are missing (web panel same rule).
 `checkout_ready` is false; mockup chrome gone. `STORE_URL_CACHE_BUST`
 was `20260912`.
 
+**Mini App I've paid + admin rails preview — live on `bef4d5f`:**
+`POST /order-paid` pending → awaiting (no stock change); `can_mark_paid`;
+health `checkout_ready` + cache bust `20260913`; Pages I've paid + Copy
+target. Live `/health` sha later `5951281` / `592eb3b`.
+
 ## This ship
 
-**Mini App I've paid + admin rails preview.** Briefs' P0/P1 were already
-live; next batch is payments UX:
+**Mini App payment-claim confirm URL.** I've paid vendor ping was plain
+text (“Confirm in Admin → Orders”). Telegram-native claims already have
+Confirm + tracking buttons on the *main* bot. The vendor poller does not
+handle `admconfirm` callbacks, so Mini App claims now get:
 
-- `POST /order-paid` `{invite, initData, code}` — same HMAC as `/order`;
-  shop-scoped; buyer `user_id` must match; `pending_payment` →
-  `awaiting_confirmation`; idempotent if already awaiting; 403
-  `not_your_order`, 409 `already_processed`. Never confirms payment, never
-  changes stock. Vendor gets a plain-text PAYMENT CLAIM ping.
-- `GET /order-status` and `POST /order` include `can_mark_paid` +
-  `mark_paid_hint` (true only while `pending_payment`).
-- `/health` adds `payments.checkout_ready` + `store_url_cache_bust`.
-- Telegram Payments list shows handle/cashtag/address; “Buyers can checkout.”
-- Web panel Payments card shows buyer-facing `buyer_hint` (no handle in the
-  hint). `api_state.shop.checkout_ready`.
-- Pages: I've paid on receipt + order lookup; Copy target when there is no
-  `pay_url` (PayPal email). `STORE_URL_CACHE_BUST=20260913`.
+- The same `/confirm?ct=` capability link as NEW ORDER (mint/reuse).
+- An inline **Confirm payment** URL button (opens `/confirm`, no callback).
+- Cancel-order text line when `PANEL_BASE_URL` is set.
+- Fallback copy when `PANEL_BASE_URL` is unset.
+- A short vendor-bot DM to the buyer. Second tap stays 200 idempotent
+  and does not re-notify. Never confirms payment, never changes stock.
+- `STORE_URL_CACHE_BUST` stays `20260913` (no Pages JS change).
 
 ## Acceptance (this ship)
 
-- [x] `python -m pytest -q -x` green on scratch DBs (618 passed)
+- [x] `python -m pytest -q -x` green on scratch DBs (652 passed)
 - [x] Docker COPY check still lists every imported module (26)
 - [x] No writes to laptop `inventory.db`; no DELETE of products
-- [x] `POST /order` success has `can_mark_paid: true`
-- [x] `POST /order-paid` moves pending → awaiting; second tap is 200 idempotent
-- [x] Wrong Telegram user → 403 `not_your_order` (order stays pending)
-- [x] Mini App HTML has I've paid + `order-paid` + copy target
-- [ ] Live `/health` new `git_sha`, `payments.active` ≥ 1, `checkout_ready`,
-      `store_url_cache_bust` `20260913` (after AUTOPUSH)
+- [x] `POST /order-paid` vendor ping includes `/confirm?ct=` + URL button
+      when `PANEL_BASE_URL` is set
+- [x] Unset `PANEL_BASE_URL` still pings; no confirm URL; no markup
+- [x] Buyer DM on first claim; second tap does not re-notify
+- [x] Stock unchanged after I've paid
+- [ ] Live `/health` new `git_sha`, `payments.active` ≥ 1,
+      `checkout_ready: true`, `store_url_cache_bust` `20260913`
+      (after AUTOPUSH)
 - [x] No secrets / `.env` / scratch import files committed
 
-Prior fe857ec checks stay true: storefront names-only, paid-order null `pay_url`.
+Prior `bef4d5f` checks stay true: `can_mark_paid`, 403 `not_your_order`,
+Pages I've paid.
 
 ## Out of scope
 

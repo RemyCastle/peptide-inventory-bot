@@ -552,7 +552,11 @@ def mark_paid_buyer_hint(status: str) -> str:
 
 
 def build_payment_claim_notify_text(order: dict) -> str:
-    """Vendor/admin plain-text ping when a Mini App buyer taps I've paid."""
+    """Vendor/admin plain-text ping when a Mini App buyer taps I've paid.
+
+    Includes the same /confirm (and /cancel) capability links as NEW ORDER
+    when PANEL_BASE_URL is set. Never confirms payment and never changes stock.
+    """
     oid = order.get("id")
     code = (order.get("payment_code") or (f"#{oid}" if oid else "")).strip()
     try:
@@ -561,11 +565,69 @@ def build_payment_claim_notify_text(order: dict) -> str:
         total = 0.0
     uname = (order.get("username") or "").strip()
     who = f"@{uname}" if uname else (order.get("full_name") or "buyer")
+    confirm_line = ""
+    cancel_line = ""
+    try:
+        import webpanel as _webpanel
+
+        shop_chat_id = int(order.get("chat_id") or 0)
+        if oid and shop_chat_id:
+            confirm_line = _webpanel.format_confirm_payment_dm_line(
+                int(oid), shop_chat_id
+            )
+            cancel_line = _webpanel.format_cancel_order_dm_line(
+                int(oid), shop_chat_id
+            )
+    except Exception:
+        log.exception(
+            "mint payment-claim action links failed for order %s", oid
+        )
+    lines = [
+        "PAYMENT CLAIM — buyer says paid (Mini App)",
+        f"Order {code} · #{oid} · ${total:.2f}",
+        f"Buyer {who}",
+    ]
+    if confirm_line:
+        lines.append(confirm_line)
+        lines.append(
+            "Tap Confirm payment to mark it paid. Stock only moves on confirm."
+        )
+    else:
+        lines.append("Confirm in Admin → Orders or /webpanel.")
+    if cancel_line:
+        lines.append(cancel_line)
+    return "\n".join(lines)
+
+
+def payment_claim_reply_markup(order: dict) -> dict | None:
+    """Inline URL button for /confirm — works on the vendor bot (no callback)."""
+    try:
+        import webpanel as _webpanel
+
+        oid = int(order.get("id") or 0)
+        shop_chat_id = int(order.get("chat_id") or 0)
+        if not oid or not shop_chat_id:
+            return None
+        url = _webpanel.confirm_payment_url(oid, shop_chat_id)
+    except Exception:
+        log.exception(
+            "payment-claim confirm URL failed for order %s", order.get("id")
+        )
+        return None
+    if not url:
+        return None
+    return {
+        "inline_keyboard": [[{"text": "✅ Confirm payment", "url": url}]]
+    }
+
+
+def build_payment_claim_buyer_text(order: dict) -> str:
+    """Short vendor-bot DM after Mini App I've paid. Never a secret."""
+    oid = order.get("id")
+    code = (order.get("payment_code") or (f"#{oid}" if oid else "")).strip()
     return (
-        f"PAYMENT CLAIM — buyer says paid (Mini App)\n"
-        f"Order {code} · #{oid} · ${total:.2f}\n"
-        f"Buyer {who}\n"
-        "Confirm in Admin → Orders or /webpanel."
+        f"We got your payment claim for {code}. "
+        "The seller will confirm it — you don't need to tap I've paid again."
     )
 
 

@@ -294,13 +294,46 @@ class NewOrderDmLinkTests(OrderConfirmLinkBase):
         with mock.patch.object(
             webpanel, "PANEL_BASE_URL", "https://bot.example.com"
         ):
+            url = webpanel.confirm_payment_url(int(o["id"]), SHOP)
             line = webpanel.format_confirm_payment_dm_line(int(o["id"]), SHOP)
-        self.assertTrue(line.startswith("✅ Confirm payment: "))
-        self.assertIn("https://bot.example.com/confirm?ct=", line)
-        raw = line.split("ct=", 1)[1]
+        self.assertTrue(url.startswith("https://bot.example.com/confirm?ct="))
+        self.assertEqual(line, f"✅ Confirm payment: {url}")
+        raw = url.split("ct=", 1)[1]
         got = webpanel.resolve_order_confirm_token(raw)
         self.assertEqual(got["order_id"], int(o["id"]))
         self.assertEqual(got["shop_chat_id"], SHOP)
+
+    def test_payment_claim_notify_includes_confirm_button(self):
+        import vendor_stores
+
+        o = self._order()
+        with mock.patch.object(
+            webpanel, "PANEL_BASE_URL", "https://bot.example.com"
+        ):
+            note = vendor_stores.build_payment_claim_notify_text(o)
+            markup = vendor_stores.payment_claim_reply_markup(o)
+        self.assertIn("PAYMENT CLAIM", note)
+        self.assertIn("https://bot.example.com/confirm?ct=", note)
+        self.assertIn("/cancel?xt=", note)
+        btn = ((markup or {}).get("inline_keyboard") or [[]])[0][0]
+        self.assertEqual(btn["text"], "✅ Confirm payment")
+        self.assertIn("https://bot.example.com/confirm?ct=", btn["url"])
+        self.assertIn(
+            "I've paid",
+            vendor_stores.build_payment_claim_buyer_text(o),
+        )
+
+    def test_payment_claim_notify_fallback_without_panel_url(self):
+        import vendor_stores
+
+        o = self._order()
+        with mock.patch.object(webpanel, "PANEL_BASE_URL", ""):
+            note = vendor_stores.build_payment_claim_notify_text(o)
+            markup = vendor_stores.payment_claim_reply_markup(o)
+        self.assertIn("PAYMENT CLAIM", note)
+        self.assertIn("Admin → Orders", note)
+        self.assertNotIn("/confirm?ct=", note)
+        self.assertIsNone(markup)
 
     def test_dm_line_skipped_when_no_panel_base_url(self):
         o = self._order()

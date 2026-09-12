@@ -505,10 +505,18 @@ class OrderHttpTests(unittest.TestCase):
         code, created = spbc_notify.handle_http_order(self._payload())
         self.assertEqual(code, 200, created)
         pay_code = created["code"]
+        stock_before = db.get_product(self.pid)["stock"]
         self.sent.clear()
-        st, body = spbc_notify.handle_http_order_paid(
-            {"invite": self.sf_key, "initData": build_valid_init_data(VENDOR_TOKEN), "code": pay_code}
-        )
+        with mock.patch.object(
+            webpanel, "PANEL_BASE_URL", "https://bot.example.com"
+        ):
+            st, body = spbc_notify.handle_http_order_paid(
+                {
+                    "invite": self.sf_key,
+                    "initData": build_valid_init_data(VENDOR_TOKEN),
+                    "code": pay_code,
+                }
+            )
         self.assertEqual(st, 200, body)
         self.assertTrue(body.get("ok"))
         self.assertTrue(body.get("claimed"))
@@ -519,9 +527,53 @@ class OrderHttpTests(unittest.TestCase):
         self.assertIn("confirm", (body.get("mark_paid_hint") or "").lower())
         order = db.get_order_by_payment_code(pay_code)
         self.assertEqual(order["status"], "awaiting_confirmation")
+        self.assertEqual(db.get_product(self.pid)["stock"], stock_before)
         vendor_sends = [s for s in self.sent if s[0] == "vendor"]
-        self.assertTrue(any("PAYMENT CLAIM" in (s[3] or "") for s in vendor_sends))
-        self.assertTrue(any(s[2] in (OWNER, ADMIN) for s in vendor_sends))
+        claim_sends = [
+            s
+            for s in vendor_sends
+            if s[2] in (OWNER, ADMIN) and "PAYMENT CLAIM" in (s[3] or "")
+        ]
+        self.assertTrue(claim_sends)
+        note = claim_sends[0][3]
+        self.assertIn("https://bot.example.com/confirm?ct=", note)
+        self.assertIn("Stock only moves on confirm", note)
+        markup = (claim_sends[0][4] or {}).get("reply_markup") or {}
+        btn = ((markup.get("inline_keyboard") or [[]])[0] or [{}])[0]
+        self.assertEqual(btn.get("text"), "✅ Confirm payment")
+        self.assertIn("https://bot.example.com/confirm?ct=", btn.get("url") or "")
+        buyer_sends = [s for s in vendor_sends if s[2] == BUYER]
+        self.assertTrue(
+            any("payment claim" in (s[3] or "").lower() for s in buyer_sends)
+        )
+        self.assertFalse(
+            any((s[4] or {}).get("reply_markup") for s in buyer_sends)
+        )
+
+    def test_order_paid_claim_fallback_without_panel_url(self) -> None:
+        code, created = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 200, created)
+        self.sent.clear()
+        with mock.patch.object(webpanel, "PANEL_BASE_URL", ""):
+            st, body = spbc_notify.handle_http_order_paid(
+                {
+                    "invite": self.sf_key,
+                    "initData": build_valid_init_data(VENDOR_TOKEN),
+                    "code": created["code"],
+                }
+            )
+        self.assertEqual(st, 200, body)
+        claim_sends = [
+            s
+            for s in self.sent
+            if s[0] == "vendor"
+            and s[2] in (OWNER, ADMIN)
+            and "PAYMENT CLAIM" in (s[3] or "")
+        ]
+        self.assertTrue(claim_sends)
+        self.assertIn("Admin → Orders", claim_sends[0][3])
+        self.assertNotIn("/confirm?ct=", claim_sends[0][3])
+        self.assertFalse((claim_sends[0][4] or {}).get("reply_markup"))
 
     def test_order_paid_idempotent_when_already_awaiting(self) -> None:
         code, created = spbc_notify.handle_http_order(self._payload())

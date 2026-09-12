@@ -401,17 +401,25 @@ def resolve_order_confirm_token(raw: str) -> Optional[dict]:
     }
 
 
-def format_confirm_payment_dm_line(order_id: int, shop_chat_id: int) -> str:
-    """Line for NEW ORDER vendor DM, or '' if PANEL_BASE_URL is unset."""
+def confirm_payment_url(order_id: int, shop_chat_id: int) -> str:
+    """https://host/confirm?ct=… or '' if PANEL_BASE_URL is unset."""
     base = (PANEL_BASE_URL or "").strip().rstrip("/")
     if not base:
+        return ""
+    raw = mint_order_confirm_token(int(order_id), int(shop_chat_id))
+    return f"{base}/confirm?ct={raw}"
+
+
+def format_confirm_payment_dm_line(order_id: int, shop_chat_id: int) -> str:
+    """Line for NEW ORDER / PAYMENT CLAIM vendor DM, or '' if PANEL_BASE_URL is unset."""
+    url = confirm_payment_url(order_id, shop_chat_id)
+    if not url:
         log.info(
             "PANEL_BASE_URL unset — skip confirm-payment link for order %s",
             order_id,
         )
         return ""
-    raw = mint_order_confirm_token(int(order_id), int(shop_chat_id))
-    return f"✅ Confirm payment: {base}/confirm?ct={raw}"
+    return f"✅ Confirm payment: {url}"
 
 
 def mint_order_cancel_token(order_id: int, shop_chat_id: int) -> str:

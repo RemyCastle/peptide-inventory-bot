@@ -1313,17 +1313,26 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
 def _notify_vendor_payment_claim(
     shop_chat_id: int, vendor_token: str, order: dict
 ) -> None:
-    """Plain-text ping (HTTP thread). No stock change. Never raises."""
+    """Plain-text ping (HTTP thread). No stock change. Never raises.
+
+    Confirm is a URL button (/confirm?ct=) so it works on the vendor bot,
+    which does not handle admconfirm callbacks.
+    """
     import vendor_stores
     import webpanel
 
     note = vendor_stores.build_payment_claim_notify_text(order)
+    markup = vendor_stores.payment_claim_reply_markup(order)
     base_ids = vendor_stores.base_notify_ids_for_shop(shop_chat_id)
     recipients = vendor_stores.build_notify_recipient_ids(base_ids, shop_chat_id)
     for rid in recipients:
         try:
             webpanel.telegram_send_with_token(
-                vendor_token, rid, note, parse_mode=None
+                vendor_token,
+                rid,
+                note,
+                parse_mode=None,
+                reply_markup=markup,
             )
         except Exception:
             log.exception(
@@ -1331,6 +1340,28 @@ def _notify_vendor_payment_claim(
                 shop_chat_id,
                 rid,
             )
+
+
+def _notify_buyer_payment_claim(
+    vendor_token: str, buyer_id: int, order: dict
+) -> None:
+    """Vendor-bot DM to the buyer after I've paid. Never raises. No stock change."""
+    import vendor_stores
+    import webpanel
+
+    if not buyer_id:
+        return
+    note = vendor_stores.build_payment_claim_buyer_text(order)
+    try:
+        webpanel.telegram_send_with_token(
+            vendor_token, buyer_id, note, parse_mode=None
+        )
+    except Exception:
+        log.exception(
+            "POST /order-paid buyer claim DM failed buyer=%s order=%s",
+            buyer_id,
+            order.get("id"),
+        )
 
 
 def handle_http_order_paid(payload: dict) -> tuple[int, dict]:
@@ -1389,6 +1420,7 @@ def handle_http_order_paid(payload: dict) -> tuple[int, dict]:
             newly_claimed = True
             order = db.get_order(int(order["id"])) or order
             _notify_vendor_payment_claim(shop_chat_id, vendor_token, order)
+            _notify_buyer_payment_claim(vendor_token, buyer_id, order)
             log.info(
                 "POST /order-paid claimed order_id=%s code=%s shop=%s",
                 order.get("id"),
