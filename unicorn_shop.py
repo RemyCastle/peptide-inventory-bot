@@ -16,6 +16,17 @@ import db
 # Not a claim/admin token. Override with UNICORN_STOREFRONT_KEY if Pages rotates.
 PAGES_STOREFRONT_KEY = "dd6dec3482e1572886868657"
 
+# Buyer-facing Unicorn rails (not secrets). Boot/admin seed inserts a type only
+# when it is absent — paused rows block a re-seed. Pause instead of delete.
+DEFAULT_PAYMENT_METHODS: tuple[dict[str, str], ...] = (
+    {"method_type": "venmo", "handle": "@wineboos"},
+    {
+        "method_type": "paypal",
+        "handle": "unicornfartzz@proton.me",
+        "network_note": "friends_family",
+    },
+)
+
 _PAID_STATUSES = ("paid", "shipped", "complete")
 
 # Title fragments used when binding the live Ghostie shop (run_cloud / webpanel).

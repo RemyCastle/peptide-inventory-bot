@@ -2717,6 +2717,11 @@ async def _admin_home(
         )
     else:
         text += "\nMin order: OFF"
+    if not db.list_payment_methods(sid, active_only=True):
+        text += (
+            "\n\n⚠️ *No payment methods* — buyers cannot checkout. "
+            "Open 💳 Payments and add Venmo / PayPal / Cash App."
+        )
     # Daily-driver actions up top; everything else lives in More tools
     kb = InlineKeyboardMarkup(
         [
@@ -5437,12 +5442,34 @@ async def cb_adm_pays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ]
         )
     if not methods:
-        lines.append("_None configured._")
+        lines.append(
+            "_None configured._ Buyers cannot checkout until you add one."
+        )
+        try:
+            import unicorn_shop
+
+            if unicorn_shop.is_unicorn_shop(sid):
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            "✨ Seed Venmo + PayPal",
+                            callback_data="adm_seedpays",
+                        )
+                    ]
+                )
+        except Exception:
+            pass
     lines.append("\n_Quick add:_")
     buttons.append(
         [
             InlineKeyboardButton("➕ Cash App", callback_data="paytpl:cashapp"),
             InlineKeyboardButton("➕ Venmo", callback_data="paytpl:venmo"),
+        ]
+    )
+    buttons.append(
+        [
+            InlineKeyboardButton("➕ PayPal", callback_data="paytpl:paypal"),
+            InlineKeyboardButton("➕ Apple Cash", callback_data="paytpl:apple_cash"),
         ]
     )
     buttons.append(
@@ -5459,6 +5486,27 @@ async def cb_adm_pays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     buttons.append([InlineKeyboardButton("« Admin", callback_data="admin")])
     await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+
+async def cb_adm_seedpays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Unicorn shop only: insert default Venmo/PayPal if those types are absent."""
+    query = update.callback_query
+    sid, ok = _require_admin(update, context)
+    if not ok or sid is None:
+        await query.answer("Denied", show_alert=True)
+        return
+    import unicorn_shop
+
+    if not unicorn_shop.is_unicorn_shop(sid):
+        await query.answer("Unicorn shop only", show_alert=True)
+        return
+    result = webpanel.ensure_unicorn_shop_payments(sid)
+    created = result.get("created") or []
+    await query.answer(
+        ("Seeded " + ", ".join(created)) if created else "Already present",
+        show_alert=True,
+    )
+    await cb_adm_pays(update, context)
 
 
 async def cb_toggle_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5521,6 +5569,8 @@ async def cb_pay_template_start(update: Update, context: ContextTypes.DEFAULT_TY
     placeholders = {
         "cashapp": "$Cashtag...",
         "venmo": "@Venmo handle...",
+        "paypal": "PayPal email or @username...",
+        "apple_cash": "Apple Cash phone...",
         "crypto": "Coin e.g. USDT...",
         "zelle": "Zelle email or phone...",
         "custom": "Payment instructions...",
@@ -7653,6 +7703,7 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_adm_reject, pattern=r"^admreject:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_view_proof, pattern=r"^viewproof:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_pays, pattern=r"^adm_pays$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_seedpays, pattern=r"^adm_seedpays$"))
     app.add_handler(CallbackQueryHandler(cb_toggle_method, pattern=r"^togglem:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_del_method, pattern=r"^delm:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_adm_ship, pattern=r"^adm_ship$"))

@@ -251,6 +251,8 @@ class HealthHostTests(unittest.TestCase):
             body = spbc_notify._status_body()
         self.assertTrue(body["default_chat_configured"])
         self.assertTrue(body["owner_chat_configured"])
+        self.assertEqual(body["payments"]["active"], 0)
+        self.assertEqual(body["payments"]["total"], 0)
 
     def test_health_exposes_render_git_sha_and_cleanup(self) -> None:
         import spbc_notify

@@ -367,6 +367,7 @@ class ApiTests(WebPanelBase):
         code, data = webpanel.api_state(self.tok)
         self.assertEqual(code, 200)
         self.assertEqual(data["shop"]["title"], "Vendor Shop")
+        self.assertFalse(data["shop"].get("is_unicorn"))
         self.assertEqual(len(data["products"]), 1)
         self.assertEqual(len(data["payments"]), 1)
 

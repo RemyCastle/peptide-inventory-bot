@@ -130,6 +130,7 @@ class HttpOrderReservationTests(unittest.TestCase):
         webpanel.ensure_webpanel_tables()
         self.sf = webpanel._ensure_storefront_key(SHOP_A)
         self.pid = db.add_product(SHOP_A, "Item", 10.0, stock=2)
+        db.add_payment_method(SHOP_A, "Venmo", "@shop-venmo memo CODE")
         self._patches = [
             mock.patch.object(
                 vendor_stores, "get_bot_token_for_shop", return_value="tok"

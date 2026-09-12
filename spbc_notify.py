@@ -1003,6 +1003,19 @@ def _status_body() -> dict:
         body["git_sha"] = sha
     if _catalog_cleanup_last is not None:
         body["catalog_cleanup"] = dict(_catalog_cleanup_last)
+    try:
+        import db as _db
+        import unicorn_shop
+
+        shop = unicorn_shop.find_catalog_shop()
+        if shop:
+            rows = _db.list_payment_methods(int(shop["chat_id"]), active_only=False)
+            body["payments"] = {
+                "active": sum(1 for m in rows if m.get("active")),
+                "total": len(rows),
+            }
+    except Exception:
+        pass
     return body
 
 
@@ -1065,7 +1078,11 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
                 getattr(exc, "reason", None) or exc,
                 err,
             )
-            return 401, {"ok": False, "error": err}
+            return 401, {
+                "ok": False,
+                "error": err,
+                "detail": str(getattr(exc, "reason", None) or err)[:80],
+            }
 
         buyer_id = int(buyer["user_id"])
         username = buyer.get("username")
@@ -1085,6 +1102,10 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             return 400, {"ok": False, "error": "bad payload"}
         if not items:
             return 400, {"ok": False, "error": "empty cart"}
+
+        if not db.list_payment_methods(shop_chat_id, active_only=True):
+            log.info("POST /order no payment methods shop=%s", shop_chat_id)
+            return 409, {"ok": False, "error": "no_payment_methods"}
 
         ship_name, ship_address, ship_notes = vendor_stores.parse_ship_fields(
             payload
@@ -1209,7 +1230,10 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
                 buyer_id,
             )
 
-        payments = vendor_stores.payment_display_lines(shop_chat_id)
+        pay_objs = vendor_stores.payment_methods_public(
+            shop_chat_id, total, code
+        )
+        payments = [p["line"] for p in pay_objs]
         invoice_sent = False
         try:
             import tg_payments
@@ -1228,6 +1252,7 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             "code": code,
             "total": total,
             "payments": payments,
+            "payment_methods": pay_objs,
             "message": message,
             "invoice_offered": bool(invoice_sent),
         }

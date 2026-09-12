@@ -169,6 +169,12 @@ class OrderHttpTests(unittest.TestCase):
         self.assertGreater(body["total"], 0)
         self.assertIsInstance(body["payments"], list)
         self.assertTrue(any("Venmo" in p for p in body["payments"]))
+        self.assertIsInstance(body.get("payment_methods"), list)
+        self.assertTrue(body["payment_methods"])
+        pm0 = body["payment_methods"][0]
+        self.assertEqual(pm0.get("name"), "Venmo")
+        self.assertIn(pm0.get("method_type"), ("venmo", "custom"))
+        self.assertTrue(pm0.get("line"))
         self.assertIn("Order received", body["message"])
         self.assertIn(body["code"], body["message"])
         self.assertIn("1 Test St", body["message"])
@@ -206,6 +212,20 @@ class OrderHttpTests(unittest.TestCase):
         buyer_tok = next(s[1] for s in vendor_sends if s[2] == BUYER)
         self.assertEqual(buyer_tok, VENDOR_TOKEN)
 
+    def test_no_payment_methods_409_does_not_create_order(self) -> None:
+        for m in db.list_payment_methods(SHOP, active_only=False):
+            db.delete_payment_method(m["id"])
+        code, body = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 409, body)
+        self.assertFalse(body.get("ok"))
+        self.assertEqual(body.get("error"), "no_payment_methods")
+        with db.get_db() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) AS c FROM orders WHERE chat_id = ?", (SHOP,)
+            ).fetchone()["c"]
+        self.assertEqual(n, 0)
+        self.assertEqual(self.sent, [])
+
     def test_tampered_init_data_401_no_order(self) -> None:
         good = build_valid_init_data(VENDOR_TOKEN)
         # Flip last hex char of hash
@@ -219,6 +239,7 @@ class OrderHttpTests(unittest.TestCase):
         self.assertEqual(code, 401)
         self.assertFalse(body.get("ok"))
         self.assertEqual(body.get("error"), "bad_hash")
+        self.assertTrue(body.get("detail"))
         with db.get_db() as conn:
             n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
         self.assertEqual(n, 0)
@@ -245,6 +266,7 @@ class OrderHttpTests(unittest.TestCase):
         self.assertEqual(code, 401)
         self.assertFalse(body.get("ok"))
         self.assertEqual(body.get("error"), "expired")
+        self.assertIn("expired", (body.get("detail") or "").lower())
         with db.get_db() as conn:
             n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
         self.assertEqual(n, 0)
@@ -256,6 +278,7 @@ class OrderHttpTests(unittest.TestCase):
         self.assertEqual(code, 401)
         self.assertFalse(body.get("ok"))
         self.assertEqual(body.get("error"), "bad_hash")
+        self.assertEqual(body.get("detail"), "missing initData or bot token")
         blobs = [" ".join(str(a) for a in (c.args or ())) for c in info.call_args_list]
         joined = " ".join(blobs)
         self.assertIn("reason=%s", joined)

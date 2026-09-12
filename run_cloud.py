@@ -19,6 +19,22 @@ import spbc_notify
 log = logging.getLogger("run_cloud")
 
 
+def _seed_unicorn_payments(shop_chat_id: int | None) -> dict | None:
+    """Idempotent Unicorn rails. No-op when shop id is missing.
+
+    Inserts Venmo/PayPal only if that method_type is absent (paused rows count).
+    Never deletes, never overwrites handles. Safe without UNICORN_CLAIM_TOKEN.
+    """
+    if not shop_chat_id:
+        return None
+    import webpanel
+
+    pay = webpanel.ensure_unicorn_shop_payments(int(shop_chat_id))
+    log.info("unicorn payments seed: %s", pay)
+    print(f"[run_cloud] unicorn payments seed: {pay}", flush=True)
+    return pay
+
+
 def _bind_unicorn_pages_storefront() -> None:
     """Point the Pages Mini App catalog key at the live Unicorn shop.
 
@@ -65,6 +81,7 @@ def _bind_unicorn_pages_storefront() -> None:
         f"products={n}",
         flush=True,
     )
+    _seed_unicorn_payments(sid)
 
 
 def _cleanup_unicorn_catalog() -> None:
@@ -147,22 +164,9 @@ def _bind_vendor_miniapps() -> None:
                 f"{result['storefront_key']}",
                 flush=True,
             )
-        # Seed payment rails she can edit anytime in her panel link
+        # Seed even when Pages bind already ran (idempotent by method_type).
         sid = result.get("shop_chat_id") or shop_id
-        if sid:
-            pay = webpanel.ensure_shop_payments(
-                int(sid),
-                [
-                    {"method_type": "venmo", "handle": "@wineboos"},
-                    {
-                        "method_type": "paypal",
-                        "handle": "unicornfartzz@proton.me",
-                        "network_note": "friends_family",
-                    },
-                ],
-            )
-            log.info("unicorn payments seed: %s", pay)
-            print(f"[run_cloud] unicorn payments seed: {pay}", flush=True)
+        _seed_unicorn_payments(sid)
 
     try:
         _cleanup_unicorn_catalog()

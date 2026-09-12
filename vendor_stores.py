@@ -79,6 +79,10 @@ INIT_DATA_MAX_AGE_SEC = 24 * 60 * 60
 # does not keep serving a cached checkout.
 STORE_URL_CACHE_BUST = "20260828"
 DEFAULT_UNICORN_STORE_URL = "https://remy-miniapp-demos.pages.dev/unicorn/"
+NO_PAYMENTS_BUYER_LINE = (
+    "No payment method is published yet. Message the seller — "
+    "do not send money until they reply."
+)
 
 
 def _normalize_store_url(url: str) -> str:
@@ -399,7 +403,7 @@ def build_customer_order_received_text(
         ]
         pay_txt = "\n".join(pay_lines)
     else:
-        pay_txt = "  • Payment details will be DM'd to you."
+        pay_txt = "  • " + NO_PAYMENTS_BUYER_LINE
 
     code = order.get("payment_code") or f"#{oid}"
     total_txt = _fmt_money(order.get("total", 0))
@@ -432,9 +436,33 @@ def build_customer_order_received_text(
 
 def payment_display_lines(shop_chat_id: int) -> list[str]:
     """Payment method lines for JSON responses (name: instructions)."""
-    pays = db.list_payment_methods(int(shop_chat_id))
+    return [p["line"] for p in payment_methods_public(shop_chat_id)]
+
+
+def payment_method_public(
+    method: dict, total: float = 0.0, code: str = ""
+) -> dict:
+    """Buyer-facing payment object (Mini App + POST /order)."""
+    mt, target = _method_kind_and_target(method)
+    name = method.get("name") or "Payment"
+    instr = (method.get("instructions") or "").strip()
+    line = f"{name}: {instr}".rstrip(": ")
+    return {
+        "name": name,
+        "method_type": mt or "custom",
+        "target": target or None,
+        "line": line,
+        "pay_url": payment_pay_link(method, total, code),
+    }
+
+
+def payment_methods_public(
+    shop_chat_id: int, total: float = 0.0, code: str = ""
+) -> list[dict]:
+    """Active payment methods as structured objects (empty list if none)."""
     return [
-        f"{p['name']}: {p['instructions']}".rstrip(": ") for p in pays
+        payment_method_public(p, total, code)
+        for p in db.list_payment_methods(int(shop_chat_id))
     ]
 
 
@@ -572,7 +600,7 @@ def build_customer_order_received_html(
     if pays:
         pay_txt = "\n".join(_payment_method_html(p, total, code) for p in pays)
     else:
-        pay_txt = "  • Payment details will be DM'd to you."
+        pay_txt = "  • " + NO_PAYMENTS_BUYER_LINE
 
     return (
         f"{emoji} <b>Order received!</b>\n\n"

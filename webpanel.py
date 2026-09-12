@@ -944,6 +944,13 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
             for p in products
         ],
         "payments": [m["name"] for m in payments],
+        "payment_methods": [
+            {
+                "name": m["name"],
+                "method_type": (m.get("method_type") or "custom"),
+            }
+            for m in payments
+        ],
     }
 
 
@@ -1064,6 +1071,7 @@ def api_state(tok: dict) -> tuple[int, dict]:
             "shipping_fee": float(shop.get("shipping_fee") or 0),
             "free_shipping_above": float(shop.get("free_shipping_above") or 0),
             "shipping_zones": db.parse_shipping_zones(shop),
+            "is_unicorn": _shop_is_unicorn(chat_id, shop.get("title")),
         },
         "products": [_product_public(p) for p in products],
         "payments": [
@@ -1360,8 +1368,22 @@ def _payment_payload_to_fields(payload: dict) -> dict[str, Any]:
     }
 
 
+def _shop_is_unicorn(chat_id: int, title: str | None = None) -> bool:
+    try:
+        import unicorn_shop
+
+        return unicorn_shop.is_unicorn_shop(int(chat_id), title)
+    except Exception:
+        return False
+
+
 def api_payment(tok: dict, payload: dict) -> tuple[int, dict]:
     chat_id = tok["chat_id"]
+    if payload.get("seed_defaults"):
+        if not _shop_is_unicorn(chat_id):
+            return _err(400, "Default rails are for the Unicorn shop only")
+        result = ensure_unicorn_shop_payments(int(chat_id))
+        return 200, {"ok": True, **result}
     mid = payload.get("id")
     if mid is not None:
         try:
@@ -1459,6 +1481,15 @@ def ensure_shop_payments(
         created.append(mt)
         by_type[mt] = rendered
     return {"ok": True, "created": created, "total": len(by_type)}
+
+
+def ensure_unicorn_shop_payments(chat_id: int) -> dict[str, Any]:
+    """Seed Unicorn Venmo/PayPal defaults. Idempotent; never deletes."""
+    import unicorn_shop
+
+    return ensure_shop_payments(
+        int(chat_id), list(unicorn_shop.DEFAULT_PAYMENT_METHODS)
+    )
 
 
 def api_shipping(tok: dict, payload: dict) -> tuple[int, dict]:
@@ -3037,6 +3068,8 @@ function render(){
   </div>
   <div class="card"><h2>Payment methods</h2>
     <p class="tag" style="margin:0 0 10px">Buyers see these at checkout. Edit anytime and hit Save — changes apply immediately.</p>
+    ${(S.payments||[]).filter(m=>m.active).length?'':'<p class="howto"><b>Buyers cannot pay.</b> Add at least one enabled method. Pause a seeded Venmo/PayPal row instead of deleting it.</p>'}
+    ${(S.shop&&S.shop.is_unicorn&&!(S.payments||[]).length)?'<div class="flex" style="margin-bottom:10px"><button type="button" id="pm-seed">✨ Seed Venmo + PayPal</button><span class="tag grow">Edit handles after — boot will not overwrite them</span></div>':''}
     <div id="paylist">${S.payments.map(m=>{
       const t=m.method_type||'custom';
       const handle=esc(m.handle||m.cashtag||'');
@@ -3313,6 +3346,12 @@ function wire(){
       if(!confirm('Delete this payment method?'))return;
       const d=await api('payment',{id:el.dataset.mid,delete:true});
       if(d.ok){toast('Deleted');load();}};});
+  const seedBtn=document.getElementById('pm-seed');
+  if(seedBtn) seedBtn.onclick=async()=>{
+    const d=await api('payment',{seed_defaults:true});
+    if(d.ok){toast('Seeded — edit handles anytime');load();}
+    else toast(d.error||'Could not seed',true);
+  };
   document.querySelectorAll('.pm-quick').forEach(btn=>{
     btn.onclick=async()=>{
       const t=btn.dataset.type;
