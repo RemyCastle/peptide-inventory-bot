@@ -657,6 +657,9 @@ def descriptions_block_ratio_merge(keeper: dict, other: dict) -> bool:
 def _disambiguate_name(cleaned: str, p: dict) -> str:
     """Keep sibling SKUs distinguishable when they share a cleaned name."""
     base = cleaned or display_product_name(str(p.get("name") or ""))
+    # Mini App groups variant_group; prices stay on each row. Don't jam $price.
+    if str(p.get("variant_group") or "").strip():
+        return base[:120]
     desc = " ".join(str(p.get("description") or "").split())
     snippet = desc[:28].strip(" ,;/-") if desc else ""
     if snippet and snippet.casefold() not in base.casefold():

@@ -1164,6 +1164,17 @@ def set_catalog_cleanup_result(result: dict | None) -> None:
     shop_title = result.get("shop_title")
     if shop_title:
         out["shop_title"] = str(shop_title)[:80]
+    ux = result.get("ux")
+    if isinstance(ux, dict):
+        slim_ux = {
+            "renames": int(ux.get("renames") or 0),
+            "categories": int(ux.get("categories") or 0),
+            "descriptions": int(ux.get("descriptions") or 0),
+            "photos": int(ux.get("photos") or 0),
+        }
+        if ux.get("skipped"):
+            slim_ux["skipped"] = str(ux.get("skipped"))[:80]
+        out["ux"] = slim_ux
     _catalog_cleanup_last = out
 
 
@@ -1796,6 +1807,24 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
             if ctype == "application/pdf":
                 # download rather than render: a PDF can carry active content
                 self.send_header("Content-Disposition", "attachment")
+            self.end_headers()
+            self.wfile.write(blob)
+            return
+        if path.startswith("/catalog-img/"):
+            import unicorn_catalog
+
+            name = path.rsplit("/", 1)[-1]
+            got = unicorn_catalog.read_catalog_image(name)
+            if got is None:
+                self._json(404, {"error": "not_found"}, cors=True)
+                return
+            blob, ctype = got
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "public, max-age=86400")
             self.end_headers()
             self.wfile.write(blob)
             return

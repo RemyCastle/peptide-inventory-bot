@@ -885,9 +885,12 @@ def product_list_keyboard(
     products: list,
     *,
     footer_rows: list | None = None,
+    header_rows: list | None = None,
 ) -> InlineKeyboardMarkup:
     """Shared product-card buttons used by Catalog and Search."""
     buttons = []
+    if header_rows:
+        buttons.extend(header_rows)
     for p in products:
         stock = int(p["stock"])
         guest = None
@@ -995,6 +998,14 @@ async def cb_catalog_sort(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _send_catalog(update, context, edit=True, page=0)
 
 
+async def cb_catalog_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    raw = (query.data or "")[len("catf:") :]
+    context.user_data["cat_filter"] = "" if raw in ("", "all") else raw
+    await query.answer("All" if not context.user_data["cat_filter"] else raw)
+    await _send_catalog(update, context, edit=True, page=0)
+
+
 async def _send_catalog(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1040,6 +1051,57 @@ async def _send_catalog(
         await _reply_or_edit(update, text, back_main_kb(extra), edit=edit)
         return
 
+    unicorn = False
+    try:
+        import unicorn_shop
+        import unicorn_catalog
+
+        unicorn = unicorn_shop.is_unicorn_shop(int(sid), shop.get("title"))
+    except Exception:
+        unicorn_catalog = None  # type: ignore[assignment]
+    chip_rows: list[list] = []
+    want_cat = str(context.user_data.get("cat_filter") or "")
+    if unicorn and unicorn_catalog is not None:
+        def _prod_cat(row: dict) -> str:
+            stored = str(row.get("category") or "").strip()
+            if stored in unicorn_catalog.CATEGORY_IDS:
+                return stored
+            return unicorn_catalog.categorize(str(row.get("name") or ""))
+
+        if want_cat and want_cat not in unicorn_catalog.CATEGORY_IDS:
+            want_cat = ""
+            context.user_data["cat_filter"] = ""
+        present = [
+            cid
+            for cid in unicorn_catalog.CATEGORY_IDS
+            if any(_prod_cat(p) == cid for p in products)
+        ]
+        if want_cat:
+            products = [p for p in products if _prod_cat(p) == want_cat]
+        chip_btns = [
+            InlineKeyboardButton(
+                catalog_cleanup.tg_button_text(
+                    ("• " if cid == want_cat else "")
+                    + unicorn_catalog.CATEGORY_LABEL[cid],
+                    24,
+                )
+                or cid,
+                callback_data=f"catf:{cid}",
+            )
+            for cid in present
+        ]
+        all_lab = catalog_cleanup.tg_button_text(
+            ("• " if not want_cat else "") + "🌈 All", 16
+        ) or "All"
+        row: list = [InlineKeyboardButton(all_lab, callback_data="catf:all")]
+        for btn in chip_btns:
+            row.append(btn)
+            if len(row) >= 3:
+                chip_rows.append(row)
+                row = []
+        if row:
+            chip_rows.append(row)
+
     total_n = len(products)
     page_size = max(1, int(CATALOG_TOP_N))
     sort_mode = context.user_data.get("cat_sort") or "pop"
@@ -1064,7 +1126,9 @@ async def _send_catalog(
         display_products.append(q)
 
     has_sales = any(int(v) > 0 for v in (sales or {}).values())
-    if sort_mode == "az":
+    if want_cat:
+        header = want_cat
+    elif sort_mode == "az":
         header = "A–Z"
     else:
         header = "Popular first" if has_sales else "Catalog"
@@ -1099,7 +1163,9 @@ async def _send_catalog(
         ]
     )
     footer.append([InlineKeyboardButton("« Menu", callback_data="main")])
-    kb = product_list_keyboard(display_products, footer_rows=footer)
+    kb = product_list_keyboard(
+        display_products, footer_rows=footer, header_rows=chip_rows or None
+    )
     await _reply_or_edit(update, text, kb, edit=edit)
 
 
@@ -7735,6 +7801,12 @@ def build_app(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(cb_catalog, pattern=r"^cat$"))
     app.add_handler(CallbackQueryHandler(cb_catalog_page, pattern=r"^catp:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_catalog_sort, pattern=r"^catsort:(az|pop)$"))
+    app.add_handler(
+        CallbackQueryHandler(
+            cb_catalog_filter,
+            pattern=r"^catf:(all|GLP-1|Retatrutide|Healing|Cognition|Skin|Metabolic|Longevity|Vitality|Tabs|BAC-water|Accessories)$",
+        )
+    )
     app.add_handler(CallbackQueryHandler(cb_adm_more, pattern=r"^adm_more$"))
     app.add_handler(CallbackQueryHandler(cb_reorder, pattern=r"^reorder:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_mark_shipped, pattern=r"^markship:\d+$"))

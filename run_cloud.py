@@ -110,6 +110,21 @@ def _cleanup_unicorn_catalog() -> None:
         titled = None
     if titled:
         clean["shop_title"] = titled
+    try:
+        import unicorn_catalog
+
+        ux = unicorn_catalog.apply_catalog_ux(sid)
+        clean["ux"] = {
+            "renames": int(ux.get("renames") or 0),
+            "categories": int(ux.get("categories") or 0),
+            "descriptions": int(ux.get("descriptions") or 0),
+            "photos": int(ux.get("photos") or 0),
+        }
+        log.info("unicorn catalog ux: %s", ux)
+        print(f"[run_cloud] unicorn catalog ux: {ux}", flush=True)
+    except Exception:
+        log.exception("unicorn catalog ux failed (continuing boot)")
+        clean["ux"] = {"ok": False, "skipped": "ux error"}
     spbc_notify.set_catalog_cleanup_result(clean)
     log.info("unicorn catalog cleanup: %s", clean)
     print(f"[run_cloud] unicorn catalog cleanup: {clean}", flush=True)

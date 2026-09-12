@@ -166,6 +166,11 @@ class StorefrontBindTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertGreater(len(body["products"]), 0)
         self.assertEqual(body["products"][0]["name"], "Klow 80mg")
+        self.assertEqual(body["products"][0]["category"], "Skin")
+        self.assertTrue(body["products"][0]["description"])
+        self.assertIn("/catalog-img/", body["products"][0]["photo_url"])
+        self.assertTrue(body.get("categories"))
+        self.assertTrue(any(c.get("id") == "Skin" for c in body["categories"]))
 
     def test_unknown_key_still_404(self) -> None:
         code, body = webpanel.api_storefront("ffffffffffffffffffffffff")
@@ -299,6 +304,8 @@ class HealthHostTests(unittest.TestCase):
     def test_dockerfile_copies_catalog_cleanup(self) -> None:
         text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("catalog_cleanup.py", text)
+        self.assertIn("unicorn_catalog.py", text)
+        self.assertIn("static/catalog", text)
 
     def test_boot_cleanup_applies_when_owner_ids_unset(self) -> None:
         """Render Unicorn often has empty OWNER_IDS; boot must still clean."""
@@ -368,6 +375,10 @@ class MiniAppPagesContractTests(unittest.TestCase):
         self.assertIn("can_mark_paid", self.src)
         self.assertIn("I've paid", self.src)
         self.assertIn("copytarget", self.src)
+        self.assertIn("d.categories", self.src)
+        self.assertIn("photo_url", self.src)
+        self.assertIn("CAT_CHIPS", self.src)
+        self.assertIn("Retatrutide", self.src)
 
     def test_drops_mockup_copy(self) -> None:
         low = self.src.lower()

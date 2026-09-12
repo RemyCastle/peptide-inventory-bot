@@ -973,17 +973,43 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
     products = db.apply_available_stock(db.list_products(chat_id, active_only=True))
     payments = vendor_stores.usable_payment_methods(chat_id)
     checkout_ready = vendor_stores.shop_checkout_ready(chat_id)
+    unicorn = False
     try:
         from catalog_cleanup import buyer_shop_title
         import unicorn_shop
 
+        unicorn = unicorn_shop.is_unicorn_shop(chat_id, shop.get("title"))
         shop_title = buyer_shop_title(
             shop.get("title"),
-            unicorn=unicorn_shop.is_unicorn_shop(chat_id, shop.get("title")),
+            unicorn=unicorn,
         )
     except Exception:
         shop_title = shop["title"]
-    return 200, {
+    public_products = []
+    for p in products:
+        item = {
+            "id": int(p["id"]),
+            "name": _buyer_product_name(p),
+            "price": float(p["price"]),
+            "kit_price": (float(p["kit_price"]) if p.get("kit_price") else None),
+            "stock": int(p.get("stock") or 0),
+            "sku": _buyer_field(p.get("sku"), 40),
+            "variant_group": _buyer_field(p.get("variant_group"), 80),
+            "variant_label": _buyer_field(p.get("variant_label"), 80),
+            "photo_url": _buyer_http_url(p.get("photo_file_id")),
+            "category": _buyer_field(p.get("category"), 40),
+            "description": _buyer_field(p.get("description"), 220) or "",
+            "sort_order": int(p.get("sort_order") or 0),
+        }
+        if unicorn:
+            try:
+                import unicorn_catalog
+
+                item = unicorn_catalog.enrich_public_product(item, p)
+            except Exception:
+                pass
+        public_products.append(item)
+    body = {
         "ok": True,
         "shop": {
             "title": shop_title,
@@ -996,22 +1022,7 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
             or "Standard shipping",
             "shipping_zones": _buyer_zones(db.parse_shipping_zones(shop)),
         },
-        "products": [
-            {
-                "id": int(p["id"]),
-                "name": _buyer_product_name(p),
-                "price": float(p["price"]),
-                "kit_price": (float(p["kit_price"]) if p.get("kit_price") else None),
-                "stock": int(p.get("stock") or 0),
-                "sku": _buyer_field(p.get("sku"), 40),
-                "variant_group": _buyer_field(p.get("variant_group"), 80),
-                "variant_label": _buyer_field(p.get("variant_label"), 80),
-                "photo_url": _buyer_http_url(p.get("photo_file_id")),
-                "category": _buyer_field(p.get("category"), 40),
-                "sort_order": int(p.get("sort_order") or 0),
-            }
-            for p in products
-        ],
+        "products": public_products,
         "checkout_ready": checkout_ready,
         "message": vendor_stores.storefront_checkout_message(checkout_ready),
         "invoices_enabled": vendor_stores.public_invoices_enabled(),
@@ -1025,6 +1036,14 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
             for m in payments
         ],
     }
+    if unicorn:
+        try:
+            import unicorn_catalog
+
+            body["categories"] = unicorn_catalog.public_categories(public_products)
+        except Exception:
+            body["categories"] = []
+    return 200, body
 
 
 def api_order_status(raw_key: str, payment_code: str) -> tuple[int, dict]:
