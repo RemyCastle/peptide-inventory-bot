@@ -125,7 +125,10 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "ghk",
             "ghkcu",
+            "ahk",
             "ahkcu",
+            "ahk-cu",
+            "ahk cu",
             "glow",
             "klow",
             "snap 8",
@@ -259,6 +262,7 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "chioctocin",
             "atp-s",
             "atp s",
+            "atps",
             "lady test",
             "test e",
             "test cyp",
@@ -520,24 +524,63 @@ _SPECIAL_DESC: dict[str, str] = {
     "bac water 2ml": "A pocket-size mixer vial. Small pour, full sparkle.",
 }
 
+# Specific first. _has keeps "sema" from stealing "semax".
+_COMPOUND_BLURB: tuple[tuple[str, str], ...] = (
+    (
+        "ahk",
+        "Copper tripeptide (AHK-Cu) on the skin-and-hair shelf. Research-only.",
+    ),
+    (
+        "ghk basic",
+        "Copper-free GHK on the skin-and-hair shelf. Research-only.",
+    ),
+    (
+        "ghk",
+        "Copper-blue GHK-Cu on the skin-and-hair shelf. Research-only.",
+    ),
+    (
+        "atp-s",
+        "ATP-S injectable on the cellular-energy shelf. Research-only.",
+    ),
+    (
+        "atps",
+        "ATP-S injectable on the cellular-energy shelf. Research-only.",
+    ),
+)
+
 
 def _hay(name: str) -> str:
     s = display_product_name(name).casefold()
     s = s.replace("–", "-").replace("—", "-")
+    s = re.sub(r"\s*-\s*", "-", s)
     return " ".join(s.split())
+
+
+def _compact(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.casefold())
 
 
 def _has(hay: str, needle: str) -> bool:
     n = needle.casefold().strip()
     if not n:
         return False
+    n = re.sub(r"\s*-\s*", "-", n)
     if re.search(r"[^a-z0-9]", n):
-        return n in hay
-    return re.search(rf"(?<![a-z0-9]){re.escape(n)}(?![a-z])", hay) is not None
+        if n in hay:
+            return True
+        cn = _compact(n)
+        ch = _compact(hay)
+        if not cn:
+            return False
+        return re.search(rf"(?<![a-z0-9]){re.escape(cn)}(?![a-z])", ch) is not None
+    if re.search(rf"(?<![a-z0-9]){re.escape(n)}(?![a-z])", hay):
+        return True
+    ch = _compact(hay)
+    return re.search(rf"(?<![a-z0-9]){re.escape(n)}(?![a-z])", ch) is not None
 
 
-def categorize(name: str) -> str:
-    """Honest shelf for a Unicorn SKU. Never returns a junk 'Other' bucket."""
+def _categorize_one(name: str) -> str:
+    """Honest shelf for one spelling. Never returns a junk 'Other' bucket."""
     hay = _hay(name)
     if not hay:
         return "Accessories"
@@ -550,10 +593,22 @@ def categorize(name: str) -> str:
     for cat, needles in _RULES:
         if any(_has(hay, n) for n in needles):
             return cat
-    # Peptide-shaped leftovers (mg / ml / blend) live on Healing, not a junk bin.
-    if re.search(r"\b(\d+\s*)?(mg|ml|iu|blend|vial)\b", hay):
+    # Peptide-shaped leftovers (mg / ml / g / blend) live on Healing, not gadgets.
+    if re.search(r"\b(\d+\s*)?(mg|mcg|ml|iu|g|blend|vial)\b", hay):
         return "Healing"
     return "Accessories"
+
+
+def categorize(name: str) -> str:
+    """Honest shelf. Uses Title Case spelling so AHK-Cu / ATP-S survive rename."""
+    pretty = pretty_name(name) if name else ""
+    for cand in (pretty, name):
+        if not cand:
+            continue
+        cat = _categorize_one(cand)
+        if cat != "Accessories":
+            return cat
+    return _categorize_one(pretty or name or "")
 
 
 def _fix_typos(text: str) -> str:
@@ -647,17 +702,56 @@ def pretty_name(name: str) -> str:
     return title_case_product_name(cleaned)
 
 
+def _format_note(hay: str) -> str:
+    if _has(hay, "kit"):
+        return "Packed as a kit."
+    if any(_has(hay, n) for n in ("cream", "serum", "filler", "tret")):
+        return "Topical format."
+    if any(_has(hay, n) for n in ("tab", "tabs", "capsule", "capsules")):
+        return "Tablet / capsule format."
+    if any(_has(hay, n) for n in ("ampoule", "ampule")):
+        return "Ampoule format."
+    if any(
+        _has(hay, n)
+        for n in ("case", "container", "flexi", "pen", "applicator", "roller")
+    ):
+        return "Factory gadget."
+    if any(_has(hay, n) for n in ("water", "saline", "buffer", "bac")):
+        return "Mixer vial."
+    if any(_has(hay, n) for n in ("vial", "inj", "injectable", "mg", "ml", "iu")):
+        return "Ships as a vial."
+    return ""
+
+
 def item_description(name: str, category: str | None = None) -> str:
-    """Short Unicorn voice. No medical claims."""
+    """Short Unicorn voice. Matches the product. No medical claims."""
     pretty = pretty_name(name)
     key = " ".join(clean_product_name(name).casefold().split())
+    pretty_key = " ".join(pretty.casefold().split())
     if key in _SPECIAL_DESC:
         return _SPECIAL_DESC[key]
+    if pretty_key in _SPECIAL_DESC:
+        return _SPECIAL_DESC[pretty_key]
     cat = category or categorize(name)
-    beats = _FLAIR.get(cat) or _FLAIR["Vitality"]
-    beat = beats[abs(hash(pretty)) % len(beats)]
-    text = f"{pretty} — {beat}"
-    return storefront_label(text, 220) or beat
+    inferred = categorize(pretty)
+    if cat == "Accessories" and inferred != "Accessories":
+        cat = inferred
+    hay = _hay(pretty)
+    for needle, blurb in _COMPOUND_BLURB:
+        if _has(hay, needle):
+            return storefront_label(f"{pretty} — {blurb}", 220) or blurb
+    tag = CATEGORY_TAG.get(cat) or "Factory sparkle"
+    note = _format_note(hay)
+    if cat == "Accessories":
+        text = f"{pretty} — {tag}."
+        if note:
+            text += f" {note}"
+    else:
+        text = f"{pretty} — {tag}."
+        if note:
+            text += f" {note}"
+        text += " Research-shelf only."
+    return storefront_label(text, 220) or tag
 
 
 def image_slug(name: str, category: str | None = None) -> str:
@@ -761,10 +855,18 @@ def enrich_public_product(public: dict, row: dict) -> dict:
     """Fill Unicorn buyer fields without changing price/stock."""
     raw_name = str(row.get("name") or public.get("name") or "")
     name = pretty_name(raw_name)
+    inferred = categorize(raw_name)
     stored_cat = storefront_label(row.get("category"), 40) or ""
-    cat = stored_cat or categorize(raw_name)
+    # Honest shelf wins over a leftover Accessories misfile.
+    cat = inferred if (not stored_cat or stored_cat == "Accessories") else stored_cat
+    if stored_cat == "Accessories" and inferred != "Accessories":
+        cat = inferred
     stored_desc = storefront_label(row.get("description"), 220) or ""
     desc = stored_desc or item_description(raw_name, cat)
+    if cat != "Accessories" and re.search(
+        r"gadget|hardware|tidier magic", desc, re.I
+    ):
+        desc = item_description(raw_name, cat)
     photo = str(public.get("photo_url") or "").strip()
     raw_photo = str(row.get("photo_file_id") or "").strip()
     if not photo.lower().startswith("http") and not raw_photo:
@@ -797,7 +899,7 @@ def plan_catalog_ux(products: list[dict]) -> list[dict]:
         if int(p.get("active") or 0) != 1:
             continue
         pretty = pretty_name(str(p.get("name") or ""))
-        cat = categorize(str(p.get("name") or ""))
+        cat = categorize(pretty or str(p.get("name") or ""))
         prepped.append((p, pretty, cat))
         counts[pretty.casefold()] = counts.get(pretty.casefold(), 0) + 1
 

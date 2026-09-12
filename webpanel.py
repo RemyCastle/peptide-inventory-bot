@@ -3116,6 +3116,9 @@ PANEL_HTML = """<!doctype html>
   .ord:first-child{border-top:0;padding-top:0;margin-top:0}
   .ord h3{font-size:.95rem;margin:0 0 4px}
   .hide{display:none!important}
+  #tab-settings .card{display:block}
+  #tab-settings h2{font-size:1.05rem}
+  #tab-settings label{color:var(--ink);font-weight:600}
 </style>
 </head>
 <body>
@@ -3310,9 +3313,15 @@ function applyCatalogFilter(){
 function render(){
   $('#title').textContent=S.shop.title||'Shop Panel';
   try{document.title=(S.shop.title||'Shop')+' · Panel';}catch(e){}
-  const sh=S.shop;
+  const sh=Object.assign({
+    title:'',shipping_enabled:0,shipping_fee:0,free_shipping_above:0,
+    shipping_label:'Standard shipping',min_order_qty:0,min_order_label:'vial',
+    low_stock_threshold:0
+  },S.shop||{});
   const range=defaultRange();
   const actionable=ORDERS.filter(o=>o.status==='pending_payment'||o.status==='awaiting_confirmation').length;
+  const payRows=S.payments||[];
+  const products=S.products||[];
   $('#app').innerHTML=`
   <div class="tabs">
     <button type="button" data-tab="orders" class="${TAB==='orders'?'on':''}">
@@ -3324,7 +3333,45 @@ function render(){
     <button type="button" data-tab="settings" class="${TAB==='settings'?'on':''}">
       Settings</button>
   </div>
-  <div id="tab-orders" class="${TAB==='orders'?'':'hide'}">
+  ${TAB==='settings'?`<div id="tab-settings">
+  <div class="card"><h2>Shop</h2>
+    <div class="row"><div class="name"><label>Shop name</label>
+      <input id="shop-title" value="${esc(sh.title)}"></div>
+      <div><button class="sub" id="shop-save">Save</button></div></div>
+    <span class="tag">Name buyers see on the storefront and receipts.</span>
+  </div>
+  <div class="card"><h2>Shipping</h2>
+    <div class="row">
+      <div><label>Enabled</label><label class="flex" style="margin:0">
+        <input type="checkbox" id="sh-on" style="width:auto"
+        ${sh.shipping_enabled?'checked':''}> charge shipping</label></div>
+      <div class="num"><label>Fee</label>
+        <input id="sh-fee" type="number" step="0.01" min="0" value="${sh.shipping_fee}"></div>
+      <div class="num"><label>Free over</label>
+        <input id="sh-free" type="number" step="0.01" min="0" value="${sh.free_shipping_above}"></div>
+    </div>
+    <div class="row">
+      <div class="name"><label>Shipping label</label>
+        <input id="sh-label" value="${esc(sh.shipping_label||'Standard shipping')}"
+          maxlength="40" placeholder="Standard shipping"></div>
+      <div><button class="sub" id="sh-save">Save</button></div></div>
+    <span class="tag">Changes apply to new checkouts immediately.</span>
+  </div>
+  <div class="card"><h2>Orders</h2>
+    <div class="row">
+      <div class="num"><label>Min order qty</label>
+        <input id="min-qty" type="number" step="1" min="0" value="${sh.min_order_qty||0}"></div>
+      <div class="name"><label>Min order unit</label>
+        <input id="min-label" value="${esc(sh.min_order_label||'vial')}" maxlength="20"
+          placeholder="vial"></div>
+      <div class="num" style="max-width:120px"><label>Low-stock alert</label>
+        <input id="low-stock" type="number" step="1" min="0"
+          value="${sh.low_stock_threshold||0}"></div>
+      <div><button class="sub" id="ord-set-save">Save</button></div></div>
+    <span class="tag">Min qty 0 = no minimum. Low-stock alerts when shelf count hits this number.</span>
+  </div>
+  </div>`:''}
+  ${TAB==='orders'?`<div id="tab-orders">
   <div class="card"><h2>Orders</h2>
     <p class="tag" style="margin:0 0 10px">Confirm payments and add tracking.
       The customer is messaged on your storefront bot automatically.</p>
@@ -3348,17 +3395,20 @@ function render(){
     </div>
     <span class="tag">One readable block per order in the date range.</span>
   </div>
-  </div>
-  <div id="tab-catalog" class="${TAB==='catalog'?'':'hide'}">
-  <div class="card"><h2>Products (${S.products.length})</h2>
+  </div>`:''}
+  ${TAB==='catalog'?`<div id="tab-catalog">
+  <div class="card"><h2>Products (${products.length})</h2>
     <p class="howto" id="stock-howto"><b>How to set stock</b>
       Count the vials on the shelf. Type that number in Stock. Tap Save.
       Stock is vials, not kits. A kit is 10 vials, so 90 vials shows as
       9 kits in the shop.</p>
     <datalist id="cat-suggestions">
-      <option value="GLP-1"><option value="Recovery"><option value="Longevity">
-      <option value="Blends"><option value="Peptides"><option value="Supplies">
-      <option value="Other">
+      <option value="GLP-1"></option><option value="Retatrutide"></option>
+      <option value="Healing"></option><option value="Cognition"></option>
+      <option value="Skin"></option><option value="Metabolic"></option>
+      <option value="Longevity"></option><option value="Vitality"></option>
+      <option value="Tabs"></option><option value="BAC-water"></option>
+      <option value="Accessories"></option>
     </datalist>
     <div class="row" style="margin-bottom:10px">
       <div class="name"><label>Find in catalog</label>
@@ -3377,7 +3427,7 @@ function render(){
         current number. To set the exact shelf count, use Stock and Save
         on the list below.</div>
       <div class="tag" style="margin-bottom:6px">Blank = unchanged.</div>
-      ${S.products.map(p=>`<div class="row rs" data-id="${p.id}">
+      ${products.map(p=>`<div class="row rs" data-id="${p.id}">
         <div class="name"><label>${esc(p.name)}</label>
           <span class="tag">now: ${p.stock}</span></div>
         <div class="num"><label>+ arrived</label>
@@ -3389,7 +3439,7 @@ function render(){
         <button id="restock-go">✅ Apply shipment</button>
       </div>
     </div>
-    <div id="plist">${S.products.map(p=>prodRow(p,catalogDups())).join('')}</div>
+    <div id="plist">${products.map(p=>prodRow(p,catalogDups())).join('')}</div>
     <div class="prod"><div class="row">
       <div class="name"><label>New product</label><input id="np-name" placeholder="BPC-157 10MG"></div>
       <div class="num"><label>Price / vial</label><input id="np-price" type="number" step="0.01" min="0"></div>
@@ -3405,19 +3455,19 @@ function render(){
           Add <b>kit:294</b> for kit pricing.</span>
         <button class="sub" id="bulk-go">Import</button></div></div>
   </div>
-  </div>
-  <div id="tab-payments" class="${TAB==='payments'?'':'hide'}">
+  </div>`:''}
+  ${TAB==='payments'?`<div id="tab-payments">
   <div class="card"><h2>Payment methods</h2>
     <p class="tag" style="margin:0 0 10px">Buyers see these at checkout. Edit anytime and hit Save — changes apply immediately.</p>
-    ${(()=>{const enabled=(S.payments||[]).filter(m=>m.active);
+    ${(()=>{const enabled=payRows.filter(m=>m.active);
       const usable=enabled.filter(m=>m.rail_ready!==false);
       if(!enabled.length) return '<p class="howto"><b>Buyers cannot pay.</b> Add at least one enabled method. Pause a seeded Venmo/PayPal row instead of deleting it.</p>';
       if(!usable.length) return '<p class="howto"><b>Buyers cannot pay.</b> Enabled methods have no pay target. Add a handle, cashtag, email, phone, or wallet (or instructions on a custom method).</p>';
       return '';})()}
-    ${(()=>{const types=new Set((S.payments||[]).map(m=>String(m.method_type||'').toLowerCase()));
+    ${(()=>{const types=new Set(payRows.map(m=>String(m.method_type||'').toLowerCase()));
       return (S.shop&&S.shop.is_unicorn&&(!types.has('venmo')||!types.has('paypal')))
         ?'<div class="flex" style="margin-bottom:10px"><button type="button" id="pm-seed">✨ Seed Venmo + PayPal</button><span class="tag grow">Edit Venmo and PayPal after — boot will not overwrite them</span></div>':'';})()}
-    <div id="paylist">${S.payments.map(m=>{
+    <div id="paylist">${payRows.map(m=>{
       const t=m.method_type||'custom';
       const tc=payTargetCopy(t);
       const handle=esc(m.handle||m.cashtag||'');
@@ -3478,45 +3528,7 @@ function render(){
       <span class="tag">You can change any method anytime — just edit and Save.</span>
     </div>
   </div>
-  </div>
-  <div id="tab-settings" class="${TAB==='settings'?'':'hide'}">
-  <div class="card"><h2>Shop</h2>
-    <div class="row"><div class="name"><label>Shop name</label>
-      <input id="shop-title" value="${esc(sh.title)}"></div>
-      <div><button class="sub" id="shop-save">Save</button></div></div>
-    <span class="tag">Name buyers see on the storefront and receipts.</span>
-  </div>
-  <div class="card"><h2>Shipping</h2>
-    <div class="row">
-      <div><label>&nbsp;</label><label class="flex" style="margin:0">
-        <input type="checkbox" id="sh-on" style="width:auto"
-        ${sh.shipping_enabled?'checked':''}> charge shipping</label></div>
-      <div class="num"><label>Fee</label>
-        <input id="sh-fee" type="number" step="0.01" min="0" value="${sh.shipping_fee}"></div>
-      <div class="num"><label>Free over</label>
-        <input id="sh-free" type="number" step="0.01" min="0" value="${sh.free_shipping_above}"></div>
-    </div>
-    <div class="row">
-      <div class="name"><label>Shipping label</label>
-        <input id="sh-label" value="${esc(sh.shipping_label||'Standard shipping')}"
-          maxlength="40" placeholder="Standard shipping"></div>
-      <div><button class="sub" id="sh-save">Save</button></div></div>
-    <span class="tag">Changes apply to new checkouts immediately.</span>
-  </div>
-  <div class="card"><h2>Orders</h2>
-    <div class="row">
-      <div class="num"><label>Min order qty</label>
-        <input id="min-qty" type="number" step="1" min="0" value="${sh.min_order_qty||0}"></div>
-      <div class="name"><label>Min order unit</label>
-        <input id="min-label" value="${esc(sh.min_order_label||'vial')}" maxlength="20"
-          placeholder="vial"></div>
-      <div class="num" style="max-width:120px"><label>Low-stock alert</label>
-        <input id="low-stock" type="number" step="1" min="0"
-          value="${sh.low_stock_threshold||0}"></div>
-      <div><button class="sub" id="ord-set-save">Save</button></div></div>
-    <span class="tag">Min qty 0 = no minimum. Low-stock alerts when shelf count hits this number.</span>
-  </div>
-  </div>`;
+  </div>`:''}`;
   wire();}
 // Read a file, shrinking images client-side so phone photos upload fast
 function pickFile(accept,resize){

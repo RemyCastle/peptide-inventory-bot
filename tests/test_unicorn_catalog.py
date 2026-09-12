@@ -284,6 +284,50 @@ class CategorizeTests(unittest.TestCase):
         self.assertEqual(uc.categorize("AOD water 10ml"), "BAC-water")
         self.assertEqual(uc.categorize("Aod 5mg"), "Metabolic")
 
+    def test_ahk_cu_is_skin_not_accessories(self) -> None:
+        for name in (
+            "AhkCu",
+            "AHK-Cu",
+            "AHK- Cu",
+            "AHK-Cu 100mg",
+            "AHK-Cu 1g",
+            "ahk cu",
+        ):
+            self.assertEqual(uc.categorize(name), "Skin", msg=name)
+            self.assertEqual(uc.categorize(uc.pretty_name(name)), "Skin", msg=name)
+            desc = uc.item_description(name).casefold()
+            self.assertNotIn("gadget", desc, msg=name)
+            self.assertNotIn("hardware", desc, msg=name)
+            self.assertTrue(
+                "skin" in desc or "copper" in desc or "ahk" in desc, msg=desc
+            )
+
+    def test_atp_s_is_vitality_not_accessories(self) -> None:
+        for name in ("ATP-S inj", "ATP-S Inj", "ATP-S", "atp- s inj", "ATP- S Inj"):
+            self.assertEqual(uc.categorize(name), "Vitality", msg=name)
+            self.assertEqual(uc.categorize(uc.pretty_name(name)), "Vitality", msg=name)
+            desc = uc.item_description(name).casefold()
+            self.assertNotIn("gadget", desc, msg=name)
+            self.assertNotIn("hardware", desc, msg=name)
+            self.assertTrue("atp" in desc or "energy" in desc, msg=desc)
+
+    def test_pretty_names_keep_live_shelves(self) -> None:
+        bad = []
+        for name, want in LIVE_NAMES:
+            pretty = uc.pretty_name(name)
+            got = uc.categorize(pretty)
+            if got != want:
+                bad.append((name, pretty, want, got))
+        self.assertEqual(bad, [], msg=bad[:12])
+
+    def test_non_accessory_descriptions_are_not_gadgets(self) -> None:
+        for name, want in LIVE_NAMES:
+            if want == "Accessories":
+                continue
+            desc = uc.item_description(name).casefold()
+            self.assertNotIn("gadget", desc, msg=name)
+            self.assertNotIn("tidier magic", desc, msg=name)
+
 
 class PrettyNameTests(unittest.TestCase):
     def test_title_case_and_typos(self) -> None:
@@ -335,6 +379,16 @@ class ApplyUxTests(unittest.TestCase):
         self.reta = db.add_product(UNICORN, "reta 30", 28.0, 4)
         self.mt_a = db.add_product(UNICORN, "MT1 ($11.00)", 11.0, 3)
         self.mt_b = db.add_product(UNICORN, "MT1 ($30.00)", 30.0, 3)
+        self.ahk = db.add_product(UNICORN, "AhkCu", 10.0, 5)
+        db.update_product(self.ahk, category="Accessories")
+        self.atp = db.add_product(
+            UNICORN,
+            "atp- s inj",
+            30.0,
+            4,
+            description="ATP-S Inj — Factory gadgets for a tidier magic shelf.",
+        )
+        db.update_product(self.atp, category="Accessories")
         self.other = db.add_product(OTHER, "sema 10mg", 99.0, 8)
 
     def tearDown(self) -> None:
@@ -357,6 +411,17 @@ class ApplyUxTests(unittest.TestCase):
         self.assertEqual(other["name"], "sema 10mg")
         self.assertIsNone(other.get("category"))
         self.assertEqual(float(other["price"]), 99.0)
+        ahk = db.get_product(self.ahk)
+        self.assertEqual(float(ahk["price"]), 10.0)
+        self.assertEqual(ahk["category"], "Skin")
+        self.assertEqual(ahk["name"], "AHK-Cu")
+        self.assertNotIn("gadget", (ahk.get("description") or "").lower())
+        atp = db.get_product(self.atp)
+        self.assertEqual(float(atp["price"]), 30.0)
+        self.assertEqual(atp["category"], "Vitality")
+        self.assertEqual(atp["name"], "ATP-S Inj")
+        self.assertNotIn("gadget", (atp.get("description") or "").lower())
+        self.assertIn("ATP", atp.get("description") or "")
 
     def test_sibling_mt1_keeps_both_prices(self) -> None:
         uc.apply_catalog_ux(UNICORN)
@@ -391,6 +456,12 @@ class ApplyUxTests(unittest.TestCase):
         self.assertEqual(by_id[self.sema]["category"], "GLP-1")
         self.assertTrue(by_id[self.sema]["description"])
         self.assertTrue(by_id[self.sema]["photo_url"].startswith("http"))
+        self.assertEqual(by_id[self.ahk]["price"], 10.0)
+        self.assertEqual(by_id[self.ahk]["category"], "Skin")
+        self.assertNotIn("gadget", (by_id[self.ahk]["description"] or "").lower())
+        self.assertEqual(by_id[self.atp]["price"], 30.0)
+        self.assertEqual(by_id[self.atp]["category"], "Vitality")
+        self.assertNotIn("gadget", (by_id[self.atp]["description"] or "").lower())
         ids = {c["id"] for c in body["categories"]}
         self.assertIn("GLP-1", ids)
         self.assertIn("Retatrutide", ids)

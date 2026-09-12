@@ -887,6 +887,7 @@ class HttpLayerTests(WebPanelBase):
         self.assertIn('data-tab="payments"', html)
         self.assertIn('id="tab-payments"', html)
         self.assertIn('id="tab-settings"', html)
+        self.assertIn('id="shop-title"', html)
         self.assertIn('id="sh-label"', html)
         self.assertIn('id="sh-fee"', html)
         self.assertIn('id="sh-free"', html)
@@ -895,13 +896,31 @@ class HttpLayerTests(WebPanelBase):
         self.assertIn('id="min-label"', html)
         self.assertIn('id="low-stock"', html)
         self.assertIn("Low-stock alert", html)
+        self.assertIn("Shop name", html)
+        self.assertIn("Free over", html)
+        self.assertIn("charge shipping", html)
         pay_at = html.find('id="tab-payments"')
         settings_at = html.find('id="tab-settings"')
         methods_at = html.find("Payment methods")
         self.assertGreater(pay_at, 0)
-        self.assertGreater(settings_at, pay_at)
+        self.assertGreater(settings_at, 0)
+        # Settings is its own TAB branch, never nested inside Payments/Catalog.
+        self.assertIn("TAB==='settings'", html)
+        self.assertIn("TAB==='payments'", html)
+        self.assertLess(settings_at, pay_at)
         self.assertGreater(methods_at, pay_at)
-        self.assertLess(methods_at, settings_at)
+
+    def test_panel_settings_not_inside_payments_branch(self):
+        html = webpanel.PANEL_HTML
+        settings_at = html.find('id="tab-settings"')
+        payments_at = html.find('id="tab-payments"')
+        shop_at = html.find('id="shop-title"')
+        fee_at = html.find('id="sh-fee"')
+        self.assertLess(settings_at, payments_at)
+        self.assertLess(shop_at, payments_at)
+        self.assertLess(fee_at, payments_at)
+        self.assertGreater(html.find('id="low-stock"'), settings_at)
+        self.assertLess(html.find('id="low-stock"'), payments_at)
 
     def test_state_json_declares_utf8(self):
         raw = webpanel.issue_token(SHOP, USER)
