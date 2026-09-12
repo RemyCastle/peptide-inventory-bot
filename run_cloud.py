@@ -179,7 +179,13 @@ def _bind_vendor_miniapps() -> None:
     redeem only. Catalog uses a separate storefront_key returned in the result
     (copy into Cloudflare Pages — never put the claim token in public HTML).
     """
+    import db
     import webpanel
+
+    try:
+        db.init_db()
+    except Exception:
+        log.exception("init_db failed (continuing boot)")
 
     try:
         _bind_unicorn_pages_storefront()

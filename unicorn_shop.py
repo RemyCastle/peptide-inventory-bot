@@ -329,6 +329,7 @@ def keep_only_catalog_shop() -> dict:
     those rows. Soft-sets shops.active=0 on every non-keeper shop. Never
     DELETE shops, products, or inventory.db. Idempotent.
     """
+    db.init_db()
     shop = find_catalog_shop()
     if not shop:
         return {
@@ -381,6 +382,9 @@ def keep_only_catalog_shop() -> dict:
                     )
                     deactivated += 1
     except Exception:
+        import logging
+
+        logging.getLogger("unicorn_shop").exception("keep_only catalog failed")
         return {
             "ok": False,
             "skipped": "reattach failed",
@@ -490,6 +494,22 @@ def _index_has_stock(idx: dict[str, dict[str, int]]) -> bool:
     return bool(idx.get("sku") or idx.get("name"))
 
 
+def _index_matches_live(idx: dict[str, dict[str, int]], live: list[dict]) -> bool:
+    """True when at least one live catalog row shares a sku/name with idx."""
+    sku_idx = idx.get("sku") or {}
+    name_idx = idx.get("name") or {}
+    if not sku_idx and not name_idx:
+        return False
+    for p in live:
+        sku = str(p.get("sku") or "").strip().casefold()
+        if sku and sku in sku_idx:
+            return True
+        name = _norm_product_name(p.get("name"))
+        if name and name in name_idx:
+            return True
+    return False
+
+
 def _vault_stock_map(
     keeper: int | None = None,
 ) -> tuple[dict[str, dict[str, int]], str]:
@@ -544,8 +564,14 @@ def _vault_stock_map(
 
 
 def _other_unicorn_shop_stock_index(keeper: int) -> dict[str, dict[str, int]]:
-    """Last known Unicorn catalog stock sitting on extra (often inactive) shops."""
-    rows: list[dict] = []
+    """Last known catalog stock sitting on extra (often inactive) shops.
+
+    Unicorn-titled extras win. Other extras on this Unicorn process are a
+    fallback for leftover /start binds titled Shop. All-placeholder sources
+    are skipped.
+    """
+    unicorn_rows: list[dict] = []
+    other_rows: list[dict] = []
     for shop in _list_shops(active_only=False):
         try:
             sid = int(shop["chat_id"])
@@ -553,21 +579,27 @@ def _other_unicorn_shop_stock_index(keeper: int) -> dict[str, dict[str, int]]:
             continue
         if sid == keeper:
             continue
-        if not shop_title_looks_unicorn(shop.get("title")):
-            continue
         try:
-            rows.extend(db.list_products(sid, active_only=False))
+            prods = db.list_products(sid, active_only=False)
         except Exception:
             continue
-    stocks = []
-    for r in rows:
-        try:
-            stocks.append(int(r.get("stock") or 0))
-        except (TypeError, ValueError):
+        if shop_title_looks_unicorn(shop.get("title")):
+            unicorn_rows.extend(prods)
+        else:
+            other_rows.extend(prods)
+    for rows in (unicorn_rows, other_rows):
+        stocks = []
+        for r in rows:
+            try:
+                stocks.append(int(r.get("stock") or 0))
+            except (TypeError, ValueError):
+                continue
+        if _stocks_all_placeholder(stocks):
             continue
-    if _stocks_all_placeholder(stocks):
-        return {"sku": {}, "name": {}}
-    return _stock_index_from_rows(rows, prefer_unicorn=True)
+        return _stock_index_from_rows(
+            rows, prefer_unicorn=True, prefer_chat_id=None
+        )
+    return {"sku": {}, "name": {}}
 
 
 def _audit_stock_index(live: list[dict]) -> dict[str, dict[str, int]]:
@@ -666,6 +698,7 @@ def recall_catalog_stock() -> dict:
     Never replaces inventory.db. Never invents placeholder 10s. Shop-scoped to
     find_catalog_shop(). Idempotent when live stock already matches the source.
     """
+    db.init_db()
     shop = find_catalog_shop()
     if not shop:
         return {
@@ -698,17 +731,19 @@ def recall_catalog_stock() -> dict:
     before = _sku_snapshot(live)
 
     mapping, vault_reason = _vault_stock_map(keeper)
-    source = "vault" if _index_has_stock(mapping) else "none"
-    if not _index_has_stock(mapping):
+    source = "none"
+    if _index_has_stock(mapping) and _index_matches_live(mapping, live):
+        source = "vault"
+    if source == "none":
         mapping = _other_unicorn_shop_stock_index(keeper)
-        if _index_has_stock(mapping):
+        if _index_has_stock(mapping) and _index_matches_live(mapping, live):
             source = "catalog"
-    if not _index_has_stock(mapping):
+    if source == "none":
         mapping = _audit_stock_index(live)
-        if _index_has_stock(mapping):
+        if _index_has_stock(mapping) and _index_matches_live(mapping, live):
             source = "stock_audit"
 
-    if not _index_has_stock(mapping):
+    if source == "none":
         after = _sku_snapshot(live)
         skipped = vault_reason if vault_reason not in ("vault",) else "no_source"
         return {

@@ -53,6 +53,21 @@ class StockRecallTests(unittest.TestCase):
         self._env.stop()
         self._tmp.cleanup()
 
+    def test_recall_from_generic_extra_shop(self) -> None:
+        """Leftover /start shop titled Shop can still hold last-known counts."""
+        stray = 41099
+        db.ensure_shop(stray, title="Shop")
+        db.add_product(stray, "BPC-157 5MG", 40.0, stock=33)
+        # Extra Unicorn shop is all placeholder 10s so generic extra wins.
+        for p in db.list_products(EXTRA, active_only=False):
+            cur = int(p["stock"])
+            if cur != 10:
+                db.adjust_stock(p["id"], 10 - cur, reason="wipe")
+        result = unicorn_shop.recall_catalog_stock()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["source"], "catalog")
+        self.assertEqual(int(db.get_product(self.pid)["stock"]), 33)
+
     def test_recall_from_extra_unicorn_shop_not_placeholder(self) -> None:
         result = unicorn_shop.recall_catalog_stock()
         self.assertTrue(result["ok"], result)
