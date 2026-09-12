@@ -91,19 +91,19 @@ handle/cashtag/email/phone/wallet no longer counts as a pay rail:
 
 ## Acceptance (this ship)
 
-- [ ] `python -m pytest -q -x` green on scratch DBs
-- [ ] Docker COPY check still lists every imported module (26)
-- [ ] No writes to laptop `inventory.db`; no DELETE of products
-- [ ] Empty-handle Venmo: `checkout_ready` false, storefront names
+- [x] `python -m pytest -q -x` green on scratch DBs (671 passed)
+- [x] Docker COPY check still lists every imported module (26)
+- [x] No writes to laptop `inventory.db`; no DELETE of products
+- [x] Empty-handle Venmo: `checkout_ready` false, storefront names
       empty, `POST /order` 409 `no_payment_methods`, no order row
-- [ ] Empty Venmo + usable PayPal: `checkout_ready` true, catalog
+- [x] Empty Venmo + usable PayPal: `checkout_ready` true, catalog
       names PayPal only
-- [ ] Seeded Unicorn shop still `checkout_ready`; health `usable` ≥ 1
-- [ ] Telegram + panel copy warn on empty handles
-- [ ] Live `/health` new `git_sha`, `payments.active` ≥ 1,
-      `payments.usable` ≥ 1, `checkout_ready: true`,
-      `store_url_cache_bust` `20260913` (after AUTOPUSH)
-- [ ] No secrets / `.env` / scratch import files committed
+- [x] Seeded Unicorn shop still `checkout_ready`; health `usable` ≥ 1
+- [x] Telegram + panel copy warn on empty handles
+- [x] Live `/health` sha `8829dfb`, `payments.active` = 2,
+      `payments.usable` = 2, `checkout_ready: true`,
+      `store_url_cache_bust` `20260913`
+- [x] No secrets / `.env` / scratch import files committed
 
 Prior `991eb64` / `6c3d68b` / `bef4d5f` checks stay true: Confirm +
 Cancel URL buttons, `/confirm` Add tracking, `can_mark_paid`, Pages

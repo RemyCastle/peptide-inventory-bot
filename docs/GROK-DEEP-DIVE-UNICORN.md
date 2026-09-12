@@ -190,7 +190,7 @@ Menu Button URL in BotFather must match `UNICORN_STORE_URL` / vendor
 | P1 | Mini App had no I've paid (Telegram cart does) | **live `bef4d5f`** (`POST /order-paid` + `can_mark_paid`) |
 | P1 | Mini App claim ping had no confirm URL (vendor bot can't take `admconfirm`) | **live `6c3d68b`** (`/confirm?ct=` URL button + buyer DM) |
 | P1 | Claim ping cancel was text-only; confirm success had no tracking CTA | **live `991eb64`** (Cancel URL button + `/confirm` Add tracking) |
-| P1 | Enabled method with no handle still counted as checkout_ready | **this ship** (`usable` rails only; health `payments.usable`) |
+| P1 | Enabled method with no handle still counted as checkout_ready | **live `8829dfb`** (`usable` rails only; health `payments.usable`) |
 | P2 | Native Telegram invoice (provider token unset) | Optional; Stars forbidden for physical goods |
 
 ---
