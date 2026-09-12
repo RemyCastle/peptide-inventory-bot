@@ -807,6 +807,16 @@ def update_shop(chat_id: int, **fields: Any) -> None:
                     v = storefront_label(v, 40)
                 except Exception:
                     v = " ".join(v.split())[:40]
+            elif k in ("shipping_label", "brand_name") and isinstance(v, str):
+                try:
+                    from catalog_cleanup import storefront_label
+
+                    cap = 40 if k == "shipping_label" else 80
+                    v = storefront_label(v, cap) or (
+                        "Standard shipping" if k == "shipping_label" else v
+                    )
+                except Exception:
+                    v = " ".join(v.split())[:80]
             cols.append(f"{k} = ?")
             vals.append(v)
     if not cols:
@@ -1531,12 +1541,17 @@ def rename_product(
 
 
 def is_valid_coa_url(url: str) -> bool:
-    """Simple validation: http(s) URL, no whitespace."""
-    u = (url or "").strip()
-    if not u or any(c.isspace() for c in u):
-        return False
-    low = u.lower()
-    return low.startswith("http://") or low.startswith("https://")
+    """http(s) URL only: same rules as buyer-facing photo/COA links."""
+    try:
+        from catalog_cleanup import public_http_url
+
+        return bool(public_http_url(url, 2000))
+    except Exception:
+        u = (url or "").strip()
+        if not u or any(c.isspace() for c in u):
+            return False
+        low = u.lower()
+        return low.startswith("http://") or low.startswith("https://")
 
 
 def product_has_coa_file(p: dict | None) -> bool:
@@ -1565,8 +1580,15 @@ def set_product_coa_url(
     Set COA URL for a product in a shop. Returns (ok, message_or_url).
     Prefer set_product_coa_file for buyer-facing COA delivery.
     """
-    u = (url or "").strip()
-    if not is_valid_coa_url(u):
+    try:
+        from catalog_cleanup import public_http_url
+
+        u = public_http_url(url, 2000)
+    except Exception:
+        u = (url or "").strip()
+        if not is_valid_coa_url(u):
+            u = ""
+    if not u:
         return (
             False,
             "Invalid link. Send a full URL starting with http:// or https:// (no spaces).",
@@ -2292,6 +2314,28 @@ def create_order(
 
         pm_id = payment_method["id"] if payment_method else None
         pm_name = payment_method["name"] if payment_method else None
+        try:
+            from catalog_cleanup import (
+                display_product_name,
+                sanitize_multiline,
+                storefront_label,
+            )
+
+            username = storefront_label(username, 40) or None
+            full_name = storefront_label(full_name, 80) or None
+            ship_name = storefront_label(ship_name, 80)
+            ship_address = sanitize_multiline(ship_address, 200)
+            ship_notes = sanitize_multiline(ship_notes, 200)
+            if pm_name:
+                pm_name = storefront_label(pm_name, 60) or None
+            for it in items:
+                it["product_name"] = display_product_name(
+                    str(it.get("product_name") or "")
+                )
+        except Exception:
+            ship_name = " ".join(str(ship_name or "").split())[:80]
+            ship_address = " ".join(str(ship_address or "").split())[:200]
+            ship_notes = " ".join(str(ship_notes or "").split())[:200]
 
         cur = conn.execute(
             """
@@ -2627,6 +2671,16 @@ def set_order_tracking(
     if not tn or tn == "-":
         return False
     car = (carrier or "").strip() or None
+    try:
+        from catalog_cleanup import storefront_label
+
+        tn = storefront_label(tn, 80)
+        car = storefront_label(car, 40) if car else None
+    except Exception:
+        tn = " ".join(tn.split())[:80]
+        car = " ".join(car.split())[:40] if car else None
+    if not tn:
+        return False
     with get_db() as conn:
         cur = conn.execute(
             """

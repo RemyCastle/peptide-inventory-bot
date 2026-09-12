@@ -1171,7 +1171,7 @@ def api_state(tok: dict) -> tuple[int, dict]:
             "shipping_enabled": int(shop.get("shipping_enabled") or 0),
             "shipping_fee": float(shop.get("shipping_fee") or 0),
             "free_shipping_above": float(shop.get("free_shipping_above") or 0),
-            "shipping_zones": db.parse_shipping_zones(shop),
+            "shipping_zones": _buyer_zones(db.parse_shipping_zones(shop)),
             "is_unicorn": _shop_is_unicorn(chat_id, shop.get("title")),
             "checkout_ready": checkout_ready,
         },
@@ -1671,14 +1671,26 @@ _TRACKING_URLS = {
 
 def tracking_url(carrier: str | None, tracking_number: str | None) -> str | None:
     """Known-carrier tracking page URL, or None."""
-    tn = urllib.parse.quote((tracking_number or "").strip())
+    try:
+        from catalog_cleanup import public_http_url, storefront_label
+
+        tn_raw = storefront_label(tracking_number, 80)
+        car_raw = storefront_label(carrier, 40)
+    except Exception:
+        public_http_url = None  # type: ignore[assignment]
+        tn_raw = " ".join(str(tracking_number or "").split())
+        car_raw = " ".join(str(carrier or "").split())
+    tn = urllib.parse.quote(tn_raw)
     if not tn:
         return None
-    key = re.sub(r"[^a-z]", "", (carrier or "").strip().lower())
+    key = re.sub(r"[^a-z]", "", (car_raw or "").lower())
     tmpl = _TRACKING_URLS.get(key)
     if not tmpl:
         return None
-    return tmpl.format(tn=tn)
+    built = tmpl.format(tn=tn)
+    if public_http_url is None:
+        return built
+    return public_http_url(built, 500) or None
 
 
 def telegram_send_with_token(
@@ -1842,7 +1854,7 @@ def _order_belongs(order: dict | None, shop_chat_id: int) -> bool:
 def _item_summary(items: list[dict]) -> str:
     parts = []
     for it in items:
-        name = (it.get("product_name") or "item").strip()
+        name = _buyer_product_name({"name": it.get("product_name") or "item"})
         qty = int(it.get("quantity") or 0)
         parts.append(f"{name} × {qty}")
     return ", ".join(parts) if parts else "—"
@@ -1851,11 +1863,22 @@ def _item_summary(items: list[dict]) -> str:
 def _order_public(order: dict) -> dict:
     oid = int(order["id"])
     items = db.get_order_items(oid)
-    uname = (order.get("username") or "").strip()
-    full = (order.get("full_name") or "").strip()
+    uname = _buyer_field(order.get("username"), 40) or ""
+    full = _buyer_field(order.get("full_name"), 80) or ""
+    tn = _buyer_field(order.get("tracking_number"), 80) or ""
+    car = _buyer_field(order.get("tracking_carrier"), 40) or ""
+    try:
+        from catalog_cleanup import sanitize_multiline
+
+        ship_notes = sanitize_multiline(order.get("ship_notes"), 200)
+        ship_address = sanitize_multiline(order.get("ship_address"), 200)
+    except Exception:
+        ship_notes = (order.get("ship_notes") or "").strip()
+        ship_address = (order.get("ship_address") or "").strip()
     return {
         "id": oid,
-        "payment_code": order.get("payment_code") or "",
+        "payment_code": _buyer_field(order.get("payment_code"), 32)
+        or (order.get("payment_code") or ""),
         "customer": {
             "user_id": int(order.get("user_id") or 0),
             "username": uname,
@@ -1866,7 +1889,7 @@ def _order_public(order: dict) -> dict:
         "items_summary": _item_summary(items),
         "items": [
             {
-                "name": it.get("product_name") or "",
+                "name": _buyer_product_name({"name": it.get("product_name") or ""}),
                 "quantity": int(it.get("quantity") or 0),
                 "unit_price": float(it.get("unit_price") or 0),
                 "line_total": float(it.get("line_total") or 0),
@@ -1878,14 +1901,12 @@ def _order_public(order: dict) -> dict:
         "total": float(order.get("total") or 0),
         "status": order.get("status") or "",
         "created_at": order.get("created_at") or "",
-        "tracking_number": (order.get("tracking_number") or "").strip(),
-        "tracking_carrier": (order.get("tracking_carrier") or "").strip(),
-        "tracking_url": tracking_url(
-            order.get("tracking_carrier"), order.get("tracking_number")
-        ),
-        "ship_name": (order.get("ship_name") or "").strip(),
-        "ship_address": (order.get("ship_address") or "").strip(),
-        "ship_notes": (order.get("ship_notes") or "").strip(),
+        "tracking_number": tn,
+        "tracking_carrier": car,
+        "tracking_url": tracking_url(car or None, tn or None),
+        "ship_name": _buyer_field(order.get("ship_name"), 80) or "",
+        "ship_address": ship_address,
+        "ship_notes": ship_notes,
     }
 
 

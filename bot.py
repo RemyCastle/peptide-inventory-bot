@@ -161,7 +161,11 @@ def force_reply(placeholder: str = "Type your answer...") -> ForceReply:
     Placeholder max length is 64 (Telegram limit).
     """
     ph = (placeholder or "Type your answer...").strip() or "Type your answer..."
-    return ForceReply(selective=False, input_field_placeholder=ph[:64])
+    try:
+        ph = catalog_cleanup.tg_button_text(ph, 64) or "Type your answer..."
+    except Exception:
+        ph = ph[:64]
+    return ForceReply(selective=False, input_field_placeholder=ph)
 
 SYM = CURRENCY_SYMBOL
 
@@ -4213,7 +4217,8 @@ async def cb_adm_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         bit += ")"
         coa_bits.append(bit)
     if has_url:
-        coa_bits.append(f"link `{p.get('coa_url')}`")
+        coa_link = catalog_cleanup.public_http_url(p.get("coa_url"))
+        coa_bits.append(f"link `{coa_link or '—'}`")
     if coa_bits:
         coa_line = "COA: ✅ " + " · ".join(coa_bits) + "\n"
     else:
@@ -4258,9 +4263,11 @@ async def cb_adm_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if has_file or has_url:
         coa_row = [InlineKeyboardButton("📄 Send COA", callback_data=f"viewcoa:{pid}")]
         if has_url:
-            coa_row.append(
-                InlineKeyboardButton("🔗 Open link", url=(p.get("coa_url") or "").strip())
-            )
+            coa_open = catalog_cleanup.public_http_url(p.get("coa_url"))
+            if coa_open:
+                coa_row.append(
+                    InlineKeyboardButton("🔗 Open link", url=coa_open)
+                )
         coa_row.append(InlineKeyboardButton("🗑 Remove COA", callback_data=f"clearcoa:{pid}"))
         # Telegram allows max ~8 buttons/row; split if needed
         if len(coa_row) > 2:
@@ -4515,7 +4522,7 @@ async def cb_view_coa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     file_id = (p.get("coa_file_id") or "").strip()
-    coa_url = (p.get("coa_url") or "").strip()
+    coa_url = catalog_cleanup.public_http_url(p.get("coa_url"))
     if not file_id and not coa_url:
         await query.answer(
             "No COA set. Admin: Set COA (file or link).",

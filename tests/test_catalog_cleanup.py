@@ -402,6 +402,61 @@ class GlyphRepairTests(unittest.TestCase):
         self.assertIn("West", out)
         self.assertNotIn("ð", out)
 
+    def test_line_sep_and_private_use_dropped(self) -> None:
+        out = cc.sanitize_catalog_text("A\u2028B\u2029C\uE000D")
+        self.assertEqual(out, "A B CD")
+        self.assertNotIn("\u2028", out)
+        self.assertNotIn("\uE000", out)
+        welcome = cc.display_shop_text("Hi\u2028there")
+        self.assertIn("\n", welcome)
+        self.assertNotIn("\u2028", welcome)
+
+    def test_noncharacter_and_leading_combining_dropped(self) -> None:
+        self.assertEqual(cc.sanitize_catalog_text("AB\uFFFECD"), "ABCD")
+        self.assertEqual(cc.sanitize_catalog_text("\u0301Cafe"), "Cafe")
+        self.assertEqual(cc.sanitize_catalog_text("\ufe0f Hello"), "Hello")
+        self.assertEqual(
+            cc.sanitize_catalog_text("\U0001F3FB wave"),
+            "wave",
+        )
+
+    def test_incomplete_subdivision_flag_stripped_when_it_fits(self) -> None:
+        incomplete = "\U0001F3F4\U000E0067\U000E0062"
+        self.assertNotIn("\U000e0067", cc.sanitize_catalog_text(incomplete))
+        clipped = cc.clip_label(incomplete + " West", 64, ellipsis="")
+        self.assertFalse(any(cc._is_emoji_tag(ch) for ch in clipped))
+        clipped.encode("utf-16-le")
+
+    def test_public_http_url_rejects_breaks_userinfo_and_schemes(self) -> None:
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/p.png\r\nSet-Cookie: x"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/p.png%09.jpg"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://user:pass@cdn.example.com/p.png"),
+            "",
+        )
+        self.assertEqual(cc.public_http_url("data:text/html,hi"), "")
+        self.assertEqual(cc.public_http_url("vbscript:msg"), "")
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/ok.png\u2028x"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/ok.png"),
+            "https://cdn.example.com/ok.png",
+        )
+
+    def test_force_reply_cap_helper_keeps_emoji(self) -> None:
+        label = cc.tg_button_text("🦄 " + ("x" * 80), 64)
+        self.assertLessEqual(cc.utf16_len(label), 64)
+        self.assertTrue(label.startswith("🦄"))
+        label.encode("utf-16-le")
+
 
 class CleanupApplyTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -64,6 +64,11 @@ _KEEP_CF = frozenset((_ZWJ,)) | frozenset(
     chr(c) for c in range(_TAG_MIN, _TAG_MAX + 1)
 )
 _CRLF_PCT = re.compile(r"%0[0da]|%00", re.IGNORECASE)
+# Line-breaking C0 / DEL / Zl-Zp in the raw URL, plus C0/DEL percent-encoded.
+# NUL is stripped by storefront_label (dirty catalog) and is not a break.
+_UNSAFE_URL_RAW = re.compile(
+    r"[\x09\x0a\x0b\x0c\x0d\x7f\u2028\u2029]|%(?:0[0-9a-fA-F]|1[0-9a-fA-F]|7[fF])"
+)
 
 
 ActionKind = Literal["rename", "merge", "deactivate"]
@@ -114,17 +119,89 @@ def _is_emoji_tag(ch: str) -> bool:
     return _TAG_MIN <= o <= _TAG_MAX
 
 
+def _is_fitzpatrick(ch: str) -> bool:
+    return 0x1F3FB <= ord(ch) <= 0x1F3FF
+
+
+def _is_variation_selector(ch: str) -> bool:
+    o = ord(ch)
+    return o in (0xFE0E, 0xFE0F) or 0xE0100 <= o <= 0xE01EF
+
+
+def _is_noncharacter(ch: str) -> bool:
+    o = ord(ch)
+    if 0xFDD0 <= o <= 0xFDEF:
+        return True
+    return (o & 0xFFFE) == 0xFFFE
+
+
 def _drop_controls(text: str, *, keep_newlines: bool = False) -> str:
-    """Drop Cc/Cf/Cs except ZWJ/emoji-tags (and newlines when keep_newlines)."""
+    """Drop Cc/Cf/Cs/Co/nonchars except ZWJ/emoji-tags (and newlines).
+
+    Zl/Zp (U+2028/U+2029) become a newline when keep_newlines else a space
+    so they cannot glue tokens or hide a URL break.
+    """
     out: list[str] = []
     for ch in text:
         if keep_newlines and ch in "\r\n":
             out.append(ch)
             continue
+        if _is_noncharacter(ch):
+            continue
         cat = unicodedata.category(ch)
+        if cat in ("Zl", "Zp"):
+            out.append("\n" if keep_newlines else " ")
+            continue
+        if cat == "Co":
+            continue
         if cat[0] == "C" and ch not in _KEEP_CF:
             continue
         out.append(ch)
+    return "".join(out)
+
+
+def _strip_leading_orphans(text: str) -> str:
+    """Drop combining marks / VS / skin-tone / tags with no base glyph."""
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        cat = unicodedata.category(ch)
+        if (
+            cat in ("Mn", "Me")
+            or _is_fitzpatrick(ch)
+            or _is_variation_selector(ch)
+            or _is_emoji_tag(ch)
+        ):
+            i += 1
+            continue
+        break
+    return text[i:]
+
+
+def _strip_incomplete_tags(text: str) -> str:
+    """Keep only complete flag-tag sequences (… + CANCEL TAG). Orphan tags go."""
+    if not text or not any(_is_emoji_tag(ch) for ch in text):
+        return text
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    black_flag = "\U0001F3F4"
+    while i < n:
+        ch = text[i]
+        if ch == black_flag or _is_emoji_tag(ch):
+            j = i + (1 if ch == black_flag else 0)
+            while j < n and _is_emoji_tag(text[j]):
+                j += 1
+            tags = text[(i + 1 if ch == black_flag else i) : j]
+            if tags and tags[-1] == _CANCEL_TAG:
+                out.append(text[i:j])
+            elif ch == black_flag:
+                out.append(black_flag)
+            i = j
+            continue
+        out.append(ch)
+        i += 1
     return "".join(out)
 
 
@@ -196,6 +273,8 @@ def display_shop_text(text: str) -> str:
     """Repair mojibake in shop title / welcome while preserving line breaks."""
     s = repair_glyphs(str(text or "")).replace("\u00ad", "")
     s = _drop_controls(s, keep_newlines=True)
+    s = _strip_leading_orphans(s)
+    s = _strip_incomplete_tags(s)
     return s.replace("\r\n", "\n").replace("\r", "\n")
 
 
@@ -235,7 +314,7 @@ def utf16_len(text: str) -> int:
 
 def clip_label(text: str, max_len: int, *, ellipsis: str = "…") -> str:
     """Trim to max_len UTF-16 units without splitting a code point or ZWJ run."""
-    s = str(text or "")
+    s = _strip_incomplete_tags(_strip_leading_orphans(_drop_controls(str(text or ""))))
     max_len = int(max_len)
     if max_len <= 0:
         return ""
@@ -291,7 +370,10 @@ def sanitize_catalog_text(text: str) -> str:
         s = unicodedata.normalize("NFKC", s)
     except Exception:
         pass
-    return " ".join(_drop_controls(s).split())
+    s = _drop_controls(s)
+    s = _strip_leading_orphans(s)
+    s = _strip_incomplete_tags(s)
+    return " ".join(s.split())
 
 
 def storefront_label(text: str | None, max_len: int | None = None) -> str:
@@ -303,9 +385,17 @@ def storefront_label(text: str | None, max_len: int | None = None) -> str:
 
 
 def public_http_url(value: str | None, max_len: int = 500) -> str:
-    """Buyer-facing http(s) URL. Glyph junk stripped; non-http dropped."""
+    """Buyer-facing http(s) URL. Glyph junk stripped; non-http dropped.
+
+    Rejects raw C0 / line-sep / percent-encoded C0 so stripping controls
+    cannot glue `https://x.com/a\\nSet-Cookie` into a still-http URL.
+    Userinfo (`user:pass@host`) is also refused.
+    """
+    raw = str(value or "")
+    if _UNSAFE_URL_RAW.search(raw):
+        return ""
     s = storefront_label(value, max_len)
-    if not s or _CRLF_PCT.search(s):
+    if not s or _CRLF_PCT.search(s) or _UNSAFE_URL_RAW.search(s):
         return ""
     low = s.lower()
     if low.startswith("https://"):
@@ -315,6 +405,9 @@ def public_http_url(value: str | None, max_len: int = 500) -> str:
     else:
         return ""
     if not rest or rest.startswith("/") or " " in rest or "\\" in rest:
+        return ""
+    host_part = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if not host_part or "@" in host_part:
         return ""
     return scheme + rest
 

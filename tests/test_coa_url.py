@@ -82,6 +82,15 @@ class CoaFileDbTests(unittest.TestCase):
         self.assertTrue(db.product_has_coa_url(p))
         self.assertTrue(db.product_has_coa(p))
 
+    def test_coa_url_rejects_javascript_and_percent_nul(self) -> None:
+        self.assertFalse(db.is_valid_coa_url("javascript:alert(1)"))
+        self.assertFalse(db.is_valid_coa_url("https://example.com/c.pdf%00.pdf"))
+        self.assertFalse(db.is_valid_coa_url("https://user@example.com/c.pdf"))
+        self.assertTrue(db.is_valid_coa_url("https://example.com/coa.pdf"))
+        ok, _ = db.set_product_coa_url(self.pid, self.shop, "javascript:alert(1)")
+        self.assertFalse(ok)
+        self.assertFalse(db.product_has_coa_url(db.get_product(self.pid)))
+
     def test_file_or_url_or_both(self) -> None:
         p = db.get_product(self.pid)
         self.assertFalse(db.product_has_coa(p))

@@ -793,12 +793,13 @@ def payment_pay_link(method: dict, total: float, code: str) -> str | None:
         return None
     amt = f"{float(total):.2f}"
     q = urllib.parse.quote
+    built: str | None = None
     if mt == "venmo":
         h = target.lstrip("@$")
         if h:
             # account.venmo.com is Venmo's canonical web pay URL — opens the
             # site, which hands off to the app with amount + note prefilled.
-            return (
+            built = (
                 "https://account.venmo.com/pay?txn=pay"
                 f"&recipients={q(h)}&amount={amt}&note={q(code)}"
             )
@@ -807,13 +808,20 @@ def payment_pay_link(method: dict, total: float, code: str) -> str | None:
         if tag:
             if not tag.startswith("$"):
                 tag = "$" + tag
-            return f"https://cash.app/{q(tag)}/{amt}"
+            built = f"https://cash.app/{q(tag)}/{amt}"
     elif mt == "paypal":
         h = target.lstrip("@")
         # paypal.me only works for usernames, not emails
         if h and "@" not in h:
-            return f"https://paypal.me/{q(h)}/{amt}"
-    return None
+            built = f"https://paypal.me/{q(h)}/{amt}"
+    if not built:
+        return None
+    try:
+        from catalog_cleanup import public_http_url
+
+        return public_http_url(built, 500) or None
+    except Exception:
+        return built
 
 
 def _payment_method_html(p: dict, total: float, code: str) -> str:
@@ -839,6 +847,13 @@ def _payment_method_html(p: dict, total: float, code: str) -> str:
             lines.append(f"   {_h(instr)}")
     link = payment_pay_link(p, total, code)
     if link:
+        try:
+            from catalog_cleanup import public_http_url
+
+            link = public_http_url(link, 500) or None
+        except Exception:
+            pass
+    if link:
         prefills = "amount + order code" if mt == "venmo" else "amount"
         lines.append(
             f'   👉 <a href="{html_mod.escape(link)}">Tap to pay '
@@ -861,8 +876,20 @@ def build_customer_order_received_html(
     code = order.get("payment_code") or f"#{oid}"
     total = float(order.get("total") or 0)
 
+    try:
+        from catalog_cleanup import display_product_name, sanitize_multiline, storefront_label
+    except Exception:
+        display_product_name = None  # type: ignore[assignment]
+        sanitize_multiline = None  # type: ignore[assignment]
+        storefront_label = None  # type: ignore[assignment]
+
+    def _item_name(raw: object) -> str:
+        if display_product_name is None:
+            return str(raw or "")
+        return display_product_name(str(raw or ""))
+
     lines = [
-        f"  • {_h(ln['product_name'])} × {ln['quantity']} — "
+        f"  • {_h(_item_name(ln.get('product_name')))} × {ln['quantity']} — "
         f"{_fmt_money(ln['line_total'])}"
         for ln in order_lines or []
     ]
@@ -870,10 +897,18 @@ def build_customer_order_received_html(
         lines.append(f"  • Shipping — {_fmt_money(order['shipping_fee'])}")
 
     ship_bits = []
-    if (order.get("ship_name") or "").strip():
-        ship_bits.append(f"  {_h(order['ship_name'].strip())}")
-    if (order.get("ship_address") or "").strip():
-        ship_bits.append(f"  {_h(order['ship_address'].strip())}")
+    raw_name = order.get("ship_name") or ""
+    raw_addr = order.get("ship_address") or ""
+    name = storefront_label(raw_name, 80) if storefront_label else raw_name.strip()
+    addr = (
+        sanitize_multiline(raw_addr, 200)
+        if sanitize_multiline
+        else raw_addr.strip()
+    )
+    if name:
+        ship_bits.append(f"  {_h(name)}")
+    if addr:
+        ship_bits.append(f"  {_h(addr)}")
     ship_block = ("\n\n📦 Ship to:\n" + "\n".join(ship_bits)) if ship_bits else ""
 
     pays = db.list_payment_methods(int(shop_chat_id))

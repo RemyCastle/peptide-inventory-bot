@@ -674,6 +674,161 @@ class StorefrontGapTests(unittest.TestCase):
         self.assertIn("UK", cat)
         self.assertIn("\U000e007f", cat)
 
+    def test_admin_state_zones_sanitized(self) -> None:
+        import json
+
+        db.update_shop(
+            SHOP,
+            shipping_zones=json.dumps(
+                [
+                    {
+                        "id": "US\u0000-W",
+                        "label": "West\ufffd",
+                        "fee": 8,
+                        "free_above": 0,
+                    }
+                ]
+            ),
+        )
+        code, state = webpanel.api_state(self.tok)
+        self.assertEqual(code, 200)
+        zones = state["shop"]["shipping_zones"]
+        self.assertEqual(len(zones), 1)
+        self.assertEqual(zones[0]["id"], "US-W")
+        self.assertEqual(zones[0]["label"], "West")
+        self.assertNotIn("\ufffd", zones[0]["label"])
+
+    def test_panel_order_public_strips_ship_and_item_junk(self) -> None:
+        pid = db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 3)
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer\u0000",
+            "Buyer\ufffd",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "Aod 5mg (vial) $15.00",
+                    "unit_price": 15.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo\ufffd"},
+            "Buyer\u0000\ufffd",
+            "1 St\u200b",
+            "Leave\u0000 at door\ufffd",
+        )
+        self.assertIsNotNone(order)
+        pub = webpanel._order_public(order)
+        self.assertEqual(pub["items"][0]["name"], "Aod 5mg")
+        self.assertNotIn("$15", pub["items_summary"])
+        self.assertEqual(pub["ship_name"], "Buyer")
+        self.assertEqual(pub["ship_address"], "1 St")
+        self.assertEqual(pub["ship_notes"], "Leave at door")
+        self.assertNotIn("\ufffd", pub["customer"]["full_name"])
+        self.assertNotIn("\u0000", pub["customer"]["username"])
+
+    def test_receipt_html_uses_cleaned_names(self) -> None:
+        pid = db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 3)
+        db.add_payment_method(SHOP, "Venmo", "@wineboos")
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer",
+            "Buyer",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "Aod 5mg (vial) $15.00",
+                    "unit_price": 15.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo"},
+            "Buyer\u0000",
+            "1 St\ufffd",
+            "",
+        )
+        html = vendor_stores.build_customer_order_received_html(order, SHOP)
+        self.assertIn("Aod 5mg", html)
+        self.assertNotIn("Aod 5mg (vial)", html)
+        self.assertNotIn("Anav@r", html)
+        self.assertIn("Buyer", html)
+        self.assertNotIn("\ufffd", html)
+        self.assertNotIn("\u0000", html)
+
+    def test_coa_url_write_rejects_breaks_and_userinfo(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        ok, _ = db.set_product_coa_url(
+            pid, SHOP, "javascript:alert(1)"
+        )
+        self.assertFalse(ok)
+        ok, _ = db.set_product_coa_url(
+            pid, SHOP, "https://cdn.example.com/c.pdf%00.pdf"
+        )
+        self.assertFalse(ok)
+        ok, _ = db.set_product_coa_url(
+            pid, SHOP, "https://user:pass@cdn.example.com/c.pdf"
+        )
+        self.assertFalse(ok)
+        ok, url = db.set_product_coa_url(
+            pid, SHOP, "HTTPS://cdn.example.com/coa.pdf"
+        )
+        self.assertTrue(ok)
+        self.assertEqual(url, "https://cdn.example.com/coa.pdf")
+        p = db.get_product(pid)
+        self.assertEqual(
+            webpanel._product_public(p)["coa_url"],
+            "https://cdn.example.com/coa.pdf",
+        )
+
+    def test_shop_brand_and_shipping_label_write_strips_junk(self) -> None:
+        db.update_shop(
+            SHOP,
+            brand_name="Unicorn\u0000 Magic\ufffd",
+            shipping_label="2-day\u200b",
+        )
+        shop = db.get_shop(SHOP)
+        self.assertEqual(shop["brand_name"], "Unicorn Magic")
+        self.assertEqual(shop["shipping_label"], "2-day")
+
+    def test_tracking_url_strips_junk_and_rejects_unknown(self) -> None:
+        url = webpanel.tracking_url("UPS\u200b", "1Z\u0000999\ufffd")
+        self.assertIsNotNone(url)
+        self.assertIn("ups.com", (url or "").lower())
+        self.assertIn("1Z999", url or "")
+        self.assertNotIn("\ufffd", url or "")
+        self.assertIsNone(webpanel.tracking_url("OnTrac", "123"))
+
+    def test_create_order_never_falls_back_to_junk_ship_fields(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "\u0000\ufffd",
+            "\u0000",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "SEMA 10MG",
+                    "unit_price": 10.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo\u0000"},
+            "\u0000\ufffd",
+            "\u200b",
+            "\ufffd",
+        )
+        self.assertIsNotNone(order)
+        self.assertFalse(order.get("username"))
+        self.assertFalse(order.get("full_name"))
+        self.assertFalse(order.get("ship_name"))
+        self.assertFalse(order.get("ship_address"))
+        self.assertFalse(order.get("ship_notes"))
+        self.assertNotEqual(order.get("payment_method_name"), "Venmo\u0000")
+        self.assertNotIn("\ufffd", str(order.get("payment_method_name") or ""))
+
 
 if __name__ == "__main__":
     unittest.main()
