@@ -33,7 +33,33 @@ bot surface parity).
    - validates `initData` against those tokens with
      `validate_webapp_init_data_any` (`vendor_stores.py:1201`);
    - on success, calls `db.create_order` **exactly once** and returns the
-     payment code, payment methods, and shipping total.
+     payment code, order total, and the rendered payment methods.
+
+### The `POST /order` success response (what the pay screen reads)
+
+On a 200, `api_order` (`spbc_notify.py:1226`) returns:
+
+```json
+{
+  "ok": true,
+  "code": "UMF-AB12CD",
+  "total": 149.00,
+  "payments": ["Venmo: 💙 *Venmo*\nSend payment to: `@wineboos`…", …],
+  "message": "…buyer-facing confirmation text…",
+  "invoice_offered": false
+}
+```
+
+- `code` is the buyer's payment reference — it must ride along on the payment
+  (Venmo prefills it as the note; every template's instructions say "include
+  your order number"). It's how you reconcile a payment to an order.
+- `payments` is the manual-rails array (see [Payment methods setup](#payment-methods-setup));
+  empty array → the buyer has no manual rail to pay on.
+- `invoice_offered` is `true` **only** when a native Telegram card invoice was
+  DM'd to the buyer — i.e. `TELEGRAM_PAYMENT_PROVIDER_TOKEN` is set (see
+  [Section D](#d-native-telegram-card-checkout-telegram_payment_provider_token)).
+  It's `false` on every deployment that hasn't wired a card provider, which is
+  normal — manual rails still carry checkout.
 
 ### HMAC algorithm (what "signed" means)
 
@@ -90,6 +116,37 @@ def check(init_data: str, bot_token: str) -> bool:
   `bad_hash`.
 - Use the **exact** query string — do not re-URL-decode `user`; the check is
   over the raw `k=v` pairs, `hash` excluded, sorted lexicographically.
+
+### Sign a *test* `initData` to exercise the auth boundary (QA)
+
+To prove `POST /order` accepts a well-formed session without borrowing a real
+buyer's device, sign your own `initData` with a token that **is** in the shop's
+set (primary or an `extra_tokens` alias). The signing is the inverse of the
+check above:
+
+```python
+import hmac, hashlib, json, time
+from urllib.parse import urlencode
+
+def sign(bot_token: str, user: dict, auth_date: int | None = None) -> str:
+    auth_date = auth_date or int(time.time())              # within 24 h, not future
+    fields = {"auth_date": str(auth_date),
+              "user": json.dumps(user, separators=(",", ":"))}
+    dcs = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+    secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+    fields["hash"] = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
+    return urlencode(fields)   # ready to drop into POST /order as "initData"
+```
+
+- **Two warnings.** (1) A *valid* `initData` + a *valid* cart calls
+  `create_order` for real — it **decrements stock and DMs the shop owner**. To
+  test only the auth layer, send an empty/sold-out cart and expect the `409`
+  stock path, or a `400 empty cart`, *after* auth passes — not a `bad_hash`.
+  (2) `user` must be a JSON object with a numeric `id` (else the token matches
+  but you get `reason=bad user …` → still surfaced as `bad_hash`; see the
+  overloaded-`bad_hash` note below).
+- Never sign with a token that isn't already in the shop's set — that only
+  reproduces `bad_hash`, which you can confirm offline without a POST.
 
 ---
 
@@ -350,6 +407,29 @@ curl -sS -X POST "https://unicornfartzz-bot.onrender.com/panel/api/payment?t=$T"
 # → {"ok": true, "id": <n>, "created": true}
 ```
 
+Pause / rename / delete on the **same** endpoint (`id` is the row from a prior
+add or from the `/storefront` list) — pause is a partial update that never
+touches the stored handle:
+
+```bash
+# Pause row 7 (buyers stop seeing it; the row and its handle stay put) —
+# this is the safe way to retire a *seeded* default (see the reboot trap).
+curl -sS -X POST "…/panel/api/payment?t=$T" -H "Content-Type: application/json" \
+  -d '{"id":7,"active":0}'                       # → {"ok":true,"id":7,"created":false}
+
+# Re-enable it later
+curl -sS -X POST "…/panel/api/payment?t=$T" -H "Content-Type: application/json" \
+  -d '{"id":7,"active":1}'
+
+# Rename without disturbing the handle/address
+curl -sS -X POST "…/panel/api/payment?t=$T" -H "Content-Type: application/json" \
+  -d '{"id":7,"name":"Venmo (fastest)"}'
+
+# Hard delete a *non-seeded* row
+curl -sS -X POST "…/panel/api/payment?t=$T" -H "Content-Type: application/json" \
+  -d '{"id":9,"delete":true}'                     # → {"ok":true,"deleted":true}
+```
+
 ### Verify the buyer will see them
 
 ```bash
@@ -394,10 +474,67 @@ Setup takeaways:
   **custom/free-text** rows with no detectable target print their `instructions`
   verbatim instead (`vendor_stores.py:527`).
 
+### D. Native Telegram card checkout (`TELEGRAM_PAYMENT_PROVIDER_TOKEN`)
+
+Everything above is **manual rails** — the buyer copies a handle and pays out of
+band. There is a **second, optional** rail: Telegram's built-in card checkout
+(`tg_payments.py`). It is **additive and off by default** — the whole send path
+is a no-op unless a provider token is set (`invoices_enabled`,
+`tg_payments.py:28`). It does **not** replace the manual rails; when enabled it
+runs *alongside* them, and the buyer gets a real in-Telegram card invoice DM'd
+right after `POST /order` succeeds.
+
+**Never Telegram Stars (XTR).** This path is fiat-only for physical goods —
+`invoice_currency` (`tg_payments.py:32`) coerces `XTR`/empty to `USD`, and
+`build_invoice_body`/`validate_pre_checkout` bail on `XTR`
+(`tg_payments.py:79`, `:161`). Stars are never accepted.
+
+**Turn it on:**
+
+1. In **BotFather → your bot → Payments**, connect a real card provider (e.g.
+   Stripe) and copy the **provider token** it issues (format `NNNNN:LIVE:…` or
+   `…:TEST:…`).
+2. Set env `TELEGRAM_PAYMENT_PROVIDER_TOKEN=<that token>` on Render and restart.
+   Also set `CURRENCY` (or the shop's `currency`) to a 3-letter fiat like `USD`.
+3. Handlers register unconditionally at boot
+   (`register_payment_handlers`, `tg_payments.py:232`), so no code change is
+   needed — the token flips the send path on. **Never log this token.**
+
+**The flow once on:**
+
+- After auth + `create_order`, `api_order` calls
+  `send_invoice_for_order` (`spbc_notify.py:1217`) which DMs a `sendInvoice` to
+  the buyer on the **vendor/live token** and sets `invoice_offered: true` in the
+  order response.
+- The invoice's `payload` is `umf-order:<order_id>` (`tg_payments.py:40`); title
+  is capped at 32 chars, description at 255, and an order `total ≤ 0` sends **no**
+  invoice (`tg_payments.py:95`).
+- Telegram fires a **pre-checkout query**; `validate_pre_checkout`
+  (`tg_payments.py:155`) is **server-authoritative** — it re-checks currency and
+  that `total_amount` equals the order's stored cents, and rejects an order that
+  is `cancelled`/`rejected`/already `paid`. Amount/currency mismatch → declined.
+- On success, `apply_successful_payment` (`tg_payments.py:184`) records the
+  Telegram charge id against the order. **It does not deduct stock or mark the
+  order fulfilled** — the admin's normal confirm step still deducts stock, same
+  as a manual-rail order. Card capture ≠ shipment.
+
+**Diagnosing:**
+
+- `invoice_offered: false` on a shop you *did* wire → the provider token is
+  unset/empty, the order total is `0`, or `currency` resolved to `XTR`.
+- `sendInvoice HTTP 4xx` in the log (`tg_payments.py:128`, token never printed)
+  → bad/expired provider token, or the bot isn't payments-enabled in BotFather.
+- "Currency mismatch" / "Amount mismatch" at pre-checkout → the invoice was
+  built against a different total/currency than the order now has; re-issue.
+
 ### Notes / gotchas
 
 - **Payments are per-shop.** Seeding the SPBC main shop does not give the
   Unicorn shop rails, and vice versa.
+- **Manual rails and native card checkout are independent.** You can run either,
+  both, or neither. `invoice_offered:false` with a non-empty `payments` array is
+  a perfectly healthy manual-only shop — don't "fix" it by wiring a card
+  provider unless you actually want in-Telegram card capture.
 - **Legacy instructions-only rows** (no `method_type`) still render; the code
   infers the kind and pay target from the name/instructions
   (`_method_kind_and_target`, `vendor_stores.py:451`).
@@ -436,6 +573,7 @@ Setup takeaways:
 | Piece | Location |
 |-------|----------|
 | `POST /order` handler | `spbc_notify.py:1010` |
+| `POST /order` success response | `spbc_notify.py:1226` |
 | HMAC validate (one token) | `vendor_stores.py:263` |
 | HMAC validate (any bound token) | `vendor_stores.py:1201` |
 | Error code map (`bad_hash`/`expired`) | `vendor_stores.py:138` |
@@ -454,3 +592,8 @@ Setup takeaways:
 | Buyer-visible list (active-only, sorted) | `db.py:2025` |
 | Telegram payments menu | `bot.py:5418` |
 | `payments` in storefront/order JSON | `vendor_stores.py:433` |
+| Native card checkout (optional) | `tg_payments.py` |
+| Invoices-enabled gate (provider token) | `tg_payments.py:28` |
+| Invoice send after order | `spbc_notify.py:1217` |
+| Server-authoritative pre-checkout | `tg_payments.py:155` |
+| Record card charge (no stock deduct) | `tg_payments.py:184` |
