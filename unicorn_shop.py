@@ -29,6 +29,10 @@ DEFAULT_PAYMENT_METHODS: tuple[dict[str, str], ...] = (
 
 _PAID_STATUSES = ("paid", "shipped", "complete")
 
+# Unique-name importer used this when real shelf counts were missing.
+# Recall must never write this as a fallback.
+PLACEHOLDER_STOCK = 10
+
 # Title fragments used when binding the live Ghostie shop (run_cloud / webpanel).
 UNICORN_TITLE_MARKERS = (
     "unicorn",
@@ -157,9 +161,27 @@ def is_unicorn_customer_bot() -> bool:
     return False
 
 
-def _list_shops() -> list[dict]:
+def shop_is_active(shop: dict | None) -> bool:
+    """Missing/NULL active counts as visible (pre-column rows)."""
+    if not shop:
+        return False
+    if "active" not in shop:
+        return True
+    val = shop.get("active")
+    if val is None:
+        return True
+    try:
+        return int(val) != 0
+    except (TypeError, ValueError):
+        return True
+
+
+def _list_shops(*, active_only: bool = False) -> list[dict]:
     with db.get_db() as conn:
-        return [dict(r) for r in conn.execute("SELECT * FROM shops").fetchall()]
+        rows = [dict(r) for r in conn.execute("SELECT * FROM shops").fetchall()]
+    if not active_only:
+        return rows
+    return [s for s in rows if shop_is_active(s)]
 
 
 def _product_count(chat_id: int) -> int:
@@ -211,7 +233,7 @@ def find_catalog_shop() -> dict | None:
     (newest paid wins) → any stocked shop (newest paid). Empty env pins
     and brand-false-positive groups are skipped.
     """
-    shops = _list_shops()
+    shops = _list_shops(active_only=True)
     if not shops:
         return None
 
@@ -222,7 +244,11 @@ def find_catalog_shop() -> dict | None:
         except Exception:
             sid = env_id
         shop = db.get_shop(sid) or db.get_shop(env_id)
-        if shop and _product_count(int(shop["chat_id"])) > 0:
+        if (
+            shop
+            and shop_is_active(shop)
+            and _product_count(int(shop["chat_id"])) > 0
+        ):
             return shop
 
     unicorns = [s for s in shops if shop_title_looks_unicorn(s.get("title"))]
@@ -296,26 +322,40 @@ def recent_orders_snapshot(limit: int = 20) -> list[dict]:
 
 
 def keep_only_catalog_shop() -> dict:
-    """Reattach extra-shop orders to the catalog shop. Never DELETE.
+    """Reattach extra-shop orders to the catalog shop and soft-hide extras.
 
     Mini App POST /order writes to whichever shop the Pages key was bound to.
     Extra personal /start shops and old Unicorn-titled binds must not orphan
-    those rows. Products and shop rows stay. Idempotent.
+    those rows. Soft-sets shops.active=0 on every non-keeper shop. Never
+    DELETE shops, products, or inventory.db. Idempotent.
     """
     shop = find_catalog_shop()
     if not shop:
-        return {"ok": False, "skipped": "no catalog shop", "moved": 0, "stray_shops": 0}
+        return {
+            "ok": False,
+            "skipped": "no catalog shop",
+            "moved": 0,
+            "stray_shops": 0,
+            "deactivated": 0,
+        }
     try:
         keeper = int(shop["chat_id"])
     except (TypeError, ValueError, KeyError):
-        return {"ok": False, "skipped": "bad catalog shop", "moved": 0, "stray_shops": 0}
+        return {
+            "ok": False,
+            "skipped": "bad catalog shop",
+            "moved": 0,
+            "stray_shops": 0,
+            "deactivated": 0,
+        }
 
     moved = 0
     stray_shops = 0
+    deactivated = 0
     try:
         with db.get_db() as conn:
             extras = conn.execute(
-                "SELECT chat_id FROM shops WHERE chat_id != ?",
+                "SELECT * FROM shops WHERE chat_id != ?",
                 (keeper,),
             ).fetchall()
             for row in extras:
@@ -325,22 +365,28 @@ def keep_only_catalog_shop() -> dict:
                     (extra,),
                 ).fetchone()
                 n_ord = int((n_ord_row["c"] if n_ord_row else 0) or 0)
-                if n_ord <= 0:
-                    continue
-                cur = conn.execute(
-                    "UPDATE orders SET chat_id = ? WHERE chat_id = ?",
-                    (keeper, extra),
-                )
-                n = int(cur.rowcount or 0)
-                if n:
-                    moved += n
-                    stray_shops += 1
+                if n_ord > 0:
+                    cur = conn.execute(
+                        "UPDATE orders SET chat_id = ? WHERE chat_id = ?",
+                        (keeper, extra),
+                    )
+                    n = int(cur.rowcount or 0)
+                    if n:
+                        moved += n
+                        stray_shops += 1
+                if shop_is_active(dict(row)):
+                    conn.execute(
+                        "UPDATE shops SET active = 0 WHERE chat_id = ?",
+                        (extra,),
+                    )
+                    deactivated += 1
     except Exception:
         return {
             "ok": False,
             "skipped": "reattach failed",
             "moved": moved,
             "stray_shops": stray_shops,
+            "deactivated": deactivated,
             "keeper": keeper,
         }
 
@@ -355,4 +401,344 @@ def keep_only_catalog_shop() -> dict:
         "keeper": keeper,
         "moved": moved,
         "stray_shops": stray_shops,
+        "deactivated": deactivated,
+    }
+
+
+def _norm_product_name(name: str | None) -> str:
+    try:
+        from catalog_cleanup import sanitize_catalog_text
+
+        s = sanitize_catalog_text(str(name or ""))
+    except Exception:
+        s = str(name or "")
+    return " ".join(s.split()).casefold()
+
+
+def _stocks_all_placeholder(stocks: list[int]) -> bool:
+    if not stocks:
+        return True
+    return all(int(s) == PLACEHOLDER_STOCK for s in stocks)
+
+
+def _sku_snapshot(products: list[dict]) -> dict[str, int]:
+    n = len(products)
+    nonzero = sum(1 for p in products if int(p.get("stock") or 0) > 0)
+    tens = sum(1 for p in products if int(p.get("stock") or 0) == PLACEHOLDER_STOCK)
+    return {"sku": n, "nonzero": nonzero, "placeholder_10": tens}
+
+
+def _stock_index_from_rows(
+    rows: list[dict],
+    *,
+    prefer_unicorn: bool = True,
+    prefer_chat_id: int | None = None,
+) -> dict[str, dict[str, int]]:
+    """sku/name → stock. Keeper chat_id, then Unicorn-titled shops, overwrite."""
+    ranked: list[tuple[int, dict]] = []
+    prefer = int(prefer_chat_id) if prefer_chat_id else 0
+    for p in rows:
+        title = ""
+        try:
+            cid = int(p.get("chat_id") or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        try:
+            shop = db.get_shop(cid)
+            title = (shop or {}).get("title") or ""
+        except Exception:
+            title = ""
+        rank = 0
+        if prefer_unicorn and shop_title_looks_unicorn(title):
+            rank = 1
+        if prefer and cid == prefer:
+            rank = 2
+        ranked.append((rank, p))
+    ranked.sort(key=lambda t: t[0])  # low first; keeper overwrites
+    idx: dict[str, dict[str, int]] = {"sku": {}, "name": {}}
+    for _flag, p in ranked:
+        try:
+            stock = int(p.get("stock") or 0)
+        except (TypeError, ValueError):
+            continue
+        if stock < 0:
+            continue
+        sku = str(p.get("sku") or "").strip().casefold()
+        name = _norm_product_name(p.get("name"))
+        if sku:
+            _put_stock(idx["sku"], sku, stock)
+        if name:
+            _put_stock(idx["name"], name, stock)
+    return idx
+
+
+def _put_stock(bucket: dict[str, int], key: str, stock: int) -> None:
+    """Keep a real shelf count; do not let placeholder 10s overwrite it."""
+    if not key:
+        return
+    prev = bucket.get(key)
+    if (
+        prev is not None
+        and prev != PLACEHOLDER_STOCK
+        and stock == PLACEHOLDER_STOCK
+    ):
+        return
+    bucket[key] = stock
+
+
+def _index_has_stock(idx: dict[str, dict[str, int]]) -> bool:
+    return bool(idx.get("sku") or idx.get("name"))
+
+
+def _vault_stock_map(
+    keeper: int | None = None,
+) -> tuple[dict[str, dict[str, int]], str]:
+    """Load product stock from /data/backups or BACKUP_DIR. Empty if unusable."""
+    import backup as backup_mod
+    from pathlib import Path
+
+    passphrase = backup_mod.passphrase_from_env()
+    if not passphrase:
+        return {"sku": {}, "name": {}}, "no_passphrase"
+
+    dirs: list[Path] = []
+    env_raw = (os.getenv("BACKUP_DIR") or "").strip()
+    if env_raw:
+        dirs.append(Path(env_raw))
+    try:
+        db_vault = Path(db.get_db_path()).resolve().parent / "backups"
+        if db_vault not in dirs:
+            dirs.append(db_vault)
+    except Exception:
+        pass
+    data_vault = Path("/data/backups")
+    if data_vault.is_dir() and data_vault not in dirs:
+        dirs.append(data_vault)
+
+    last_reason = "no_vault"
+    for folder in dirs:
+        enc = backup_mod.pick_vault_backup(folder)
+        if enc is None:
+            continue
+        try:
+            rows = backup_mod.read_products_from_encrypted_backup(enc, passphrase)
+        except Exception:
+            last_reason = "vault_decrypt_failed"
+            continue
+        stocks = []
+        for r in rows:
+            try:
+                stocks.append(int(r.get("stock") or 0))
+            except (TypeError, ValueError):
+                continue
+        if _stocks_all_placeholder(stocks):
+            last_reason = "vault_placeholder"
+            continue
+        mapping = _stock_index_from_rows(
+            rows, prefer_unicorn=True, prefer_chat_id=keeper
+        )
+        if _index_has_stock(mapping):
+            return mapping, "vault"
+        last_reason = "vault_empty"
+    return {"sku": {}, "name": {}}, last_reason
+
+
+def _other_unicorn_shop_stock_index(keeper: int) -> dict[str, dict[str, int]]:
+    """Last known Unicorn catalog stock sitting on extra (often inactive) shops."""
+    rows: list[dict] = []
+    for shop in _list_shops(active_only=False):
+        try:
+            sid = int(shop["chat_id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if sid == keeper:
+            continue
+        if not shop_title_looks_unicorn(shop.get("title")):
+            continue
+        try:
+            rows.extend(db.list_products(sid, active_only=False))
+        except Exception:
+            continue
+    stocks = []
+    for r in rows:
+        try:
+            stocks.append(int(r.get("stock") or 0))
+        except (TypeError, ValueError):
+            continue
+    if _stocks_all_placeholder(stocks):
+        return {"sku": {}, "name": {}}
+    return _stock_index_from_rows(rows, prefer_unicorn=True)
+
+
+def _audit_stock_index(live: list[dict]) -> dict[str, dict[str, int]]:
+    """Most recent non-placeholder stock_after/before per live product."""
+    idx: dict[str, dict[str, int]] = {"sku": {}, "name": {}}
+    for p in live:
+        try:
+            pid = int(p["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        try:
+            audit = db.list_stock_audit(product_id=pid, limit=50)
+        except Exception:
+            audit = []
+        chosen: int | None = None
+        for row in audit:
+            for key in ("stock_after", "stock_before"):
+                raw = row.get(key)
+                if raw is None:
+                    continue
+                try:
+                    val = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if val == PLACEHOLDER_STOCK:
+                    continue
+                if val < 0:
+                    continue
+                chosen = val
+                break
+            if chosen is not None:
+                break
+        if chosen is None:
+            continue
+        sku = str(p.get("sku") or "").strip().casefold()
+        name = _norm_product_name(p.get("name"))
+        if sku:
+            idx["sku"][sku] = chosen
+        if name:
+            idx["name"][name] = chosen
+    return idx
+
+
+def _apply_stock_index(
+    live: list[dict], idx: dict[str, dict[str, int]]
+) -> tuple[int, int]:
+    """Write recalled stock via adjust_stock. Returns (updated, skipped_placeholder)."""
+    name_counts: dict[str, int] = {}
+    for p in live:
+        name = _norm_product_name(p.get("name"))
+        if name:
+            name_counts[name] = name_counts.get(name, 0) + 1
+
+    updated = 0
+    skipped_placeholder = 0
+    sku_idx = idx.get("sku") or {}
+    name_idx = idx.get("name") or {}
+    for p in live:
+        try:
+            old = int(p.get("stock") or 0)
+            pid = int(p["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        sku = str(p.get("sku") or "").strip().casefold()
+        name = _norm_product_name(p.get("name"))
+        new: int | None = None
+        if sku and sku in sku_idx:
+            new = int(sku_idx[sku])
+        if (
+            new is None or new == PLACEHOLDER_STOCK
+        ) and name and name_counts.get(name, 0) == 1 and name in name_idx:
+            named = int(name_idx[name])
+            if new is None or named != PLACEHOLDER_STOCK:
+                new = named
+        if new is None:
+            continue
+        if new < 0:
+            continue
+        if new == old:
+            continue
+        if new == PLACEHOLDER_STOCK and old != PLACEHOLDER_STOCK:
+            skipped_placeholder += 1
+            continue
+        delta = new - old
+        if delta == 0:
+            continue
+        got = db.adjust_stock(pid, delta, reason="stock_recall")
+        if got is not None:
+            updated += 1
+    return updated, skipped_placeholder
+
+
+def recall_catalog_stock() -> dict:
+    """Restore catalog shelf counts from vault / extra Unicorn shop / stock_audit.
+
+    Never replaces inventory.db. Never invents placeholder 10s. Shop-scoped to
+    find_catalog_shop(). Idempotent when live stock already matches the source.
+    """
+    shop = find_catalog_shop()
+    if not shop:
+        return {
+            "ok": False,
+            "skipped": "no catalog shop",
+            "source": "none",
+            "updated": 0,
+            "sku_before": 0,
+            "sku_after": 0,
+            "nonzero_before": 0,
+            "nonzero_after": 0,
+            "skipped_placeholder": 0,
+        }
+    try:
+        keeper = int(shop["chat_id"])
+    except (TypeError, ValueError, KeyError):
+        return {
+            "ok": False,
+            "skipped": "bad catalog shop",
+            "source": "none",
+            "updated": 0,
+            "sku_before": 0,
+            "sku_after": 0,
+            "nonzero_before": 0,
+            "nonzero_after": 0,
+            "skipped_placeholder": 0,
+        }
+
+    live = db.list_products(keeper, active_only=False)
+    before = _sku_snapshot(live)
+
+    mapping, vault_reason = _vault_stock_map(keeper)
+    source = "vault" if _index_has_stock(mapping) else "none"
+    if not _index_has_stock(mapping):
+        mapping = _other_unicorn_shop_stock_index(keeper)
+        if _index_has_stock(mapping):
+            source = "catalog"
+    if not _index_has_stock(mapping):
+        mapping = _audit_stock_index(live)
+        if _index_has_stock(mapping):
+            source = "stock_audit"
+
+    if not _index_has_stock(mapping):
+        after = _sku_snapshot(live)
+        skipped = vault_reason if vault_reason not in ("vault",) else "no_source"
+        return {
+            "ok": True,
+            "skipped": skipped,
+            "source": "none",
+            "updated": 0,
+            "sku_before": before["sku"],
+            "sku_after": after["sku"],
+            "nonzero_before": before["nonzero"],
+            "nonzero_after": after["nonzero"],
+            "placeholder_10_before": before["placeholder_10"],
+            "placeholder_10_after": after["placeholder_10"],
+            "skipped_placeholder": 0,
+            "keeper": keeper,
+        }
+
+    updated, skipped_placeholder = _apply_stock_index(live, mapping)
+    after_live = db.list_products(keeper, active_only=False)
+    after = _sku_snapshot(after_live)
+    return {
+        "ok": True,
+        "source": source,
+        "updated": updated,
+        "sku_before": before["sku"],
+        "sku_after": after["sku"],
+        "nonzero_before": before["nonzero"],
+        "nonzero_after": after["nonzero"],
+        "placeholder_10_before": before["placeholder_10"],
+        "placeholder_10_after": after["placeholder_10"],
+        "skipped_placeholder": skipped_placeholder,
+        "keeper": keeper,
     }

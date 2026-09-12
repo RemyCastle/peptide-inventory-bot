@@ -116,9 +116,10 @@ def _cleanup_unicorn_catalog() -> None:
 
 
 def _keep_only_catalog_shop() -> None:
-    """Reattach stray Mini App orders to the Pages catalog shop.
+    """Reattach stray Mini App orders and soft-hide extra shops.
 
-    Never deletes shops, products, or orders. Unicorn customer bot only.
+    Never deletes shops, products, or orders. Never wipes inventory.db.
+    Unicorn customer bot only.
     """
     import unicorn_shop
 
@@ -151,6 +152,24 @@ def _keep_only_catalog_shop() -> None:
             f"username={row.get('username')}",
             flush=True,
         )
+
+
+def _recall_catalog_stock() -> None:
+    """Restore Unicorn catalog stock from vault / extra shop / stock_audit.
+
+    Never replaces inventory.db. Never invents placeholder 10s.
+    Unicorn customer bot only.
+    """
+    import unicorn_shop
+
+    if not unicorn_shop.is_unicorn_customer_bot():
+        log.info("unicorn stock recall: skip (not customer bot)")
+        print("[run_cloud] unicorn stock recall: skip (not customer bot)", flush=True)
+        return
+    result = unicorn_shop.recall_catalog_stock()
+    spbc_notify.set_stock_recall_result(result)
+    log.info("unicorn stock recall: %s", result)
+    print(f"[run_cloud] unicorn stock recall: {result}", flush=True)
 
 
 def _bind_vendor_miniapps() -> None:
@@ -215,6 +234,11 @@ def _bind_vendor_miniapps() -> None:
         _keep_only_catalog_shop()
     except Exception:
         log.exception("unicorn keep-only catalog failed (continuing boot)")
+
+    try:
+        _recall_catalog_stock()
+    except Exception:
+        log.exception("unicorn stock recall failed (continuing boot)")
 
     # Optional multi-vendor JSON: each entry may include invite + shop_chat_id + name
     raw = (os.getenv("VENDOR_STORES_JSON") or "").strip()

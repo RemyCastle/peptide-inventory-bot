@@ -82,10 +82,53 @@ def build_zip_bytes(db_path: Path, extra_meta: Optional[dict] = None) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("meta.json", json.dumps(meta, indent=2))
-        # Consistent copy even if writers are active
-        raw = db_path.read_bytes()
+        # Consistent copy even if writers are active (includes WAL).
+        raw = _consistent_db_bytes(db_path)
         zf.writestr("inventory.db", raw)
     return buf.getvalue()
+
+
+def _consistent_db_bytes(db_path: Path) -> bytes:
+    """Snapshot sqlite including WAL via the backup API. Never touches dest live path.
+
+    Do not use `file:C:/...` URIs — on Windows sqlite treats `C` as the host and
+    can open a different database. Path.as_uri() is `file:///C:/...` and is safe.
+    """
+    import sqlite3
+    import tempfile
+
+    db_path = Path(db_path).resolve()
+    tmp: Optional[Path] = None
+    src: Optional[sqlite3.Connection] = None
+    dest: Optional[sqlite3.Connection] = None
+    try:
+        src = sqlite3.connect(str(db_path))
+        fd, name = tempfile.mkstemp(suffix=".snap.db")
+        os.close(fd)
+        tmp = Path(name)
+        dest = sqlite3.connect(str(tmp))
+        src.backup(dest)
+        dest.close()
+        dest = None
+        return tmp.read_bytes()
+    except Exception:
+        return db_path.read_bytes()
+    finally:
+        if dest is not None:
+            try:
+                dest.close()
+            except Exception:
+                pass
+        if src is not None:
+            try:
+                src.close()
+            except Exception:
+                pass
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def encrypt_blob(plaintext: bytes, passphrase: str) -> bytes:
@@ -277,3 +320,82 @@ def list_backups(backup_dir: Path) -> list[Path]:
         return []
     files = sorted(backup_dir.glob("*.enc"), key=lambda p: p.stat().st_mtime, reverse=True)
     return files
+
+
+def read_products_from_encrypted_backup(
+    enc_path: Path,
+    passphrase: str,
+) -> list[dict]:
+    """Decrypt a vault snapshot and return product rows. Does not touch dest DB.
+
+    Used to recall stock onto the live catalog without replacing inventory.db.
+    """
+    import sqlite3
+    import tempfile
+
+    enc_path = Path(enc_path)
+    blob = enc_path.read_bytes()
+    zip_bytes = decrypt_blob(blob, passphrase)
+
+    tmp_path: Optional[Path] = None
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        with zipfile.ZipFile(__import__("io").BytesIO(zip_bytes), "r") as zf:
+            if "inventory.db" not in zf.namelist():
+                raise ValueError("Backup zip missing inventory.db")
+            data = zf.read("inventory.db")
+        fd, name = tempfile.mkstemp(suffix=".recall.db")
+        os.close(fd)
+        tmp_path = Path(name)
+        tmp_path.write_bytes(data)
+        conn = sqlite3.connect(str(tmp_path))
+        conn.row_factory = sqlite3.Row
+        cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(products)").fetchall()
+        }
+        select_cols = ["id", "chat_id", "name", "stock", "active"]
+        if "sku" in cols:
+            select_cols.append("sku")
+        if "unit" in cols:
+            select_cols.append("unit")
+        rows = conn.execute(
+            f"SELECT {', '.join(select_cols)} FROM products"
+        ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            item = dict(r)
+            if "sku" not in item:
+                item["sku"] = ""
+            out.append(item)
+        return out
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def pick_vault_backup(backup_dir: Path) -> Optional[Path]:
+    """Prefer latest.enc, else newest dated *.enc. None if the vault is empty."""
+    backup_dir = Path(backup_dir)
+    if not backup_dir.is_dir():
+        return None
+    latest = backup_dir / "latest.enc"
+    if latest.is_file():
+        return latest
+    dated = [
+        p
+        for p in backup_dir.glob("*.enc")
+        if p.is_file() and p.name != "latest.enc"
+    ]
+    if not dated:
+        return None
+    dated.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return dated[0]

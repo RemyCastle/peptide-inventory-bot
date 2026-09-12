@@ -1140,6 +1140,7 @@ def live_git_sha() -> str:
 
 _catalog_cleanup_last: dict[str, Any] | None = None
 _keep_only_last: dict[str, Any] | None = None
+_stock_recall_last: dict[str, Any] | None = None
 
 
 def set_catalog_cleanup_result(result: dict | None) -> None:
@@ -1176,11 +1177,36 @@ def set_keep_only_result(result: dict | None) -> None:
         "ok": bool(result.get("ok")),
         "moved": int(result.get("moved") or 0),
         "stray_shops": int(result.get("stray_shops") or 0),
+        "deactivated": int(result.get("deactivated") or 0),
     }
     skipped = result.get("skipped")
     if skipped:
         out["skipped"] = str(skipped)[:80]
     _keep_only_last = out
+
+
+def set_stock_recall_result(result: dict | None) -> None:
+    """Remember last catalog stock recall for /health (counts only, no chat ids)."""
+    global _stock_recall_last
+    if not result:
+        _stock_recall_last = None
+        return
+    out: dict[str, Any] = {
+        "ok": bool(result.get("ok")),
+        "source": str(result.get("source") or "none")[:40],
+        "updated": int(result.get("updated") or 0),
+        "sku_before": int(result.get("sku_before") or 0),
+        "sku_after": int(result.get("sku_after") or 0),
+        "nonzero_before": int(result.get("nonzero_before") or 0),
+        "nonzero_after": int(result.get("nonzero_after") or 0),
+        "placeholder_10_before": int(result.get("placeholder_10_before") or 0),
+        "placeholder_10_after": int(result.get("placeholder_10_after") or 0),
+        "skipped_placeholder": int(result.get("skipped_placeholder") or 0),
+    }
+    skipped = result.get("skipped")
+    if skipped:
+        out["skipped"] = str(skipped)[:80]
+    _stock_recall_last = out
 
 
 def _status_body() -> dict:
@@ -1212,6 +1238,8 @@ def _status_body() -> dict:
         body["git_sha"] = sha
     if _catalog_cleanup_last is not None:
         body["catalog_cleanup"] = dict(_catalog_cleanup_last)
+    if _stock_recall_last is not None:
+        body["stock_recall"] = dict(_stock_recall_last)
     try:
         import db as _db
         import unicorn_shop

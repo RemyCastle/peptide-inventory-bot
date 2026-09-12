@@ -393,6 +393,8 @@ def init_db() -> None:
         # Min total cart qty (vials/kits). 0 = no minimum.
         _ensure_column(conn, "shops", "min_order_qty", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "shops", "min_order_label", "TEXT")
+        # Soft-hide extra shops. Default 1 so existing rows stay visible.
+        _ensure_column(conn, "shops", "active", "INTEGER NOT NULL DEFAULT 1")
 
         # Structured payment method fields (name/instructions remain buyer-facing)
         _ensure_column(conn, "payment_methods", "method_type", "TEXT")
@@ -813,6 +815,7 @@ def update_shop(chat_id: int, **fields: Any) -> None:
         "low_stock_threshold",
         "min_order_qty",
         "min_order_label",
+        "active",
         "setup_complete",
         "inventory_master_chat_id",
         "hidden_service_fee",

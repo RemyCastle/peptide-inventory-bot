@@ -1173,6 +1173,7 @@ def api_state(tok: dict) -> tuple[int, dict]:
         welcome = sanitize_multiline(shop.get("welcome_text"), 500)
     except Exception:
         welcome = shop.get("welcome_text") or ""
+    disp = db.shop_display(shop)
     return 200, {
         "ok": True,
         "shop": {
@@ -1185,9 +1186,10 @@ def api_state(tok: dict) -> tuple[int, dict]:
             "shipping_enabled": int(shop.get("shipping_enabled") or 0),
             "shipping_fee": float(shop.get("shipping_fee") or 0),
             "free_shipping_above": float(shop.get("free_shipping_above") or 0),
-            "shipping_label": _buyer_field(shop.get("shipping_label"), 40) or "",
-            "min_order_label": _buyer_field(shop.get("min_order_label"), 40)
-            or "vial",
+            "shipping_label": disp.get("shipping_label") or "Standard shipping",
+            "min_order_qty": int(disp.get("min_order_qty") or 0),
+            "min_order_label": disp.get("min_order_label") or "vial",
+            "low_stock_threshold": int(disp.get("low_stock_threshold") or 0),
             "shipping_zones": _buyer_zones(db.parse_shipping_zones(shop)),
             "is_unicorn": _shop_is_unicorn(chat_id, shop.get("title")),
             "checkout_ready": checkout_ready,
@@ -1687,6 +1689,12 @@ def api_shipping(tok: dict, payload: dict) -> tuple[int, dict]:
             if encoded is None:
                 return _err(400, "Bad shipping zones")
             fields["shipping_zones"] = encoded
+    label_raw = payload.get("label")
+    if label_raw is None:
+        label_raw = payload.get("shipping_label")
+    if label_raw is not None:
+        label = _buyer_field(label_raw, 40) or "Standard shipping"
+        fields["shipping_label"] = label
     if not fields:
         return _err(400, "Nothing to update")
     db.update_shop(tok["chat_id"], **fields)
@@ -1708,9 +1716,34 @@ def api_shop(tok: dict, payload: dict) -> tuple[int, dict]:
         except Exception:
             welcome = str(payload.get("welcome_text") or "").strip()[:500]
         fields["welcome_text"] = welcome or None
-    if not fields:
+    min_qty = payload.get("min_order_qty")
+    if min_qty is None:
+        min_qty = payload.get("min_order")
+    min_label = payload.get("min_order_label")
+    if min_qty is not None:
+        ok_min, min_msg = db.set_min_order(
+            tok["chat_id"], min_qty, label=min_label
+        )
+        if not ok_min:
+            return _err(400, min_msg or "Bad min order")
+    elif min_label is not None:
+        shop = db.get_shop(tok["chat_id"]) or {}
+        qty = int((shop.get("min_order_qty") or 0) or 0)
+        ok_min, min_msg = db.set_min_order(tok["chat_id"], qty, label=min_label)
+        if not ok_min:
+            return _err(400, min_msg or "Bad min order label")
+    if payload.get("low_stock_threshold") is not None:
+        try:
+            thresh = int(payload.get("low_stock_threshold"))
+        except (TypeError, ValueError):
+            return _err(400, "Bad low_stock_threshold")
+        if thresh < 0 or thresh > 10_000:
+            return _err(400, "Bad low_stock_threshold")
+        fields["low_stock_threshold"] = thresh
+    if not fields and min_qty is None and min_label is None:
         return _err(400, "Nothing to update")
-    db.update_shop(tok["chat_id"], **fields)
+    if fields:
+        db.update_shop(tok["chat_id"], **fields)
     return 200, {"ok": True}
 
 
@@ -3267,6 +3300,8 @@ function render(){
       Orders${actionable?` (${actionable})`:''}</button>
     <button type="button" data-tab="catalog" class="${TAB==='catalog'?'on':''}">
       Catalog</button>
+    <button type="button" data-tab="payments" class="${TAB==='payments'?'on':''}">
+      Payments</button>
     <button type="button" data-tab="settings" class="${TAB==='settings'?'on':''}">
       Settings</button>
   </div>
@@ -3351,6 +3386,8 @@ function render(){
           Add <b>kit:294</b> for kit pricing.</span>
         <button class="sub" id="bulk-go">Import</button></div></div>
   </div>
+  </div>
+  <div id="tab-payments" class="${TAB==='payments'?'':'hide'}">
   <div class="card"><h2>Payment methods</h2>
     <p class="tag" style="margin:0 0 10px">Buyers see these at checkout. Edit anytime and hit Save — changes apply immediately.</p>
     ${(()=>{const enabled=(S.payments||[]).filter(m=>m.active);
@@ -3428,6 +3465,7 @@ function render(){
     <div class="row"><div class="name"><label>Shop name</label>
       <input id="shop-title" value="${esc(sh.title)}"></div>
       <div><button class="sub" id="shop-save">Save</button></div></div>
+    <span class="tag">Name buyers see on the storefront and receipts.</span>
   </div>
   <div class="card"><h2>Shipping</h2>
     <div class="row">
@@ -3438,8 +3476,26 @@ function render(){
         <input id="sh-fee" type="number" step="0.01" min="0" value="${sh.shipping_fee}"></div>
       <div class="num"><label>Free over</label>
         <input id="sh-free" type="number" step="0.01" min="0" value="${sh.free_shipping_above}"></div>
+    </div>
+    <div class="row">
+      <div class="name"><label>Shipping label</label>
+        <input id="sh-label" value="${esc(sh.shipping_label||'Standard shipping')}"
+          maxlength="40" placeholder="Standard shipping"></div>
       <div><button class="sub" id="sh-save">Save</button></div></div>
     <span class="tag">Changes apply to new checkouts immediately.</span>
+  </div>
+  <div class="card"><h2>Orders</h2>
+    <div class="row">
+      <div class="num"><label>Min order qty</label>
+        <input id="min-qty" type="number" step="1" min="0" value="${sh.min_order_qty||0}"></div>
+      <div class="name"><label>Min order unit</label>
+        <input id="min-label" value="${esc(sh.min_order_label||'vial')}" maxlength="20"
+          placeholder="vial"></div>
+      <div class="num" style="max-width:120px"><label>Low-stock alert</label>
+        <input id="low-stock" type="number" step="1" min="0"
+          value="${sh.low_stock_threshold||0}"></div>
+      <div><button class="sub" id="ord-set-save">Save</button></div></div>
+    <span class="tag">Min qty 0 = no minimum. Low-stock alerts when shelf count hits this number.</span>
   </div>
   </div>`;
   wire();}
@@ -3609,12 +3665,14 @@ function wire(){
     el.querySelector('.b-up').onclick=()=>swapOrder(-1);
     el.querySelector('.b-dn').onclick=()=>swapOrder(1);
   });
-  $('#np-add').onclick=async()=>{
+  const npAdd=$('#np-add');
+  if(npAdd)npAdd.onclick=async()=>{
     const d=await api('product',{name:$('#np-name').value,
       price:$('#np-price').value,stock:$('#np-stock').value||0,
       kit_price:$('#np-kit').value||null});
     if(d.ok){toast('Product added');load();}};
-  $('#bulk-go').onclick=async()=>{
+  const bulkGo=$('#bulk-go');
+  if(bulkGo)bulkGo.onclick=async()=>{
     const d=await api('bulk',{text:$('#bulk').value});
     if(d.ok){toast(`Imported: ${d.created} new, ${d.updated} updated`+
       (d.errors.length?`, ${d.errors.length} errors`:''));load();}};
@@ -3686,15 +3744,25 @@ function wire(){
       else toast(d.error||'Could not add',true);
     };
   });
-  $('#pm-add').onclick=async()=>{
+  const pmAdd=$('#pm-add');
+  if(pmAdd)pmAdd.onclick=async()=>{
     const name=$('#pm-name').value.trim();
     if(!name){toast('Name required',true);return;}
     const d=await api('payment',{method_type:'custom',name,instructions:''});
     if(d.ok){toast('Added — write instructions and Save');load();}};
-  $('#sh-save').onclick=async()=>{
+  const shSave=$('#sh-save');
+  if(shSave)shSave.onclick=async()=>{
     const d=await api('shipping',{enabled:$('#sh-on').checked,
-      fee:$('#sh-fee').value,free_above:$('#sh-free').value});
-    if(d.ok)toast('Shipping saved');};}
+      fee:$('#sh-fee').value,free_above:$('#sh-free').value,
+      label:($('#sh-label')||{}).value||''});
+    if(d.ok)toast('Shipping saved');};
+  const ordSet=$('#ord-set-save');
+  if(ordSet)ordSet.onclick=async()=>{
+    const d=await api('shop',{
+      min_order_qty:($('#min-qty')||{}).value||0,
+      min_order_label:($('#min-label')||{}).value||'vial',
+      low_stock_threshold:($('#low-stock')||{}).value||0});
+    if(d.ok)toast('Order settings saved');};}
 load();
 </script>
 </body>

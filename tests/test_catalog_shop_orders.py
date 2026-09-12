@@ -154,17 +154,25 @@ class CatalogShopOrderTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(int(result["keeper"]), CATALOG)
         self.assertGreaterEqual(int(result["moved"]), 2)
+        self.assertGreaterEqual(int(result["deactivated"]), 2)
         moved = db.get_order(int(stray["id"]))
         self.assertEqual(int(moved["chat_id"]), CATALOG)
         moved_other = db.get_order(int(other_order["id"]))
         self.assertEqual(int(moved_other["chat_id"]), CATALOG)
-        self.assertIsNotNone(db.get_shop(PERSONAL))
-        self.assertIsNotNone(db.get_shop(OTHER))
+        # Soft-hide extras — never DELETE shops or their inventory rows.
+        personal = db.get_shop(PERSONAL)
+        other = db.get_shop(OTHER)
+        self.assertIsNotNone(personal)
+        self.assertIsNotNone(other)
+        self.assertEqual(int(personal["active"] or 0), 0)
+        self.assertEqual(int(other["active"] or 0), 0)
         self.assertEqual(
             len(db.list_products(CATALOG, active_only=False)), n_prod_before
         )
         self.assertEqual(len(db.list_products(PERSONAL, active_only=True)), 1)
         self.assertEqual(len(db.list_products(OTHER, active_only=True)), 1)
+        catalog = unicorn_shop.find_catalog_shop()
+        self.assertEqual(int(catalog["chat_id"]), CATALOG)
         codes = {o["payment_code"] for o in db.list_orders(CATALOG, limit=20)}
         self.assertIn(stray["payment_code"], codes)
         self.assertIn(self.order["payment_code"], codes)
@@ -175,7 +183,10 @@ class CatalogShopOrderTests(unittest.TestCase):
         second = unicorn_shop.keep_only_catalog_shop()
         self.assertTrue(second["ok"])
         self.assertEqual(int(second["moved"]), 0)
+        self.assertEqual(int(second["deactivated"]), 0)
         self.assertEqual(int(first["keeper"]), CATALOG)
+        self.assertIsNotNone(db.get_shop(PERSONAL))
+        self.assertIsNotNone(db.get_shop(OTHER))
 
     def test_cmd_orders_lists_catalog_not_personal_shop(self) -> None:
         replies: list[str] = []

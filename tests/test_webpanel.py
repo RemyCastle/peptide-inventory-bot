@@ -705,6 +705,39 @@ class ApiTests(WebPanelBase):
         self.assertEqual(code, 200)
         self.assertEqual(db.get_shop(SHOP)["title"], "Oliver Peptides")
 
+    def test_shipping_label_and_order_settings(self):
+        code, data = webpanel.api_shipping(
+            self.tok,
+            {
+                "enabled": True,
+                "fee": 12,
+                "free_above": 80,
+                "label": "2-day air",
+            },
+        )
+        self.assertEqual(code, 200, data)
+        shop = db.get_shop(SHOP)
+        self.assertEqual(shop["shipping_label"], "2-day air")
+        self.assertEqual(float(shop["shipping_fee"]), 12)
+        code, data = webpanel.api_shop(
+            self.tok,
+            {
+                "min_order_qty": 2,
+                "min_order_label": "vial",
+                "low_stock_threshold": 4,
+            },
+        )
+        self.assertEqual(code, 200, data)
+        shop = db.get_shop(SHOP)
+        self.assertEqual(int(shop["min_order_qty"]), 2)
+        self.assertEqual(str(shop["min_order_label"]), "vial")
+        self.assertEqual(int(shop["low_stock_threshold"]), 4)
+        code, state = webpanel.api_state(self.tok)
+        self.assertEqual(code, 200)
+        self.assertEqual(state["shop"]["shipping_label"], "2-day air")
+        self.assertEqual(int(state["shop"]["min_order_qty"]), 2)
+        self.assertEqual(int(state["shop"]["low_stock_threshold"]), 4)
+
 
 JPEG = b"\xff\xd8\xff\xe0" + b"x" * 40
 PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 40
@@ -848,6 +881,27 @@ class HttpLayerTests(WebPanelBase):
         self.assertIn("show hidden", html)
         self.assertIn('class="f-sku"', html)
         self.assertIn("duplicate name", html)
+
+    def test_panel_html_payments_tab_and_settings_fields(self):
+        html = webpanel.PANEL_HTML
+        self.assertIn('data-tab="payments"', html)
+        self.assertIn('id="tab-payments"', html)
+        self.assertIn('id="tab-settings"', html)
+        self.assertIn('id="sh-label"', html)
+        self.assertIn('id="sh-fee"', html)
+        self.assertIn('id="sh-free"', html)
+        self.assertIn('id="sh-on"', html)
+        self.assertIn('id="min-qty"', html)
+        self.assertIn('id="min-label"', html)
+        self.assertIn('id="low-stock"', html)
+        self.assertIn("Low-stock alert", html)
+        pay_at = html.find('id="tab-payments"')
+        settings_at = html.find('id="tab-settings"')
+        methods_at = html.find("Payment methods")
+        self.assertGreater(pay_at, 0)
+        self.assertGreater(settings_at, pay_at)
+        self.assertGreater(methods_at, pay_at)
+        self.assertLess(methods_at, settings_at)
 
     def test_state_json_declares_utf8(self):
         raw = webpanel.issue_token(SHOP, USER)
