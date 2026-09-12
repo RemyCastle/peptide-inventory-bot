@@ -644,7 +644,10 @@ def _audit_stock_index(live: list[dict]) -> dict[str, dict[str, int]]:
 
 
 def _apply_stock_index(
-    live: list[dict], idx: dict[str, dict[str, int]]
+    live: list[dict],
+    idx: dict[str, dict[str, int]],
+    *,
+    source: str = "",
 ) -> tuple[int, int]:
     """Write recalled stock via adjust_stock. Returns (updated, skipped_placeholder)."""
     name_counts: dict[str, int] = {}
@@ -682,6 +685,10 @@ def _apply_stock_index(
             continue
         if new == PLACEHOLDER_STOCK and old != PLACEHOLDER_STOCK:
             skipped_placeholder += 1
+            continue
+        # Leftover /start shops often have stock 0 copies. Do not treat that
+        # as last-good inventory over a live positive shelf count.
+        if source == "catalog" and new == 0 and old > 0:
             continue
         delta = new - old
         if delta == 0:
@@ -761,7 +768,9 @@ def recall_catalog_stock() -> dict:
             "keeper": keeper,
         }
 
-    updated, skipped_placeholder = _apply_stock_index(live, mapping)
+    updated, skipped_placeholder = _apply_stock_index(
+        live, mapping, source=source
+    )
     after_live = db.list_products(keeper, active_only=False)
     after = _sku_snapshot(after_live)
     return {

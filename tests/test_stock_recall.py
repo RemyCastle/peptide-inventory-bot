@@ -85,6 +85,18 @@ class StockRecallTests(unittest.TestCase):
         # Never copied the other vendor's 99.
         self.assertEqual(int(db.get_product(self.pid)["stock"]), 47)
 
+    def test_extra_shop_zero_does_not_clobber_live(self) -> None:
+        stray = 41100
+        db.ensure_shop(stray, title="Shop")
+        db.add_product(stray, "BPC-157 5MG", 40.0, stock=0)
+        for p in db.list_products(EXTRA, active_only=False):
+            cur = int(p["stock"])
+            if cur != 10:
+                db.adjust_stock(p["id"], 10 - cur, reason="wipe")
+        result = unicorn_shop.recall_catalog_stock()
+        self.assertEqual(int(db.get_product(self.pid)["stock"]), 10)
+        self.assertEqual(int(result["updated"]), 0)
+
     def test_does_not_invent_placeholder_ten(self) -> None:
         db.adjust_stock(self.pid, 37, reason="shelf")  # 10 → 47
         extra_bpc = next(
