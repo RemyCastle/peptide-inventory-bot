@@ -1391,6 +1391,155 @@ class StorefrontGapTests(unittest.TestCase):
             )
         self.assertIsNone(db.last_ship_details(BUYER))
 
+    def test_order_history_txt_strips_item_ship_track_junk(self) -> None:
+        pid = db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 3)
+        db.add_payment_method(SHOP, "Venmo", "@x")
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer",
+            "Buyer",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "Aod 5mg (vial) $15.00",
+                    "unit_price": 15.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo"},
+            "Buyer",
+            "1 St",
+            "Leave at door",
+        )
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET full_name = ?, username = ?, "
+                "payment_code = ?, ship_name = ?, ship_address = ?, "
+                "ship_notes = ?, tracking_number = ?, tracking_carrier = ? "
+                "WHERE id = ?",
+                (
+                    "Buyer\ufffd",
+                    "buyer\u0000",
+                    "ABC123\ufffd",
+                    "Ship\u0000Name\ufffd",
+                    "1 St\u0000\ufffd",
+                    "Leave\u0000 at door\ufffd",
+                    "1Z\u0000999\ufffd",
+                    "UPS\u200b",
+                    int(order["id"]),
+                ),
+            )
+            conn.execute(
+                "UPDATE order_items SET product_name = ? WHERE order_id = ?",
+                ("Aod 5mg (vial) $15.00\ufffd", int(order["id"])),
+            )
+        text, _ = webpanel.api_order_history_txt(
+            self.tok, "2000-01-01", "2099-12-31"
+        )
+        self.assertIn("Aod 5mg", text)
+        self.assertNotIn("(vial)", text)
+        self.assertIn("Buyer", text)
+        self.assertIn("@buyer", text)
+        self.assertIn("ABC123", text)
+        self.assertIn("ShipName", text)
+        self.assertIn("1 St", text)
+        self.assertIn("Leave at door", text)
+        self.assertIn("1Z999", text)
+        self.assertIn("UPS", text)
+        self.assertNotIn("\ufffd", text)
+        self.assertNotIn("\u0000", text)
+
+    def test_track_html_and_shipped_dm_strip_junk(self) -> None:
+        pid = db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 3)
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer",
+            "Buyer",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "Aod 5mg (vial) $15.00",
+                    "unit_price": 15.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo"},
+            "Buyer",
+            "1 St",
+            "",
+        )
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET payment_code = ?, ship_name = ?, "
+                "ship_address = ?, tracking_number = ?, tracking_carrier = ?, "
+                "status = ? WHERE id = ?",
+                (
+                    "ABC123\ufffd",
+                    "Buyer\u0000\ufffd",
+                    "1 St\u0000\ufffd",
+                    "1Z\u0000999\ufffd",
+                    "UPS\u200b",
+                    "paid",
+                    int(order["id"]),
+                ),
+            )
+            conn.execute(
+                "UPDATE order_items SET product_name = ? WHERE order_id = ?",
+                ("Aod 5mg (vial) $15.00\ufffd", int(order["id"])),
+            )
+        dirty = db.get_order(int(order["id"]))
+        items = db.get_order_items(int(order["id"]))
+        form = webpanel._track_form_html(dirty, items, "ot-test").decode("utf-8")
+        self.assertIn("ABC123", form)
+        self.assertIn("Buyer", form)
+        self.assertIn("1 St", form)
+        self.assertIn("Aod 5mg", form)
+        self.assertNotIn("(vial)", form)
+        self.assertNotIn("\ufffd", form)
+        self.assertNotIn("\u0000", form)
+        html = webpanel._track_success_html(
+            "ABC123\ufffd", "UPS\u200b", "1Z\u0000999\ufffd",
+            "https://www.ups.com/track?tracknum=1Z999",
+        ).decode("utf-8")
+        self.assertIn("ABC123", html)
+        self.assertIn("UPS", html)
+        self.assertIn("1Z999", html)
+        self.assertIn("ups.com", html.lower())
+        self.assertNotIn("\ufffd", html)
+        self.assertNotIn("\u0000", html)
+        dm, car, tn, url = webpanel._buyer_shipped_dm(dirty)
+        self.assertIn("ABC123", dm)
+        self.assertIn("UPS", dm)
+        self.assertIn("1Z999", dm)
+        self.assertNotIn("\ufffd", dm)
+        self.assertNotIn("\u0000", dm)
+        self.assertEqual(car, "UPS")
+        self.assertEqual(tn, "1Z999")
+        self.assertTrue((url or "").startswith("https://"))
+        cancel = webpanel._buyer_cancelled_dm(dirty, refund_note=False)
+        self.assertIn("ABC123", cancel)
+        self.assertNotIn("\ufffd", cancel)
+
+    def test_payment_claim_buyer_text_strips_code_junk(self) -> None:
+        note = vendor_stores.build_payment_claim_buyer_text(
+            {"id": 9, "payment_code": "ABC123\u0000\ufffd"}
+        )
+        self.assertIn("ABC123", note)
+        self.assertNotIn("\ufffd", note)
+        self.assertNotIn("\u0000", note)
+        self.assertIn("I've paid", note)
+
+    def test_filename_and_admin_who_labels_strip_junk(self) -> None:
+        import reports
+
+        self.assertEqual(
+            reports.safe_filename_part("Unicorn\u0000 Magic\ufffd"),
+            "Unicorn_Magic",
+        )
+        self.assertNotIn("\ufffd", reports.safe_filename_part("Shop\ufffd"))
+
 
 if __name__ == "__main__":
     unittest.main()

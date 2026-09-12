@@ -667,6 +667,12 @@ def build_payment_claim_buyer_text(order: dict) -> str:
     """Short vendor-bot DM after Mini App I've paid. Never a secret."""
     oid = order.get("id")
     code = (order.get("payment_code") or (f"#{oid}" if oid else "")).strip()
+    try:
+        from catalog_cleanup import storefront_label
+
+        code = storefront_label(code, 32) or (f"#{oid}" if oid else "")
+    except Exception:
+        code = " ".join(str(code or "").split())[:32]
     return (
         f"We got your payment claim for {code}. "
         "The seller will confirm it — you don't need to tap I've paid again."

@@ -1916,6 +1916,43 @@ def _item_summary(items: list[dict]) -> str:
     return ", ".join(parts) if parts else "—"
 
 
+def _buyer_order_code(order: dict) -> str:
+    return _buyer_field(order.get("payment_code"), 32) or str(order.get("id") or "")
+
+
+def _buyer_cancelled_dm(order: dict, *, refund_note: bool) -> str:
+    code = html.escape(_buyer_order_code(order))
+    text = f"Your order <code>{code}</code> has been cancelled."
+    if refund_note:
+        text += " A refund will be issued to your payment method."
+    return text
+
+
+def _buyer_shipped_dm(
+    order: dict, *, carrier: str = "", tracking_number: str = ""
+) -> tuple[str, str, str, str | None]:
+    """Sanitized HTML shipped DM plus carrier / tracking / url."""
+    code = _buyer_order_code(order)
+    car = (
+        _buyer_field(order.get("tracking_carrier"), 40)
+        or _buyer_field(carrier, 40)
+        or "—"
+    )
+    tn = (
+        _buyer_field(order.get("tracking_number"), 80)
+        or _buyer_field(tracking_number, 80)
+        or ""
+    )
+    url = tracking_url(car if car != "—" else None, tn)
+    text = (
+        f"📦 Your order <code>{html.escape(code)}</code> has shipped! "
+        f"Carrier: {html.escape(car)} · Tracking: {html.escape(tn)}"
+    )
+    if url:
+        text += f"\n🔗 {html.escape(url)}"
+    return text, car, tn, url
+
+
 def _order_public(order: dict) -> dict:
     oid = int(order["id"])
     items = db.get_order_items(oid)
@@ -2040,10 +2077,9 @@ def api_cancel_order(tok: dict, payload: dict) -> tuple[int, dict]:
     if not ok:
         return _err(400, msg or "Could not cancel order")
     order = db.get_order(order_id) or order
-    code = (order.get("payment_code") or str(order_id)).strip()
-    text = f"Your order <code>{code}</code> has been cancelled."
-    if prior_status in _PAID_STATUSES_FOR_REFUND_MSG:
-        text += " A refund will be issued to your payment method."
+    text = _buyer_cancelled_dm(
+        order, refund_note=prior_status in _PAID_STATUSES_FOR_REFUND_MSG
+    )
     notified = notify_order_customer(chat_id, int(order["user_id"]), text)
     return 200, {
         "ok": True,
@@ -2085,16 +2121,9 @@ def api_set_tracking(tok: dict, payload: dict) -> tuple[int, dict]:
             )
             return _err(400, ship_msg or "Could not mark shipped")
     order = db.get_order(order_id) or order
-    code = (order.get("payment_code") or str(order_id)).strip()
-    car = (order.get("tracking_carrier") or carrier or "").strip() or "—"
-    tn = (order.get("tracking_number") or tracking_number).strip()
-    url = tracking_url(car if car != "—" else None, tn)
-    text = (
-        f"📦 Your order <code>{code}</code> has shipped! "
-        f"Carrier: {car} · Tracking: {tn}"
+    text, car, tn, url = _buyer_shipped_dm(
+        order, carrier=carrier, tracking_number=tracking_number
     )
-    if url:
-        text += f"\n🔗 {url}"
     notified = notify_order_customer(chat_id, int(order["user_id"]), text)
     return 200, {
         "ok": True,
@@ -2157,21 +2186,22 @@ def api_order_history_txt(
     blocks.append(header)
     for o in orders:
         items = db.get_order_items(int(o["id"]))
-        uname = (o.get("username") or "").strip()
-        full = (o.get("full_name") or "").strip()
+        uname = _buyer_field(o.get("username"), 40) or ""
+        full = _buyer_field(o.get("full_name"), 80) or ""
         cust = full or (f"@{uname}" if uname else f"user_id={o.get('user_id')}")
         if full and uname:
             cust = f"{full} (@{uname})"
+        code = _buyer_field(o.get("payment_code"), 32) or "—"
         lines = [
             "",
             f"Date:    {o.get('created_at') or '—'}",
-            f"Code:    {o.get('payment_code') or '—'}",
+            f"Code:    {code}",
             f"Status:  {o.get('status') or '—'}",
             f"Customer:{cust}",
             "Items:",
         ]
         for it in items:
-            name = it.get("product_name") or "item"
+            name = _buyer_product_name({"name": it.get("product_name") or "item"})
             qty = int(it.get("quantity") or 0)
             lt = float(it.get("line_total") or 0)
             lines.append(f"  · {name} × {qty} — ${lt:,.2f}")
@@ -2179,17 +2209,23 @@ def api_order_history_txt(
             lines.append("  (no line items)")
         lines.append(f"Shipping: ${float(o.get('shipping_fee') or 0):,.2f}")
         lines.append(f"Total:    ${float(o.get('total') or 0):,.2f}")
-        sn = (o.get("ship_name") or "").strip()
-        sa = (o.get("ship_address") or "").strip().replace("\n", ", ")
-        snotes = (o.get("ship_notes") or "").strip()
+        sn = _buyer_field(o.get("ship_name"), 80) or ""
+        try:
+            from catalog_cleanup import sanitize_multiline
+
+            sa = sanitize_multiline(o.get("ship_address"), 200).replace("\n", ", ")
+            snotes = sanitize_multiline(o.get("ship_notes"), 200)
+        except Exception:
+            sa = (o.get("ship_address") or "").strip().replace("\n", ", ")
+            snotes = (o.get("ship_notes") or "").strip()
         ship_bits = [b for b in (sn, sa, snotes) if b]
         if ship_bits:
             lines.append("Ship to: " + " · ".join(ship_bits))
         else:
             lines.append("Ship to: —")
-        tn = (o.get("tracking_number") or "").strip()
+        tn = _buyer_field(o.get("tracking_number"), 80) or ""
         if tn:
-            car = (o.get("tracking_carrier") or "").strip()
+            car = _buyer_field(o.get("tracking_carrier"), 40) or ""
             lines.append(f"Tracking: {car + ' · ' if car else ''}{tn}")
         lines.append("-" * 48)
         blocks.append("\n".join(lines))
@@ -2232,12 +2268,13 @@ def _track_expired_html() -> bytes:
 
 
 def _track_success_html(code: str, carrier: str, tn: str, url: str | None) -> bytes:
-    code_e = html.escape(code)
-    car_e = html.escape(carrier or "—")
-    tn_e = html.escape(tn)
+    code_e = html.escape(_buyer_field(code, 32) or code or "—")
+    car_e = html.escape(_buyer_field(carrier, 40) or "—")
+    tn_e = html.escape(_buyer_field(tn, 80) or tn or "")
+    clean_url = _buyer_http_url(url) if url else ""
     link = (
-        f'<p><a href="{html.escape(url)}">Open tracking page</a></p>'
-        if url
+        f'<p><a href="{html.escape(clean_url)}">Open tracking page</a></p>'
+        if clean_url
         else ""
     )
     return (
@@ -2256,13 +2293,20 @@ def _track_success_html(code: str, carrier: str, tn: str, url: str | None) -> by
 
 def _track_form_html(order: dict, items: list[dict], raw_ot: str) -> bytes:
     code = html.escape(
-        (order.get("payment_code") or str(order.get("id") or "")).strip()
+        _buyer_field(order.get("payment_code"), 32)
+        or str(order.get("id") or "")
     )
     status = html.escape(str(order.get("status") or "—"))
-    ship_name = html.escape((order.get("ship_name") or "").strip() or "—")
-    ship_addr = html.escape((order.get("ship_address") or "").strip() or "—")
-    cur_car = (order.get("tracking_carrier") or "").strip()
-    cur_tn = (order.get("tracking_number") or "").strip()
+    ship_name = html.escape(_buyer_field(order.get("ship_name"), 80) or "—")
+    try:
+        from catalog_cleanup import sanitize_multiline
+
+        addr_raw = sanitize_multiline(order.get("ship_address"), 200) or "—"
+    except Exception:
+        addr_raw = (order.get("ship_address") or "").strip() or "—"
+    ship_addr = html.escape(addr_raw)
+    cur_car = _buyer_field(order.get("tracking_carrier"), 40) or ""
+    cur_tn = _buyer_field(order.get("tracking_number"), 80) or ""
     summary = html.escape(_item_summary(items))
     ot_e = html.escape(raw_ot)
     options = []
@@ -2397,17 +2441,11 @@ def handle_track_post(
             )
 
     order = db.get_order(order_id) or order
-    code = (order.get("payment_code") or str(order_id)).strip()
-    car = (order.get("tracking_carrier") or carrier or "").strip() or "—"
-    tn = (order.get("tracking_number") or tracking_number).strip()
-    url = tracking_url(car if car != "—" else None, tn)
-    text = (
-        f"📦 Your order <code>{code}</code> has shipped! "
-        f"Carrier: {car} · Tracking: {tn}"
+    text, car, tn, url = _buyer_shipped_dm(
+        order, carrier=carrier, tracking_number=tracking_number
     )
-    if url:
-        text += f"\n🔗 {url}"
     notified = notify_order_customer(shop_chat_id, int(order["user_id"]), text)
+    code = _buyer_order_code(order) or str(order_id)
 
     if wants_json:
         body = {
@@ -2874,10 +2912,9 @@ def handle_cancel_post(
         return 400, "text/html; charset=utf-8", _cancel_error_html(msg or "")
 
     order = db.get_order(order_id) or order
-    code = (order.get("payment_code") or str(order_id)).strip()
-    text = f"Your order <code>{code}</code> has been cancelled."
-    if prior_status in _PAID_STATUSES_FOR_REFUND_MSG:
-        text += " A refund will be issued to your payment method."
+    text = _buyer_cancelled_dm(
+        order, refund_note=prior_status in _PAID_STATUSES_FOR_REFUND_MSG
+    )
     notified = notify_order_customer(shop_chat_id, int(order["user_id"]), text)
 
     if wants_json:

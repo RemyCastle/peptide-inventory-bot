@@ -541,6 +541,59 @@ class GlyphRepairTests(unittest.TestCase):
             "https://cdn.example.com/p%20.png",
         )
 
+    def test_orphan_tag_runs_dropped_complete_flag_kept(self) -> None:
+        england = (
+            "\U0001F3F4\U000E0067\U000E0062\U000E0065"
+            "\U000E006E\U000E0067\U000E007F"
+        )
+        self.assertEqual(cc.sanitize_catalog_text(england), england)
+        self.assertEqual(cc.sanitize_catalog_text("\U000e007f"), "")
+        self.assertEqual(
+            cc.sanitize_catalog_text("\U000e0067\U000e007f West"),
+            "West",
+        )
+        pirate = "🏴\u200d☠️"
+        self.assertEqual(cc.sanitize_catalog_text(pirate), pirate)
+        # Black flag + cancel with no region letters is not a subdivision flag.
+        lone = "\U0001F3F4\U000E007F"
+        self.assertEqual(cc.sanitize_catalog_text(lone), "🏴")
+        self.assertNotIn("\U000e007f", cc.sanitize_catalog_text(lone))
+
+    def test_combining_grapheme_joiner_and_mongolian_fvs_dropped(self) -> None:
+        self.assertEqual(cc.sanitize_catalog_text("AB\u034fCD"), "ABCD")
+        self.assertEqual(cc.sanitize_catalog_text("AB\u180bCD"), "ABCD")
+        self.assertEqual(cc.sanitize_catalog_text("AB\u180cCD"), "ABCD")
+        self.assertEqual(cc.sanitize_catalog_text("AB\u180dCD"), "ABCD")
+        self.assertEqual(cc.sanitize_catalog_text("AB\u2060CD"), "ABCD")
+        self.assertEqual(cc.sanitize_catalog_text("AB\ufff9CD"), "ABCD")
+        welcome = cc.display_shop_text("Hi\u034f there")
+        self.assertEqual(welcome, "Hi there")
+
+    def test_public_http_url_rejects_empty_host_labels_and_format_cf(self) -> None:
+        self.assertEqual(cc.public_http_url("https://.example.com/p.png"), "")
+        self.assertEqual(cc.public_http_url("https://example..com/p.png"), "")
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com./ok.png"),
+            "https://cdn.example.com./ok.png",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/ok%E2%80%8B.png"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/ok%EF%BB%BF.png"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/ok%E2%81%A0.png"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://[::1]/ok.png"),
+            "https://[::1]/ok.png",
+        )
+        self.assertEqual(cc.public_http_url("https://[]/ok.png"), "")
+
 
 class CleanupApplyTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -156,8 +156,14 @@ def generate_full_report(shop_id: int) -> str:
 
 def safe_filename_part(text: str, max_len: int = 32) -> str:
     """Sanitize shop title for filenames."""
+    try:
+        from catalog_cleanup import storefront_label
+
+        text = storefront_label(text, max_len) or "shop"
+    except Exception:
+        text = text or "shop"
     out = []
-    for ch in (text or "shop"):
+    for ch in text:
         if ch.isalnum() or ch in ("-", "_"):
             out.append(ch)
         elif ch.isspace():

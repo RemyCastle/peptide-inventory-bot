@@ -6165,19 +6165,24 @@ async def _send_admin_order_history(
 ) -> None:
     orders = db.list_orders(sid, status=None, limit=limit)
     shop = db.get_shop(sid) or db.ensure_shop(sid)
+    title = catalog_cleanup.md_escape(
+        catalog_cleanup.buyer_shop_title(shop.get("title") or "")
+    )
     if not orders:
         await update.message.reply_text(
-            f"No orders yet for *{shop['title']}*.",
+            f"No orders yet for *{title}*.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_menu_kb(True),
         )
         return
-    lines = [f"📋 *Orders — {shop['title']}* (last {len(orders)})\n"]
+    lines = [f"📋 *Orders — {title}* (last {len(orders)})\n"]
     buttons = []
     for o in orders:
-        uname = o.get("username") or o.get("full_name") or o["user_id"]
+        uname = catalog_cleanup.storefront_label(o.get("username"), 40)
+        full = catalog_cleanup.storefront_label(o.get("full_name"), 80)
+        who = catalog_cleanup.md_escape(uname or full or str(o["user_id"]))
         lines.append(
-            f"#{o['id']} · `{o['status']}` · {money(o['total'])} · {uname}"
+            f"#{o['id']} · `{o['status']}` · {money(o['total'])} · {who}"
         )
         buttons.append(
             [InlineKeyboardButton(f"#{o['id']} {o['status']}", callback_data=f"vieword:{o['id']}")]

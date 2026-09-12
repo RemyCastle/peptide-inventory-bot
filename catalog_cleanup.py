@@ -72,6 +72,7 @@ _UNSAFE_URL_RAW = re.compile(
 )
 # Invisible "blank" glyphs that are not Cf/Cc (so they survived prior passes).
 # U+115F/U+1160 are the NFKC forms of Hangul fillers — drop those too.
+# U+034F / Mongolian FVS are Mn (so they survived _drop_controls' C-class skip).
 _INVISIBLE_FILLERS = frozenset(
     {
         "\uFFFC",  # object replacement
@@ -80,6 +81,10 @@ _INVISIBLE_FILLERS = frozenset(
         "\uFFA0",  # halfwidth hangul filler (NFKC → U+3164 → U+1160)
         "\u115F",  # hangul choseong filler
         "\u1160",  # hangul jungseong filler
+        "\u034F",  # combining grapheme joiner
+        "\u180B",  # mongolian free variation selector 1
+        "\u180C",  # mongolian fvs 2
+        "\u180D",  # mongolian fvs 3
     }
 )
 
@@ -193,7 +198,12 @@ def _strip_leading_orphans(text: str) -> str:
 
 
 def _strip_incomplete_tags(text: str) -> str:
-    """Keep only complete flag-tag sequences (… + CANCEL TAG). Orphan tags go."""
+    """Keep only complete flag-tag sequences (🏴 + TAG latin + CANCEL TAG).
+
+    Orphan tags (no black flag), a lone CANCEL TAG, and black-flag + cancel
+    with no region letters are dropped. Pirate 🏴‍☠️ is black-flag + ZWJ, not
+    tags — the flag stays and the ZWJ run is handled elsewhere.
+    """
     if not text or not any(_is_emoji_tag(ch) for ch in text):
         return text
     out: list[str] = []
@@ -202,16 +212,21 @@ def _strip_incomplete_tags(text: str) -> str:
     black_flag = "\U0001F3F4"
     while i < n:
         ch = text[i]
-        if ch == black_flag or _is_emoji_tag(ch):
-            j = i + (1 if ch == black_flag else 0)
+        if ch == black_flag:
+            j = i + 1
             while j < n and _is_emoji_tag(text[j]):
                 j += 1
-            tags = text[(i + 1 if ch == black_flag else i) : j]
-            if tags and tags[-1] == _CANCEL_TAG:
+            tags = text[i + 1 : j]
+            if len(tags) >= 2 and tags[-1] == _CANCEL_TAG:
                 out.append(text[i:j])
-            elif ch == black_flag:
+            else:
                 out.append(black_flag)
             i = j
+            continue
+        if _is_emoji_tag(ch):
+            i += 1
+            while i < n and _is_emoji_tag(text[i]):
+                i += 1
             continue
         out.append(ch)
         i += 1
@@ -471,6 +486,15 @@ def public_http_url(value: str | None, max_len: int = 500) -> str:
     host_part = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
     if not host_part or "@" in host_part:
         return ""
+    if host_part.startswith("["):
+        end = host_part.find("]")
+        if end < 2:
+            return ""
+    else:
+        hostname = host_part.split(":", 1)[0]
+        labels = hostname.rstrip(".").split(".")
+        if not hostname or not labels or any(not lab for lab in labels):
+            return ""
     return scheme + rest
 
 
