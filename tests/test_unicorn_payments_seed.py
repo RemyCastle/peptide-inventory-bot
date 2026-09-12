@@ -76,6 +76,7 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         body = spbc_notify._status_body()
         self.assertEqual(body["payments"]["active"], 2)
         self.assertEqual(body["payments"]["total"], 2)
+        self.assertEqual(body["payments"]["usable"], 2)
         self.assertTrue(body["payments"]["checkout_ready"])
         self.assertEqual(
             body.get("store_url_cache_bust"), vendor_stores.STORE_URL_CACHE_BUST
@@ -147,6 +148,57 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertEqual(body.get("payments"), [])
         self.assertEqual(body.get("payment_methods"), [])
 
+    def test_empty_handle_typed_method_is_not_checkout_ready(self) -> None:
+        db.add_payment_method(
+            UNICORN, "Venmo", "", method_type="venmo", handle=""
+        )
+        webpanel.ensure_storefront_key_plain(UNICORN, PAGES_KEY)
+        rows = db.list_payment_methods(UNICORN, active_only=False)
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(vendor_stores.payment_rail_usable(rows[0]))
+        self.assertFalse(vendor_stores.shop_checkout_ready(UNICORN))
+        code, body = webpanel.api_storefront(PAGES_KEY)
+        self.assertEqual(code, 200, body)
+        self.assertFalse(body.get("checkout_ready"))
+        self.assertEqual(body.get("payments"), [])
+        self.assertEqual(body.get("payment_methods"), [])
+        self.assertIn("Message the seller", body.get("message") or "")
+        st, state = webpanel.api_state({"chat_id": UNICORN, "user_id": 1})
+        self.assertEqual(st, 200)
+        self.assertFalse(state["shop"]["checkout_ready"])
+        self.assertFalse(state["payments"][0].get("rail_ready"))
+        with mock.patch.object(
+            unicorn_shop, "find_catalog_shop", return_value={"chat_id": UNICORN}
+        ):
+            health = spbc_notify._status_body()
+        self.assertEqual(health["payments"]["active"], 1)
+        self.assertEqual(health["payments"]["usable"], 0)
+        self.assertFalse(health["payments"]["checkout_ready"])
+        blob = str(health["payments"])
+        self.assertNotIn("wineboos", blob)
+
+    def test_empty_venmo_does_not_hide_usable_paypal(self) -> None:
+        db.add_payment_method(
+            UNICORN, "Venmo", "", method_type="venmo", handle=""
+        )
+        db.add_payment_method(
+            UNICORN,
+            "PayPal",
+            "send to unicornfartzz@proton.me",
+            method_type="paypal",
+            handle="unicornfartzz@proton.me",
+        )
+        webpanel.ensure_storefront_key_plain(UNICORN, PAGES_KEY)
+        self.assertTrue(vendor_stores.shop_checkout_ready(UNICORN))
+        code, body = webpanel.api_storefront(PAGES_KEY)
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body.get("checkout_ready"))
+        self.assertEqual(body.get("payments"), ["PayPal"])
+        kinds = {m["method_type"] for m in body["payment_methods"]}
+        self.assertEqual(kinds, {"paypal"})
+        blob = json.dumps(body)
+        self.assertNotIn("proton", blob)
+
     def test_empty_buyer_copy_does_not_promise_a_dm(self) -> None:
         text = vendor_stores.build_customer_order_received_text(
             {"id": 1, "total": 10, "payment_code": "ABC"},
@@ -170,13 +222,17 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertIn('callback_data="paytpl:apple_cash"', src)
         self.assertIn("cb_adm_seedpays", src)
         self.assertIn("_All methods paused._", src)
+        self.assertIn("_Enabled methods have no handle._", src)
         self.assertIn("_Buyers can checkout._", src)
+        self.assertIn("add a handle", src)
         self.assertIn("cashtag", src)
         panel = (ROOT / "webpanel.py").read_text(encoding="utf-8")
         self.assertIn("types.has('venmo')", panel)
         self.assertIn("checkout_ready", panel)
         self.assertIn("Buyers see:", panel)
         self.assertIn("buyer_hint", panel)
+        self.assertIn("rail_ready", panel)
+        self.assertIn("No handle", panel)
 
     def test_pay_url_venmo_prefill_paypal_username_not_email(self) -> None:
         venmo = payment_templates.render_venmo("@wineboos")
@@ -202,6 +258,36 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertIn("Copy", email_hint)
         self.assertNotIn("proton", email_hint)
         self.assertFalse(vendor_stores.public_invoices_enabled())
+
+    def test_payment_rail_usable_typed_vs_custom(self) -> None:
+        venmo = payment_templates.render_venmo("@wineboos")
+        self.assertTrue(vendor_stores.payment_rail_usable(venmo))
+        empty_venmo = {
+            "name": "Venmo",
+            "method_type": "venmo",
+            "handle": "",
+            "instructions": "",
+        }
+        self.assertFalse(vendor_stores.payment_rail_usable(empty_venmo))
+        custom = {
+            "name": "Cash pickup",
+            "method_type": "custom",
+            "instructions": "Pay in person at pickup.",
+        }
+        self.assertTrue(vendor_stores.payment_rail_usable(custom))
+        thin = {
+            "name": "Custom",
+            "method_type": "custom",
+            "instructions": "n/a",
+        }
+        self.assertFalse(vendor_stores.payment_rail_usable(thin))
+        from_instr = {
+            "name": "Venmo",
+            "method_type": "venmo",
+            "handle": "",
+            "instructions": "Send to @shop-venmo",
+        }
+        self.assertTrue(vendor_stores.payment_rail_usable(from_instr))
 
 
 if __name__ == "__main__":

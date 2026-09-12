@@ -1,15 +1,15 @@
-# SHIP BRIEF — Unicorn Mini App claim cancel + confirm-success tracking
+# SHIP BRIEF — Unicorn empty-handle rails are not checkout-ready
 
 Product: peptide (unicorn)  
 Repo: `C:\Users\Remy\peptide_inventory_bot`  
 Prod: https://unicornfartzz-bot.onrender.com  
 Priority: P1  
 Ship agent: grok  
-AUTOPUSH: this ship (Mini App PAYMENT CLAIM ping gets Cancel URL
-button; /confirm success gets Add tracking CTA; no stock change on claim)
+AUTOPUSH: this ship (typed payment rows with no handle no longer
+count as checkout_ready; POST /order 409; admin/panel warn; no stock change)
 
-Goal: After Mini App I've paid, the vendor bot can cancel or (after
-confirm) add tracking via URL buttons/pages; never wipe inventory.
+Goal: An enabled Venmo/PayPal/Cash App row with no handle is empty UX —
+buyers cannot checkout on it; never wipe inventory.
 
 Context (already verified — do not rediscover):
 
@@ -17,11 +17,13 @@ Context (already verified — do not rediscover):
 - `POST /order` auth + HMAC: [`../UNICORN-INITDATA-RUNBOOK.md`](../UNICORN-INITDATA-RUNBOOK.md)
 - Catalog vs Pages: [`../UNICORN-MINIAPP-PARITY.md`](../UNICORN-MINIAPP-PARITY.md)
 - P0 seed/409/health live on `16c6547` (`payments.active` = 2)
-- Checkout JSON follow-up live on `52a5e5a` (order-status `pay_url`, 401 split, `invoices.enabled`)
+- Checkout JSON follow-up live on `52a5e5a`
 - Buyer `message` + paid-order rails live on `fef9326`
 - Sold-out/min-order codes + empty-rails UX live on `c5bbf40`
 - Laptop `inventory.db` is not live; Render `/data/inventory.db` is never opened from tests
 - Confirm URL + buyer DM live on `6c3d68b` (`payments.active` = 2, cache bust `20260913`)
+- Claim cancel URL + confirm-success tracking live on `991eb64`
+- Sanitizer harden live on `2340351` (live `/health` sha `2340351`, `payments.active` = 2)
 
 ## Prior ships
 
@@ -58,45 +60,54 @@ was `20260912`.
 **Mini App I've paid + admin rails preview — live on `bef4d5f`:**
 `POST /order-paid` pending → awaiting (no stock change); `can_mark_paid`;
 health `checkout_ready` + cache bust `20260913`; Pages I've paid + Copy
-target. Live `/health` sha later `5951281` / `592eb3b`.
+target.
 
 **Mini App payment-claim confirm URL — live on `6c3d68b`:** vendor ping
 includes `/confirm?ct=` URL button + cancel text line; buyer DM on first
 claim; second tap 200 idempotent; no stock change.
 
+**Mini App claim cancel URL + confirm-success tracking — live on `991eb64`:**
+PAYMENT CLAIM is Confirm + Cancel URL buttons; `/confirm` success offers
+Add tracking. Claim still no stock change.
+
 ## This ship
 
-**Mini App claim cancel URL + confirm-success tracking.** Vendor bot still
-has no cancel/track callbacks. After I've paid:
+**Empty-handle rails are not checkout-ready.** An active typed method
+(Venmo / PayPal / Cash App / Zelle / Apple Cash / crypto) with no
+handle/cashtag/email/phone/wallet no longer counts as a pay rail:
 
-- PAYMENT CLAIM markup is two URL buttons: **Confirm payment** and
-  **Cancel order** (same `/confirm?ct=` / `/cancel?xt=` links as the text
-  lines). Unset `PANEL_BASE_URL` still pings with fallback copy and no
-  markup.
-- `/confirm` success (and already-confirmed GET/POST) includes an
-  **Add tracking** CTA (`/track?ot=`) when `PANEL_BASE_URL` is set.
-  Pending confirm form does not. JSON `track_url` matches.
-- Claim still never confirms payment and never changes stock. Confirm
-  still deducts once. `STORE_URL_CACHE_BUST` stays `20260913`.
+- `checkout_ready` is true only when ≥1 **usable** active method
+  (copyable target, or custom instructions ≥8 chars).
+- `/storefront` `payments` / `payment_methods` list usable rails only.
+- `POST /order` 409 `no_payment_methods` when none are usable (same
+  buyer `message` as a fully empty shop). Telegram cart checkout
+  blocks the same way.
+- `/health` adds `payments.usable` (count, never handles).
+  `checkout_ready` follows usable, not merely `active > 0`.
+- Telegram 💳 Payments and `/webpanel` warn when enabled rows have
+  no handle. Panel state includes `rail_ready`.
+- Seeded Unicorn Venmo + PayPal still pass. Custom “pay in person”
+  instructions still count. `STORE_URL_CACHE_BUST` stays `20260913`.
 
 ## Acceptance (this ship)
 
-- [x] `python -m pytest -q -x` green on scratch DBs (654 passed)
-- [x] Docker COPY check still lists every imported module (26)
-- [x] No writes to laptop `inventory.db`; no DELETE of products
-- [x] `POST /order-paid` vendor ping includes Confirm + Cancel URL buttons
-      when `PANEL_BASE_URL` is set
-- [x] Unset `PANEL_BASE_URL` still pings; no confirm/cancel URL; no markup
-- [x] `/confirm` success HTML + JSON include `/track?ot=` when panel URL set
-- [x] Pending `/confirm` GET has no tracking CTA
-- [x] Stock unchanged after I've paid; confirm still decrements once
+- [ ] `python -m pytest -q -x` green on scratch DBs
+- [ ] Docker COPY check still lists every imported module (26)
+- [ ] No writes to laptop `inventory.db`; no DELETE of products
+- [ ] Empty-handle Venmo: `checkout_ready` false, storefront names
+      empty, `POST /order` 409 `no_payment_methods`, no order row
+- [ ] Empty Venmo + usable PayPal: `checkout_ready` true, catalog
+      names PayPal only
+- [ ] Seeded Unicorn shop still `checkout_ready`; health `usable` ≥ 1
+- [ ] Telegram + panel copy warn on empty handles
 - [ ] Live `/health` new `git_sha`, `payments.active` ≥ 1,
-      `checkout_ready: true`, `store_url_cache_bust` `20260913`
-      (after AUTOPUSH)
-- [x] No secrets / `.env` / scratch import files committed
+      `payments.usable` ≥ 1, `checkout_ready: true`,
+      `store_url_cache_bust` `20260913` (after AUTOPUSH)
+- [ ] No secrets / `.env` / scratch import files committed
 
-Prior `6c3d68b` / `bef4d5f` checks stay true: `can_mark_paid`, 403
-`not_your_order`, Pages I've paid, buyer claim DM.
+Prior `991eb64` / `6c3d68b` / `bef4d5f` checks stay true: Confirm +
+Cancel URL buttons, `/confirm` Add tracking, `can_mark_paid`, Pages
+I've paid, buyer claim DM.
 
 ## Out of scope
 
@@ -111,8 +122,9 @@ Prior `6c3d68b` / `bef4d5f` checks stay true: `can_mark_paid`, 403
 ## Verify in 60s
 
 1. GET https://unicornfartzz-bot.onrender.com/health → `ok: true`,
-   `payments.active` ≥ 1, `payments.checkout_ready: true`,
-   `store_url_cache_bust` `20260913`
-2. Open https://remy-miniapp-demos.pages.dev/unicorn/ — receipt/lookup have
-   I've paid; PayPal email is Copy, not a fake paypal.me link.
+   `payments.active` ≥ 1, `payments.usable` ≥ 1,
+   `payments.checkout_ready: true`, `store_url_cache_bust` `20260913`
+2. Open https://remy-miniapp-demos.pages.dev/unicorn/ — checkout still
+   enabled (Venmo + PayPal have handles); PayPal email is Copy, not a
+   fake paypal.me link.
 3. Place nothing. Do not run local `start.bat`. Do not wipe `/data`.

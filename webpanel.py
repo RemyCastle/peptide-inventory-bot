@@ -971,8 +971,8 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
         return 404, vendor_stores.checkout_error_body("unknown storefront")
     shop = db.get_shop(chat_id) or db.ensure_shop(chat_id)
     products = db.apply_available_stock(db.list_products(chat_id, active_only=True))
-    payments = db.list_payment_methods(chat_id, active_only=True)
-    checkout_ready = bool(payments)
+    payments = vendor_stores.usable_payment_methods(chat_id)
+    checkout_ready = vendor_stores.shop_checkout_ready(chat_id)
     try:
         from catalog_cleanup import buyer_shop_title
         import unicorn_shop
@@ -1148,12 +1148,13 @@ def _product_public(p: dict) -> dict:
 
 
 def api_state(tok: dict) -> tuple[int, dict]:
+    import vendor_stores
+
     chat_id = tok["chat_id"]
     shop = db.get_shop(chat_id) or db.ensure_shop(chat_id)
     products = db.list_products(chat_id, active_only=False)
     payments = db.list_payment_methods(chat_id, active_only=False)
-    checkout_ready = any(int(m.get("active") or 0) for m in payments)
-    import vendor_stores
+    checkout_ready = vendor_stores.shop_checkout_ready(chat_id)
 
     try:
         from catalog_cleanup import sanitize_multiline
@@ -1193,6 +1194,7 @@ def api_state(tok: dict) -> tuple[int, dict]:
                 "address": _buyer_field(m.get("address") or "", 120) or "",
                 "network_note": _buyer_field(m.get("network_note") or "", 80)
                 or "",
+                "rail_ready": vendor_stores.payment_rail_usable(m),
                 "buyer_hint": vendor_stores.payment_pay_hint(m),
             }
             for m in payments
@@ -3248,7 +3250,11 @@ function render(){
   </div>
   <div class="card"><h2>Payment methods</h2>
     <p class="tag" style="margin:0 0 10px">Buyers see these at checkout. Edit anytime and hit Save — changes apply immediately.</p>
-    ${(S.payments||[]).filter(m=>m.active).length?'':'<p class="howto"><b>Buyers cannot pay.</b> Add at least one enabled method. Pause a seeded Venmo/PayPal row instead of deleting it.</p>'}
+    ${(()=>{const enabled=(S.payments||[]).filter(m=>m.active);
+      const usable=enabled.filter(m=>m.rail_ready!==false);
+      if(!enabled.length) return '<p class="howto"><b>Buyers cannot pay.</b> Add at least one enabled method. Pause a seeded Venmo/PayPal row instead of deleting it.</p>';
+      if(!usable.length) return '<p class="howto"><b>Buyers cannot pay.</b> Enabled methods have no handle. Add a Venmo / PayPal / Cash App handle (or instructions on a custom method).</p>';
+      return '';})()}
     ${(()=>{const types=new Set((S.payments||[]).map(m=>String(m.method_type||'').toLowerCase()));
       return (S.shop&&S.shop.is_unicorn&&(!types.has('venmo')||!types.has('paypal')))
         ?'<div class="flex" style="margin-bottom:10px"><button type="button" id="pm-seed">✨ Seed Venmo + PayPal</button><span class="tag grow">Edit handles after — boot will not overwrite them</span></div>':'';})()}
@@ -3284,6 +3290,7 @@ function render(){
         </div>
         <label>Instructions shown to buyers (auto-filled from the fields above — editable)</label>
         <textarea class="p-instr" style="min-height:60px">${esc(m.instructions)}</textarea>
+        ${m.active&&m.rail_ready===false?'<p class="howto" style="margin:6px 0 0">No handle — buyers cannot use this method until you add one.</p>':''}
         ${m.buyer_hint?`<p class="tag" style="margin:6px 0 0">Buyers see: ${esc(m.buyer_hint)}</p>`:''}
         <div class="flex" style="margin-top:8px">
           <label class="flex" style="margin:0"><input type="checkbox" class="p-act"

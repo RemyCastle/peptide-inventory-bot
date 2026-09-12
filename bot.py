@@ -1609,15 +1609,19 @@ async def cb_checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return ConversationHandler.END
 
-    methods = db.list_payment_methods(sid, active_only=True)
+    methods = [
+        m
+        for m in db.list_payment_methods(sid, active_only=True)
+        if vendor_stores.payment_rail_usable(m)
+    ]
     if not methods:
-        log.warning("Checkout blocked: shop %s has no payment methods", sid)
+        log.warning("Checkout blocked: shop %s has no usable payment methods", sid)
         await safe_edit(
             query,
             "⚠️ *Checkout unavailable*\n\n"
-            "This shop has *no payment methods* set up yet.\n"
-            "Shop owner: open *Admin → 💳 Payments* and add Cash App / Venmo / etc., "
-            "then the buyer can checkout.",
+            "This shop has *no payment methods* buyers can use yet.\n"
+            "Shop owner: open *Admin → 💳 Payments* and add a handle "
+            "(Venmo / PayPal / Cash App), then the buyer can checkout.",
             back_main_kb(),
         )
         return ConversationHandler.END
@@ -2726,10 +2730,10 @@ async def _admin_home(
         )
     else:
         text += "\nMin order: OFF"
-    if not db.list_payment_methods(sid, active_only=True):
+    if not vendor_stores.shop_checkout_ready(sid):
         text += (
-            "\n\n⚠️ *No payment methods* — buyers cannot checkout. "
-            "Open 💳 Payments and add Venmo / PayPal / Cash App."
+            "\n\n⚠️ *No usable payment methods* — buyers cannot checkout. "
+            "Open 💳 Payments and add a handle (Venmo / PayPal / Cash App)."
         )
     # Daily-driver actions up top; everything else lives in More tools
     kb = InlineKeyboardMarkup(
@@ -5449,6 +5453,8 @@ async def cb_adm_pays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         line = f"{flag} #{m['id']} *{m['name']}*"
         if handle:
             line += f" · `{handle}`"
+        elif not vendor_stores.payment_rail_usable(m):
+            line += " · ⚠️ add a handle"
         lines.append(line)
         buttons.append(
             [
@@ -5460,6 +5466,7 @@ async def cb_adm_pays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ]
         )
     active = [m for m in methods if m.get("active")]
+    usable = [m for m in active if vendor_stores.payment_rail_usable(m)]
     if not methods:
         lines.append(
             "_None configured._ Buyers cannot checkout until you add one."
@@ -5468,6 +5475,11 @@ async def cb_adm_pays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines.append(
             "_All methods paused._ Buyers cannot checkout until you "
             "unpause one or add another."
+        )
+    elif not usable:
+        lines.append(
+            "_Enabled methods have no handle._ Buyers cannot checkout "
+            "until you add a Venmo / PayPal / Cash App handle."
         )
     else:
         lines.append("\n_Buyers can checkout._")

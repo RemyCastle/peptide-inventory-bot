@@ -1009,12 +1009,18 @@ def _status_body() -> dict:
 
         shop = unicorn_shop.find_catalog_shop()
         if shop:
+            import vendor_stores as _vs
+
             rows = _db.list_payment_methods(int(shop["chat_id"]), active_only=False)
             active = sum(1 for m in rows if m.get("active"))
+            usable = sum(
+                1 for m in rows if m.get("active") and _vs.payment_rail_usable(m)
+            )
             body["payments"] = {
                 "active": active,
                 "total": len(rows),
-                "checkout_ready": active > 0,
+                "usable": usable,
+                "checkout_ready": usable > 0,
             }
     except Exception:
         pass
@@ -1137,8 +1143,8 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
         if not items:
             return 400, vendor_stores.checkout_error_body("empty cart")
 
-        if not db.list_payment_methods(shop_chat_id, active_only=True):
-            log.info("POST /order no payment methods shop=%s", shop_chat_id)
+        if not vendor_stores.shop_checkout_ready(shop_chat_id):
+            log.info("POST /order no usable payment methods shop=%s", shop_chat_id)
             return 409, vendor_stores.checkout_error_body("no_payment_methods")
 
         shop_row = db.get_shop(shop_chat_id) or db.ensure_shop(shop_chat_id)

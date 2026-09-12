@@ -235,6 +235,24 @@ class OrderHttpTests(unittest.TestCase):
         self.assertEqual(n, 0)
         self.assertEqual(self.sent, [])
 
+    def test_empty_handle_method_409_does_not_create_order(self) -> None:
+        for m in db.list_payment_methods(SHOP, active_only=False):
+            db.delete_payment_method(m["id"])
+        db.add_payment_method(
+            SHOP, "Venmo", "", method_type="venmo", handle=""
+        )
+        code, body = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 409, body)
+        self.assertFalse(body.get("ok"))
+        self.assertEqual(body.get("error"), "no_payment_methods")
+        self.assertIn("Message the seller", body.get("message") or "")
+        with db.get_db() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) AS c FROM orders WHERE chat_id = ?", (SHOP,)
+            ).fetchone()["c"]
+        self.assertEqual(n, 0)
+        self.assertEqual(self.sent, [])
+
     def test_tampered_init_data_401_no_order(self) -> None:
         good = build_valid_init_data(VENDOR_TOKEN)
         # Flip last hex char of hash

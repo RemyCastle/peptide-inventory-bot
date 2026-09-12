@@ -473,7 +473,7 @@ def build_customer_order_received_text(
         ship_name, ship_address, markdown=markdown
     )
 
-    pays = db.list_payment_methods(int(shop_chat_id))
+    pays = usable_payment_methods(int(shop_chat_id))
     if pays:
         pay_lines = [
             f"  • {_esc(p['name'])}: {_esc(p['instructions'])}".rstrip(": ")
@@ -729,10 +729,10 @@ def payment_method_public(
 def payment_methods_public(
     shop_chat_id: int, total: float = 0.0, code: str = ""
 ) -> list[dict]:
-    """Active payment methods as structured objects (empty list if none)."""
+    """Active usable payment methods as structured objects (empty if none)."""
     return [
         payment_method_public(p, total, code)
-        for p in db.list_payment_methods(int(shop_chat_id))
+        for p in usable_payment_methods(int(shop_chat_id))
     ]
 
 
@@ -823,6 +823,35 @@ def payment_pay_link(method: dict, total: float, code: str) -> str | None:
     except Exception:
         return built
 
+def payment_rail_usable(method: dict) -> bool:
+    """True when buyers can copy a target or open a pay URL.
+
+    Typed rails (Venmo / PayPal / Cash App / Zelle / Apple Cash / crypto)
+    need a handle, cashtag, email, phone, or wallet. Custom / freeform rows
+    count when instructions have real text. Empty enabled rows do not make
+    checkout_ready.
+    """
+    mt, target = _method_kind_and_target(method)
+    if (target or "").strip():
+        return True
+    if mt in ("venmo", "paypal", "cashapp", "zelle", "apple_cash", "crypto"):
+        return False
+    instr = " ".join(str(method.get("instructions") or "").split())
+    return len(instr) >= 8
+
+
+def usable_payment_methods(
+    shop_chat_id: int, *, active_only: bool = True
+) -> list[dict]:
+    """Active (or all) methods that actually give the buyer a rail."""
+    rows = db.list_payment_methods(int(shop_chat_id), active_only=active_only)
+    return [m for m in rows if payment_rail_usable(m)]
+
+
+def shop_checkout_ready(shop_chat_id: int) -> bool:
+    """True iff at least one active method has a copyable target or pay URL."""
+    return bool(usable_payment_methods(int(shop_chat_id), active_only=True))
+
 
 def _payment_method_html(p: dict, total: float, code: str) -> str:
     """One payment method as Telegram-HTML lines with tap-to-copy target."""
@@ -911,7 +940,7 @@ def build_customer_order_received_html(
         ship_bits.append(f"  {_h(addr)}")
     ship_block = ("\n\n📦 Ship to:\n" + "\n".join(ship_bits)) if ship_bits else ""
 
-    pays = db.list_payment_methods(int(shop_chat_id))
+    pays = usable_payment_methods(int(shop_chat_id))
     if pays:
         pay_txt = "\n".join(_payment_method_html(p, total, code) for p in pays)
     else:
@@ -944,7 +973,7 @@ def build_payment_qr_photos(
         log.warning("segno not installed — skipping payment QR codes")
         return []
     out: list[tuple[bytes, str]] = []
-    for p in db.list_payment_methods(int(shop_chat_id)):
+    for p in usable_payment_methods(int(shop_chat_id)):
         link = payment_pay_link(p, total, code)
         if not link:
             continue
