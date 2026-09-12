@@ -55,8 +55,15 @@ _MD_UNSAFE = re.compile(r"([_*`\[\]])")
 # Python len() under-counts non-BMP emoji (🦄 is 1 char / 2 units), so a
 # naive s[:64] either overflows Telegram or slices a combining/ZWJ run.
 TG_BUTTON_MAX = 64
-# Format chars we must keep so emoji ZWJ sequences survive sanitizer.
-_KEEP_CF = frozenset("\u200d")
+# Format chars we must keep so emoji ZWJ sequences and subdivision flags
+# (🏴 + TAG latin + CANCEL TAG, e.g. 🏴󠁧󠁢󠁥󠁮󠁧󠁿) survive the sanitizer.
+_ZWJ = "\u200d"
+_CANCEL_TAG = "\U000e007f"
+_TAG_MIN, _TAG_MAX = 0xE0020, 0xE007F
+_KEEP_CF = frozenset((_ZWJ,)) | frozenset(
+    chr(c) for c in range(_TAG_MIN, _TAG_MAX + 1)
+)
+_CRLF_PCT = re.compile(r"%0[0da]|%00", re.IGNORECASE)
 
 
 ActionKind = Literal["rename", "merge", "deactivate"]
@@ -102,8 +109,13 @@ def _is_regional_indicator(ch: str) -> bool:
     return 0x1F1E6 <= o <= 0x1F1FF
 
 
+def _is_emoji_tag(ch: str) -> bool:
+    o = ord(ch)
+    return _TAG_MIN <= o <= _TAG_MAX
+
+
 def _drop_controls(text: str, *, keep_newlines: bool = False) -> str:
-    """Drop Cc/Cf/Cs except ZWJ (and newlines when keep_newlines)."""
+    """Drop Cc/Cf/Cs except ZWJ/emoji-tags (and newlines when keep_newlines)."""
     out: list[str] = []
     for ch in text:
         if keep_newlines and ch in "\r\n":
@@ -242,9 +254,14 @@ def clip_label(text: str, max_len: int, *, ellipsis: str = "…") -> str:
     # ZWJ joins to the *next* code point — a trailing one is always dangling.
     # Do not pop VS-16 / combining marks: those bind to the previous character
     # and are complete if we already kept the base (☂️, café).
-    while out and out[-1] in _KEEP_CF:
+    # Do not pop a complete flag-tag sequence (ends in CANCEL TAG).
+    while out and out[-1] == _ZWJ:
         used -= 2 if ord(out[-1]) > 0xFFFF else 1
         out.pop()
+    if out and _is_emoji_tag(out[-1]) and out[-1] != _CANCEL_TAG:
+        while out and _is_emoji_tag(out[-1]):
+            used -= 2 if ord(out[-1]) > 0xFFFF else 1
+            out.pop()
     if out and _is_regional_indicator(out[-1]):
         run = 0
         for ch in reversed(out):
@@ -261,9 +278,10 @@ def clip_label(text: str, max_len: int, *, ellipsis: str = "…") -> str:
 def sanitize_catalog_text(text: str) -> str:
     """Drop control/format/replacement glyphs that render as boxes or �.
 
-    Keeps ZWJ (U+200D) so emoji sequences stay intact. Other Cf (ZWSP, BOM,
-    soft hyphen) still go. Whitespace collapses; line breaks are not preserved
-    — use display_shop_text for title/welcome.
+    Keeps ZWJ (U+200D) and emoji tag chars (U+E0020–U+E007F) so ZWJ sequences
+    and subdivision flags stay intact. Other Cf (ZWSP, BOM, soft hyphen) still
+    go. Whitespace collapses; line breaks are not preserved — use
+    display_shop_text for title/welcome.
     """
     s = repair_glyphs(str(text or ""))
     if not s:
@@ -282,6 +300,23 @@ def storefront_label(text: str | None, max_len: int | None = None) -> str:
     if max_len is not None and int(max_len) > 0:
         s = clip_label(s, int(max_len), ellipsis="")
     return s
+
+
+def public_http_url(value: str | None, max_len: int = 500) -> str:
+    """Buyer-facing http(s) URL. Glyph junk stripped; non-http dropped."""
+    s = storefront_label(value, max_len)
+    if not s or _CRLF_PCT.search(s):
+        return ""
+    low = s.lower()
+    if low.startswith("https://"):
+        rest, scheme = s[8:], "https://"
+    elif low.startswith("http://"):
+        rest, scheme = s[7:], "http://"
+    else:
+        return ""
+    if not rest or rest.startswith("/") or " " in rest or "\\" in rest:
+        return ""
+    return scheme + rest
 
 
 def sanitize_multiline(text: str | None, max_len: int | None = None) -> str:

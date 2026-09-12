@@ -1261,7 +1261,9 @@ def _catalog_entry_for_shop(sid: int | None, pid: int) -> dict | None:
 def _product_card_text(p: dict, stock: int, in_cart_vials: int) -> str:
     shown = catalog_cleanup.display_product_name(str(p.get("name") or ""))
     esc = catalog_cleanup.md_escape
-    unit = esc(str(p.get("unit") or "vial"))
+    unit = esc(
+        catalog_cleanup.storefront_label(str(p.get("unit") or "vial"), 20) or "vial"
+    )
     text = (
         f"*{esc(shown)}*\n"
         f"Price: *{money(p['price'])}* / {unit}\n"
@@ -1270,15 +1272,21 @@ def _product_card_text(p: dict, stock: int, in_cart_vials: int) -> str:
     if in_cart_vials > 0:
         text += f"🛒 *In your cart: {in_cart_vials}*\n"
     if p.get("is_guest"):
-        guest = esc(str(p.get("guest_title") or "partner"))
+        guest = esc(
+            catalog_cleanup.storefront_label(
+                str(p.get("guest_title") or "partner"), 40
+            )
+            or "partner"
+        )
         text += f"_Partner stock ({guest})_\n"
     if db.kit_option_available(p, stock=stock):
         kp = db.product_kit_price(p)
         text += f"Kit of {KIT_SIZE}: *{money(kp)}*\n"
     elif db.product_kit_price(p) is not None and stock < KIT_SIZE:
         text += f"_Kit of {KIT_SIZE} unavailable (need {KIT_SIZE}+ in stock)_\n"
-    if p.get("description"):
-        text += f"\n{esc(str(p['description']))}\n"
+    desc = catalog_cleanup.sanitize_catalog_text(str(p.get("description") or ""))
+    if desc:
+        text += f"\n{esc(desc)}\n"
     if stock <= 0:
         text += "\n_Currently out of stock._"
     if db.product_has_coa(p):

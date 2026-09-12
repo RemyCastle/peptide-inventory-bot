@@ -336,6 +336,72 @@ class GlyphRepairTests(unittest.TestCase):
         out.encode("utf-16-le")
         self.assertNotIn("\ufffd", out)
 
+    def test_subdivision_flag_kept(self) -> None:
+        england = (
+            "\U0001F3F4\U000E0067\U000E0062\U000E0065"
+            "\U000E006E\U000E0067\U000E007F"
+        )
+        self.assertEqual(cc.sanitize_catalog_text(england), england)
+        self.assertEqual(cc.storefront_label(england + "\u0000", 40), england)
+        self.assertIn("\U000e007f", cc.sanitize_catalog_text(england))
+
+    def test_clip_label_keeps_complete_subdivision_flag(self) -> None:
+        england = (
+            "\U0001F3F4\U000E0067\U000E0062\U000E0065"
+            "\U000E006E\U000E0067\U000E007F"
+        )
+        clipped = cc.clip_label(england + " West", 64)
+        self.assertTrue(clipped.startswith(england))
+        self.assertIn("\U000e007f", clipped)
+        clipped.encode("utf-16-le")
+
+    def test_clip_label_drops_incomplete_tag_run(self) -> None:
+        england = (
+            "\U0001F3F4\U000E0067\U000E0062\U000E0065"
+            "\U000E006E\U000E0067\U000E007F"
+        )
+        # Flag is 14 UTF-16 units. Budget 10 with no ellipsis cuts mid-tags.
+        clipped = cc.clip_label(england, 10, ellipsis="")
+        self.assertLessEqual(cc.utf16_len(clipped), 10)
+        self.assertFalse(any(cc._is_emoji_tag(ch) for ch in clipped))
+        clipped.encode("utf-16-le")
+
+    def test_rlo_and_c1_controls_dropped(self) -> None:
+        raw = "AB\u202eCD\u0080EF"
+        out = cc.sanitize_catalog_text(raw)
+        self.assertEqual(out, "ABCDEF")
+        self.assertNotIn("\u202e", out)
+        self.assertNotIn("\u0080", out)
+
+    def test_nfd_combining_accent_survives(self) -> None:
+        nfd = "Cafe\u0301"
+        out = cc.sanitize_catalog_text(nfd)
+        self.assertNotIn("\ufffd", out)
+        self.assertTrue("é" in out or "Cafe" in out)
+
+    def test_public_http_url_uppercase_and_junk(self) -> None:
+        self.assertEqual(
+            cc.public_http_url("HTTPS://cdn.example.com/p.png"),
+            "https://cdn.example.com/p.png",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/p\u0000.png\ufffd"),
+            "https://cdn.example.com/p.png",
+        )
+        self.assertEqual(cc.public_http_url("javascript:alert(1)"), "")
+        self.assertEqual(cc.public_http_url("https://cdn.example.com/p.png%00.jpg"), "")
+        self.assertEqual(cc.public_http_url("https://cdn.example.com/p.png%0d%0aX"), "")
+        self.assertEqual(cc.public_http_url(""), "")
+        self.assertEqual(cc.public_http_url("ftp://x"), "")
+
+    def test_mixed_real_flag_and_mojibake_latin(self) -> None:
+        flag = "🇺🇸"
+        broken = self._mojibake(" West", "cp1252")
+        out = cc.sanitize_catalog_text(flag + broken)
+        self.assertTrue(out.startswith(flag))
+        self.assertIn("West", out)
+        self.assertNotIn("ð", out)
+
 
 class CleanupApplyTests(unittest.TestCase):
     def setUp(self) -> None:

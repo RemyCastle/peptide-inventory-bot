@@ -403,6 +403,22 @@ class LabelFuzzTests(unittest.TestCase):
         self.assertEqual(zones[0]["id"], "intl")
         self.assertEqual(zones[0]["label"], "Intl")
 
+    def test_fuzz_rlo_tags_and_pct_nul_never_leak(self) -> None:
+        england = (
+            "\U0001F3F4\U000E0067\U000E0062\U000E0065"
+            "\U000E006E\U000E0067\U000E007F"
+        )
+        raw = "\u202e" + england + "\u0000 Anav@r\ufffd"
+        out = cc.sanitize_catalog_text(raw)
+        self.assertIn(england, out)
+        self.assertIn("Anav@r", out)
+        self.assertNotIn("\u202e", out)
+        self.assertNotIn("\ufffd", out)
+        self.assertNotIn("\u0000", out)
+        self.assertIn("Anavar", cc.clean_product_name(raw))
+        url = cc.public_http_url("HTTPS://x.example/%00")
+        self.assertEqual(url, "")
+
     def test_fuzz_mixed_mojibake_controls_and_zwj(self) -> None:
         family = "👨\u200d👩\u200d👧\u200d👦"
         raw = (
@@ -569,6 +585,94 @@ class StorefrontGapTests(unittest.TestCase):
             webpanel.api_storefront(self.sf_key)
             after = (repo_db.stat().st_mtime_ns, repo_db.stat().st_size)
             self.assertEqual(before, after)
+
+    def test_storefront_photo_uppercase_https_and_pct_nul(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE products SET photo_file_id = ? WHERE id = ?",
+                ("HTTPS://cdn.example.com/ok.png", pid),
+            )
+        code, body = webpanel.api_storefront(self.sf_key)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(
+            body["products"][0]["photo_url"],
+            "https://cdn.example.com/ok.png",
+        )
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE products SET photo_file_id = ? WHERE id = ?",
+                ("https://cdn.example.com/p.png%00.jpg", pid),
+            )
+        code, body = webpanel.api_storefront(self.sf_key)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["products"][0]["photo_url"], "")
+
+    def test_admin_state_payments_sanitized(self) -> None:
+        mid = db.add_payment_method(SHOP, "Venmo", "@x")
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE payment_methods SET name = ?, handle = ?, "
+                "method_type = ?, instructions = ? WHERE id = ?",
+                (
+                    "Venmo\u0000\ufffd",
+                    "@wineboos\u200b",
+                    "venmo\ufffd",
+                    "send\u0000 now",
+                    mid,
+                ),
+            )
+        code, state = webpanel.api_state(self.tok)
+        self.assertEqual(code, 200)
+        row = next(p for p in state["payments"] if int(p["id"]) == mid)
+        self.assertEqual(row["name"], "Venmo")
+        self.assertEqual(row["handle"], "@wineboos")
+        self.assertEqual(row["method_type"], "venmo")
+        self.assertEqual(row["instructions"], "send now")
+        self.assertNotIn("\ufffd", row["name"])
+
+    def test_add_product_unit_and_method_type_write_strips_junk(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3, unit="vial\u0000\ufffd")
+        row = db.get_product(pid)
+        self.assertEqual(row["unit"], "vial")
+        mid = db.add_payment_method(
+            SHOP, "Zelle", "send", method_type="zelle\u0000\ufffd"
+        )
+        m = db.get_payment_method(mid)
+        self.assertEqual(m["method_type"], "zelle")
+
+    def test_format_product_line_strips_description_junk(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE products SET description = ?, unit = ? WHERE id = ?",
+                ("lyo\u0000\ufffd 10mg", "vial\u200b", pid),
+            )
+        p = db.get_product(pid)
+        line = db.format_product_line(p)
+        self.assertIn("SEMA 10MG", line)
+        self.assertIn("lyo 10mg", line)
+        self.assertIn("/ vial", line)
+        self.assertNotIn("\ufffd", line)
+        self.assertNotIn("\u0000", line)
+
+    def test_storefront_subdivision_flag_category(self) -> None:
+        england = (
+            "\U0001F3F4\U000E0067\U000E0062\U000E0065"
+            "\U000E006E\U000E0067\U000E007F"
+        )
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE products SET category = ? WHERE id = ?",
+                (england + " UK", pid),
+            )
+        code, body = webpanel.api_storefront(self.sf_key)
+        self.assertEqual(code, 200, body)
+        cat = body["products"][0]["category"] or ""
+        self.assertTrue(cat.startswith(england))
+        self.assertIn("UK", cat)
+        self.assertIn("\U000e007f", cat)
 
 
 if __name__ == "__main__":

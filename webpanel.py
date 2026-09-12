@@ -906,13 +906,16 @@ def _buyer_field(value: Any, max_len: int) -> str | None:
 
 def _buyer_http_url(value: Any, max_len: int = 500) -> str:
     """Buyer-facing http(s) URL: junk stripped, non-http dropped."""
-    raw = str(value or "").strip()
-    if not (raw.startswith("http://") or raw.startswith("https://")):
-        return ""
-    cleaned = _buyer_field(raw, max_len) or ""
-    if not (cleaned.startswith("http://") or cleaned.startswith("https://")):
-        return ""
-    return cleaned
+    try:
+        from catalog_cleanup import public_http_url
+
+        return public_http_url(value, max_len)
+    except Exception:
+        raw = str(value or "").strip()
+        low = raw.lower()
+        if not (low.startswith("http://") or low.startswith("https://")):
+            return ""
+        return raw[:max_len]
 
 
 def _buyer_payment_name(m: dict) -> str:
@@ -1152,15 +1155,20 @@ def api_state(tok: dict) -> tuple[int, dict]:
         "payments": [
             {
                 "id": m["id"],
-                "name": m["name"],
-                "instructions": m.get("instructions") or "",
+                "name": _buyer_field(m.get("name"), 60) or "Payment",
+                "instructions": _buyer_field(m.get("instructions") or "", 200)
+                or "",
                 "active": int(m.get("active") or 0),
-                "method_type": (m.get("method_type") or "custom"),
-                "cashtag": m.get("cashtag") or "",
-                "handle": m.get("handle") or "",
-                "chain": m.get("chain") or "",
-                "address": m.get("address") or "",
-                "network_note": m.get("network_note") or "",
+                "method_type": _buyer_field(
+                    m.get("method_type") or "custom", 20
+                )
+                or "custom",
+                "cashtag": _buyer_field(m.get("cashtag") or "", 40) or "",
+                "handle": _buyer_field(m.get("handle") or "", 80) or "",
+                "chain": _buyer_field(m.get("chain") or "", 40) or "",
+                "address": _buyer_field(m.get("address") or "", 120) or "",
+                "network_note": _buyer_field(m.get("network_note") or "", 80)
+                or "",
                 "buyer_hint": vendor_stores.payment_pay_hint(m),
             }
             for m in payments
@@ -1220,7 +1228,7 @@ def api_product(tok: dict, payload: dict) -> tuple[int, dict]:
         if stock < 0 or stock > 1_000_000:
             return _err(400, "Stock must be 0 or more")
     if payload.get("unit") is not None:
-        unit = str(payload["unit"]).strip()[:20] or "vial"
+        unit = _optional_text(payload["unit"], 20) or "vial"
         fields["unit"] = unit
     if payload.get("active") is not None:
         fields["active"] = 1 if payload["active"] in (1, True, "1", "true") else 0

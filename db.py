@@ -1409,13 +1409,15 @@ def add_product(
     clean_name = (name or "").strip()
     clean_desc = (description or "").strip()
     try:
-        from catalog_cleanup import sanitize_catalog_text
+        from catalog_cleanup import sanitize_catalog_text, storefront_label
 
         clean_name = sanitize_catalog_text(clean_name)
         clean_desc = sanitize_catalog_text(clean_desc)
+        unit = storefront_label(unit, 20) or "vial"
     except Exception:
         clean_name = " ".join(clean_name.split())
         clean_desc = " ".join(clean_desc.split())
+        unit = " ".join(str(unit or "vial").split())[:20] or "vial"
     with get_db() as conn:
         cur = conn.execute(
             """
@@ -2008,6 +2010,8 @@ def add_payment_method(
         cleaned = storefront_label(clean_name, 60)
         clean_name = cleaned or "Payment"
         clean_instr = sanitize_catalog_text(clean_instr)
+        if method_type:
+            method_type = (storefront_label(method_type, 20) or "custom").lower()
         if cashtag:
             cashtag = storefront_label(cashtag, 40) or None
         if handle:
@@ -2086,6 +2090,13 @@ def update_payment_method(method_id: int, **fields: Any) -> bool:
                 v = storefront_label(v, 60) or "Payment"
             except Exception:
                 v = " ".join(v.split())[:60] or "Payment"
+        elif k == "method_type" and isinstance(v, str):
+            try:
+                from catalog_cleanup import storefront_label
+
+                v = (storefront_label(v, 20) or "custom").lower()
+            except Exception:
+                v = " ".join(v.split())[:20].lower() or "custom"
         elif k == "instructions" and isinstance(v, str):
             try:
                 from catalog_cleanup import sanitize_catalog_text
@@ -3011,16 +3022,23 @@ def format_product_line(p: dict, symbol: str = CURRENCY_SYMBOL) -> str:
     stock = int(p["stock"])
     stock_txt = f"{stock} in stock" if stock > 0 else "OUT OF STOCK"
     try:
-        from catalog_cleanup import display_product_name, md_escape
+        from catalog_cleanup import (
+            display_product_name,
+            md_escape,
+            sanitize_catalog_text,
+            storefront_label,
+        )
 
         shown = md_escape(display_product_name(str(p.get("name") or "")))
-        desc_raw = str(p.get("description") or "")
+        desc_raw = sanitize_catalog_text(str(p.get("description") or ""))
         desc = f"\n   {md_escape(desc_raw)}" if desc_raw else ""
+        unit = storefront_label(p.get("unit") or "vial", 20) or "vial"
     except Exception:
         shown = str(p.get("name") or "")
         desc = f"\n   {p['description']}" if p.get("description") else ""
+        unit = p.get("unit") or "vial"
     return (
-        f"• *{shown}* — {money(float(p['price']), symbol)} / {p.get('unit') or 'vial'}\n"
+        f"• *{shown}* — {money(float(p['price']), symbol)} / {unit}\n"
         f"   _{stock_txt}_{desc}"
     )
 
