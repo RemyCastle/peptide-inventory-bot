@@ -69,17 +69,17 @@ This repo: `POST /order` adds short `checkout_message`; `STORE_URL_CACHE_BUST`
 after paid/cancelled/rejected; `POST /order` rails include `pay_hint`
 (PayPal email = copy Friends & Family; no handle inside the hint).
 
-## Acceptance (this ship)
+## Acceptance (this ship — `fe857ec`, Pages `9c914f77`)
 
-- [ ] `python -m pytest -q -x` green on scratch DBs
-- [ ] Docker COPY check still lists every imported module
-- [ ] No writes to laptop `inventory.db`; no DELETE of products
-- [ ] `POST /order` success includes short `checkout_message` (not the full DM)
-- [ ] Mini App HTML: no “sample data” / “make-believe”; uses `pay_url` / `pay_hint`
-- [ ] Mini App disables submit when `checkout_ready` is false
-- [ ] Live Pages `/unicorn/` no longer shows mockup chrome
-- [ ] After peptide push: `/health` `git_sha` matches this commit; Telegram store URL `?v=20260912`
-- [ ] No secrets / `.env` / scratch import files committed
+- [x] `python -m pytest -q -x` green on scratch DBs (611 passed)
+- [x] Docker COPY check still lists every imported module (26)
+- [x] No writes to laptop `inventory.db`; no DELETE of products
+- [x] `POST /order` success includes short `checkout_message` (not the full DM)
+- [x] Mini App HTML: no “sample data” / “make-believe”; uses `pay_url` / `pay_hint`
+- [x] Mini App disables submit when `checkout_ready` is false
+- [x] Live Pages `/unicorn/` no longer shows mockup chrome
+- [x] Live `/health` `git_sha` `fe857ec…`, `payments.active` = 2; store URL `?v=20260912`
+- [x] No secrets / `.env` / scratch import files committed
 
 Prior 2054b95 checks stay true: storefront names-only, paid-order null `pay_url`.
 
