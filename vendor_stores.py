@@ -601,9 +601,10 @@ def payment_method_public(
         from catalog_cleanup import storefront_label
 
         name = storefront_label(name, 60) or "Payment"
+        instr = storefront_label(method.get("instructions") or "", 200)
     except Exception:
         name = str(name or "Payment")[:60] or "Payment"
-    instr = (method.get("instructions") or "").strip()
+        instr = " ".join(str(method.get("instructions") or "").split())[:200]
     line = f"{name}: {instr}".rstrip(": ")
     return {
         "name": name,

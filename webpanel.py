@@ -909,6 +909,15 @@ def _buyer_payment_name(m: dict) -> str:
     return _buyer_field(raw, 60) or "Payment"
 
 
+def _buyer_zones(zones: list[dict] | None) -> list[dict] | None:
+    try:
+        from catalog_cleanup import public_shipping_zones
+
+        return public_shipping_zones(zones)
+    except Exception:
+        return zones
+
+
 def api_storefront(raw_key: str) -> tuple[int, dict]:
     """Public, read-only catalog for a vendor's mini-app storefront.
 
@@ -943,7 +952,7 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
             "shipping_enabled": int(shop.get("shipping_enabled") or 0),
             "shipping_fee": float(shop.get("shipping_fee") or 0),
             "free_shipping_above": float(shop.get("free_shipping_above") or 0),
-            "shipping_zones": db.parse_shipping_zones(shop),
+            "shipping_zones": _buyer_zones(db.parse_shipping_zones(shop)),
         },
         "products": [
             {
@@ -969,7 +978,8 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
         "payment_methods": [
             {
                 "name": _buyer_payment_name(m),
-                "method_type": (m.get("method_type") or "custom"),
+                "method_type": _buyer_field(m.get("method_type") or "custom", 20)
+                or "custom",
             }
             for m in payments
         ],
@@ -1025,10 +1035,10 @@ def api_order_status(raw_key: str, payment_code: str) -> tuple[int, dict]:
         "shipping_fee": float(order.get("shipping_fee") or 0),
         "total": total,
         "created_at": order.get("created_at") or "",
-        "tracking_number": (order.get("tracking_number") or "").strip(),
-        "tracking_carrier": (order.get("tracking_carrier") or "").strip(),
-        "ship_name": (order.get("ship_name") or "").strip(),
-        "ship_address": (order.get("ship_address") or "").strip(),
+        "tracking_number": _buyer_field(order.get("tracking_number"), 80) or "",
+        "tracking_carrier": _buyer_field(order.get("tracking_carrier"), 40) or "",
+        "ship_name": _buyer_field(order.get("ship_name"), 80) or "",
+        "ship_address": _buyer_field(order.get("ship_address"), 200) or "",
         "payments": [p.get("line") for p in pay_objs],
         "payment_methods": pay_objs,
     }
@@ -1064,9 +1074,7 @@ def _optional_text(value: Any, max_len: int) -> str | None:
 
 def _product_public(p: dict) -> dict:
     photo = (p.get("photo_file_id") or "").strip()
-    cat = p.get("category")
-    if cat is not None:
-        cat = str(cat).strip() or None
+    cat = _optional_text(p.get("category"), 40) or ""
     sku = _optional_text(p.get("sku"), 40) or ""
     shown = _buyer_product_name(p)
     stored = str(p.get("name") or "")
@@ -1089,7 +1097,7 @@ def _product_public(p: dict) -> dict:
         "has_photo": bool(photo),
         "coa_url": (p.get("coa_url") or "").strip(),
         "has_coa_file": bool((p.get("coa_file_id") or "").strip()),
-        "category": cat,
+        "category": cat or None,
         "sort_order": int(p.get("sort_order") or 0),
     }
 
@@ -1445,8 +1453,8 @@ def api_payment(tok: dict, payload: dict) -> tuple[int, dict]:
         return 200, {"ok": True, "deleted": True}
 
     rendered = _payment_payload_to_fields(payload)
-    name = str(rendered.get("name") or "").strip()[:60]
-    instructions = str(rendered.get("instructions") or "").strip()[:1000]
+    name = _buyer_field(rendered.get("name"), 60) or ""
+    instructions = _buyer_field(rendered.get("instructions"), 1000) or ""
 
     if mid is None:
         if not name:
@@ -1481,9 +1489,9 @@ def api_payment(tok: dict, payload: dict) -> tuple[int, dict]:
     ):
         fields = {}
         if payload.get("name"):
-            fields["name"] = str(payload.get("name") or "").strip()[:60]
+            fields["name"] = _buyer_field(payload.get("name"), 60) or "Payment"
         if payload.get("instructions") is not None:
-            fields["instructions"] = str(payload.get("instructions") or "").strip()[:1000]
+            fields["instructions"] = _buyer_field(payload.get("instructions"), 1000) or ""
         if payload.get("active") is not None:
             fields["active"] = 1 if payload["active"] in (1, True, "1", "true") else 0
     if not fields:
@@ -1571,12 +1579,18 @@ def api_shipping(tok: dict, payload: dict) -> tuple[int, dict]:
 def api_shop(tok: dict, payload: dict) -> tuple[int, dict]:
     fields: dict[str, Any] = {}
     if payload.get("title") is not None:
-        title = " ".join(str(payload["title"]).split())[:80]
+        title = _buyer_field(payload.get("title"), 80) or ""
         if not title:
             return _err(400, "Title cannot be empty")
         fields["title"] = title
     if payload.get("welcome_text") is not None:
-        fields["welcome_text"] = str(payload["welcome_text"]).strip()[:500] or None
+        try:
+            from catalog_cleanup import sanitize_multiline
+
+            welcome = sanitize_multiline(payload.get("welcome_text"), 500)
+        except Exception:
+            welcome = str(payload.get("welcome_text") or "").strip()[:500]
+        fields["welcome_text"] = welcome or None
     if not fields:
         return _err(400, "Nothing to update")
     db.update_shop(tok["chat_id"], **fields)

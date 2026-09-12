@@ -1201,6 +1201,15 @@ def parse_shipping_zones(shop: dict | None) -> list[dict] | None:
         except (TypeError, ValueError):
             continue
         label = " ".join(str(z.get("label") or zid).split())[:80] or zid
+        try:
+            from catalog_cleanup import storefront_label
+
+            zid = storefront_label(zid, 40) or zid
+            label = storefront_label(label, 80) or zid
+        except Exception:
+            pass
+        if not zid:
+            continue
         out.append(
             {
                 "id": zid,
@@ -1953,6 +1962,17 @@ def add_payment_method(
     network_note: str | None = None,
 ) -> int:
     ensure_shop(chat_id)
+    clean_name = (name or "").strip()
+    clean_instr = (instructions or "").strip()
+    try:
+        from catalog_cleanup import storefront_label, sanitize_catalog_text
+
+        cleaned = storefront_label(clean_name, 60)
+        clean_name = cleaned if cleaned else (clean_name[:60] or "Payment")
+        clean_instr = sanitize_catalog_text(clean_instr)
+    except Exception:
+        clean_name = " ".join(clean_name.split())[:60]
+        clean_instr = " ".join(clean_instr.split())
     with get_db() as conn:
         cur = conn.execute(
             """
@@ -1964,8 +1984,8 @@ def add_payment_method(
             """,
             (
                 chat_id,
-                name.strip(),
-                instructions.strip(),
+                clean_name,
+                clean_instr,
                 _utc_now(),
                 method_type,
                 cashtag,
@@ -2009,9 +2029,24 @@ def update_payment_method(method_id: int, **fields: Any) -> bool:
     cols = []
     vals: list[Any] = []
     for k, v in fields.items():
-        if k in allowed:
-            cols.append(f"{k} = ?")
-            vals.append(v)
+        if k not in allowed:
+            continue
+        if k == "name" and isinstance(v, str):
+            try:
+                from catalog_cleanup import storefront_label
+
+                v = storefront_label(v, 60) or v[:60]
+            except Exception:
+                v = " ".join(v.split())[:60]
+        elif k == "instructions" and isinstance(v, str):
+            try:
+                from catalog_cleanup import sanitize_catalog_text
+
+                v = sanitize_catalog_text(v)
+            except Exception:
+                v = " ".join(v.split())
+        cols.append(f"{k} = ?")
+        vals.append(v)
     if not cols:
         return False
     vals.append(method_id)

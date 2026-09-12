@@ -196,6 +196,60 @@ class GlyphRepairTests(unittest.TestCase):
         self.assertEqual(cc.storefront_label("X" * 50, 40), "X" * 40)
         self.assertEqual(cc.storefront_label("  "), "")
 
+    def test_repair_leaves_real_latin_and_euro(self) -> None:
+        for good in ("10€ off", "Ångström", "café", "œuf", "naïve"):
+            self.assertEqual(cc.repair_glyphs(good), good)
+            self.assertEqual(cc.sanitize_catalog_text(good), good)
+
+    def test_mixed_ascii_and_emoji_mojibake(self) -> None:
+        original = "Hello 🦄 catalog"
+        broken = self._mojibake(original, "cp1252")
+        self.assertIn("Hello", broken)
+        self.assertEqual(cc.repair_glyphs(broken), original)
+
+    def test_emdash_and_ellipsis_mojibake(self) -> None:
+        original = "Wait… then — go"
+        broken = self._mojibake(original, "cp1252")
+        self.assertEqual(cc.repair_glyphs(broken), original)
+
+    def test_flag_and_zwj_sequences_kept(self) -> None:
+        flag = "🇺🇸"
+        rainbow = "🏳️\u200d🌈"
+        wave = "👋🏽"
+        for seq in (flag, rainbow, wave):
+            self.assertEqual(cc.sanitize_catalog_text(seq), seq)
+            self.assertEqual(cc.storefront_label(seq + "\u0000", 40), seq)
+
+    def test_clip_label_keeps_flag_intact(self) -> None:
+        flag = "🇺🇸"
+        clipped = cc.clip_label(flag * 40, 64)
+        self.assertLessEqual(cc.utf16_len(clipped), 64)
+        clipped.encode("utf-16-le")
+        self.assertNotIn("\ufffd", clipped)
+
+    def test_repair_still_works_when_replacement_char_present(self) -> None:
+        original = "🦄 Unicorn Magic Factory"
+        broken = self._mojibake(original, "cp1252") + "\ufffd"
+        self.assertEqual(cc.repair_glyphs(broken), original)
+        self.assertEqual(
+            cc.sanitize_catalog_text(broken + "\u0000"),
+            original,
+        )
+
+    def test_glyph_fixture_table(self) -> None:
+        cases = (
+            ("🦄", "cp1252"),
+            ("🧬 Catalog", "latin-1"),
+            ("Owner’s shop", "cp1252"),
+            ("Café", "cp1252"),
+            ("Wait…", "cp1252"),
+            ("A—B", "cp1252"),
+        )
+        for original, codec in cases:
+            with self.subTest(original=original, codec=codec):
+                broken = self._mojibake(original, codec)
+                self.assertEqual(cc.repair_glyphs(broken), original)
+
     def test_buyer_shop_title_strips_junk(self) -> None:
         self.assertEqual(
             cc.buyer_shop_title("Unicorn\u200b Magic Factory"),

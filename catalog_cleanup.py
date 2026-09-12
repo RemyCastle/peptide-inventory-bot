@@ -107,7 +107,7 @@ def repair_glyphs(text: str) -> str:
     single-byte codec, so the encode step raises and we bail. Loops a few
     times to undo double-encoding.
     """
-    s = str(text or "")
+    s = str(text or "").replace("\ufffd", "")
     for _ in range(3):
         if not any(m in s for m in _MOJIBAKE_MARKERS):
             break
@@ -226,6 +226,45 @@ def storefront_label(text: str | None, max_len: int | None = None) -> str:
     if max_len is not None and int(max_len) > 0:
         s = clip_label(s, int(max_len), ellipsis="")
     return s
+
+
+def sanitize_multiline(text: str | None, max_len: int | None = None) -> str:
+    """Repair glyphs; keep newlines; drop other controls. Welcome / instructions."""
+    s = display_shop_text(str(text or "")).replace("\r\n", "\n").replace("\r", "\n")
+    if not s:
+        return ""
+    out: list[str] = []
+    for ch in s:
+        if ch == "\n":
+            out.append(ch)
+            continue
+        cat = unicodedata.category(ch)
+        if cat[0] == "C" and ch not in _KEEP_CF:
+            continue
+        out.append(ch)
+    lines = [" ".join(part.split()) for part in "".join(out).split("\n")]
+    s = "\n".join(lines).strip()
+    if max_len is not None and int(max_len) > 0 and len(s) > int(max_len):
+        s = s[: int(max_len)].rstrip()
+    return s
+
+
+def public_shipping_zones(zones: list[dict] | None) -> list[dict] | None:
+    """Buyer-facing zone ids/labels: repaired, junk stripped. Empty → None."""
+    if not zones:
+        return None
+    out: list[dict] = []
+    for z in zones:
+        zid_raw = str(z.get("id") or "")
+        zid = storefront_label(zid_raw, 40) or zid_raw.strip()[:40]
+        if not zid:
+            continue
+        label = storefront_label(z.get("label"), 80) or zid
+        item = dict(z)
+        item["id"] = zid
+        item["label"] = label
+        out.append(item)
+    return out or None
 
 
 def tg_button_text(text: str, max_len: int = TG_BUTTON_MAX) -> str:
