@@ -2692,6 +2692,19 @@ def _require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[
     sid = shop_id(context, update)
     if not user:
         return None, False
+    # MagicFactory2: OWNER + catalog admins must see Mini App orders on the
+    # Pages catalog shop, not a personal /start shop or title-sorted extra.
+    try:
+        import unicorn_shop
+
+        if unicorn_shop.is_unicorn_customer_bot():
+            cat = unicorn_shop.staff_shop_for_admin(user.id)
+            if cat:
+                sid = int(cat["chat_id"])
+                set_shop(context, sid)
+                return sid, True
+    except Exception:
+        log.exception("catalog staff shop lookup failed")
     if sid is None:
         # Try private shop / first admin shop
         shops = db.shops_for_admin(user.id)

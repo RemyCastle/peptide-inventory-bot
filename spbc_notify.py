@@ -164,6 +164,14 @@ def _owner_chat_id() -> int | None:
         raw = (os.getenv("OWNER_TELEGRAM_CHAT_ID") or "").strip()
     if raw.lstrip("-").isdigit():
         return int(raw)
+    try:
+        import vendor_stores
+
+        ids = vendor_stores._owner_ids()
+        if ids:
+            return int(ids[0])
+    except Exception:
+        pass
     return None
 
 
@@ -1131,6 +1139,7 @@ def live_git_sha() -> str:
 
 
 _catalog_cleanup_last: dict[str, Any] | None = None
+_keep_only_last: dict[str, Any] | None = None
 
 
 def set_catalog_cleanup_result(result: dict | None) -> None:
@@ -1155,6 +1164,23 @@ def set_catalog_cleanup_result(result: dict | None) -> None:
     if shop_title:
         out["shop_title"] = str(shop_title)[:80]
     _catalog_cleanup_last = out
+
+
+def set_keep_only_result(result: dict | None) -> None:
+    """Remember last keep-only catalog reattach for /health (counts only)."""
+    global _keep_only_last
+    if not result:
+        _keep_only_last = None
+        return
+    out: dict[str, Any] = {
+        "ok": bool(result.get("ok")),
+        "moved": int(result.get("moved") or 0),
+        "stray_shops": int(result.get("stray_shops") or 0),
+    }
+    skipped = result.get("skipped")
+    if skipped:
+        out["skipped"] = str(skipped)[:80]
+    _keep_only_last = out
 
 
 def _status_body() -> dict:
@@ -1220,6 +1246,39 @@ def _status_body() -> dict:
     except Exception:
         body["invoices"] = {"enabled": False}
     body["notify"] = notify_stats()
+    try:
+        import unicorn_shop as _ushop
+        import vendor_stores as _vstores
+
+        cat = _ushop.find_catalog_shop()
+        recipient_n = 0
+        if cat:
+            sid = int(cat["chat_id"])
+            recipient_n = len(
+                _vstores.build_notify_recipient_ids(
+                    _vstores.base_notify_ids_for_shop(sid), sid
+                )
+            )
+        body["notify"]["recipients_configured"] = recipient_n > 0
+        body["notify"]["recipient_count"] = recipient_n
+        recent = _ushop.recent_orders_snapshot(20)
+        body["orders"] = {
+            "recent": [
+                {
+                    "id": r["id"],
+                    "payment_code": r["payment_code"],
+                    "chat_id": r["chat_id"],
+                    "status": r["status"],
+                    "username": r["username"],
+                }
+                for r in recent
+            ]
+        }
+        if _keep_only_last is not None:
+            body["orders"]["keep_only"] = dict(_keep_only_last)
+    except Exception:
+        body["notify"]["recipients_configured"] = False
+        body["notify"]["recipient_count"] = 0
     return body
 
 

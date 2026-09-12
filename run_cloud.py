@@ -115,6 +115,44 @@ def _cleanup_unicorn_catalog() -> None:
     print(f"[run_cloud] unicorn catalog cleanup: {clean}", flush=True)
 
 
+def _keep_only_catalog_shop() -> None:
+    """Reattach stray Mini App orders to the Pages catalog shop.
+
+    Never deletes shops, products, or orders. Unicorn customer bot only.
+    """
+    import unicorn_shop
+
+    if not unicorn_shop.is_unicorn_customer_bot():
+        log.info("unicorn keep-only catalog: skip (not customer bot)")
+        print("[run_cloud] unicorn keep-only catalog: skip (not customer bot)", flush=True)
+        return
+    result = unicorn_shop.keep_only_catalog_shop()
+    spbc_notify.set_keep_only_result(result)
+    log.info("unicorn keep-only catalog: %s", result)
+    print(f"[run_cloud] unicorn keep-only catalog: {result}", flush=True)
+    try:
+        snap = unicorn_shop.recent_orders_snapshot(20)
+    except Exception:
+        log.exception("unicorn recent-order snapshot failed")
+        snap = []
+    for row in snap:
+        log.info(
+            "unicorn recent order id=%s payment_code=%s chat_id=%s status=%s username=%s",
+            row.get("id"),
+            row.get("payment_code"),
+            row.get("chat_id"),
+            row.get("status"),
+            row.get("username"),
+        )
+        print(
+            "[run_cloud] unicorn recent order "
+            f"id={row.get('id')} payment_code={row.get('payment_code')} "
+            f"chat_id={row.get('chat_id')} status={row.get('status')} "
+            f"username={row.get('username')}",
+            flush=True,
+        )
+
+
 def _bind_vendor_miniapps() -> None:
     """Re-attach claim tokens + issue public storefront keys for vendor shops.
 
@@ -172,6 +210,11 @@ def _bind_vendor_miniapps() -> None:
         _cleanup_unicorn_catalog()
     except Exception:
         log.exception("unicorn catalog cleanup failed (continuing boot)")
+
+    try:
+        _keep_only_catalog_shop()
+    except Exception:
+        log.exception("unicorn keep-only catalog failed (continuing boot)")
 
     # Optional multi-vendor JSON: each entry may include invite + shop_chat_id + name
     raw = (os.getenv("VENDOR_STORES_JSON") or "").strip()

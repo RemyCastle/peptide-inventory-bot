@@ -1488,8 +1488,39 @@ def find_order_for_resend(key: str) -> dict | None:
 # ── configuration ────────────────────────────────────────────────────────────
 
 def _owner_ids() -> list[int]:
-    raw = (os.getenv("OWNER_TELEGRAM_CHAT_ID") or "").strip()
-    return [int(raw)] if raw.lstrip("-").isdigit() else []
+    """OWNER_TELEGRAM_CHAT_ID + OWNER_IDS + UNICORN_NOTIFY_IDS (deduped).
+
+    Mini App staff DMs used to miss MagicFactory2 owners when only OWNER_IDS
+    was set (Telegram-native checkout already fans out to OWNER_IDS).
+    """
+    out: list[int] = []
+    seen: set[int] = set()
+
+    def _add(raw: object) -> None:
+        text = str(raw or "").strip()
+        if not text or not text.lstrip("-").isdigit():
+            return
+        try:
+            i = int(text)
+        except (TypeError, ValueError):
+            return
+        if i and i not in seen:
+            seen.add(i)
+            out.append(i)
+
+    _add(os.getenv("OWNER_TELEGRAM_CHAT_ID"))
+    for part in (os.getenv("OWNER_IDS") or "").split(","):
+        _add(part)
+    for part in (os.getenv("UNICORN_NOTIFY_IDS") or "").split(","):
+        _add(part)
+    try:
+        from config import OWNER_IDS as _cfg_owners
+
+        for uid in _cfg_owners or []:
+            _add(uid)
+    except Exception:
+        pass
+    return out
 
 
 def load_vendor_configs() -> list[dict]:

@@ -149,6 +149,11 @@ def is_unicorn_customer_bot() -> bool:
         return True
     if (os.getenv("UNICORN_BOT_TOKEN") or "").strip():
         return True
+    panel = (
+        os.getenv("PANEL_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or ""
+    ).strip().lower()
+    if "unicornfartzz" in panel:
+        return True
     return False
 
 
@@ -225,3 +230,129 @@ def find_catalog_shop() -> dict | None:
     if picked:
         return picked
     return _pick_stocked(shops)
+
+
+def staff_shop_for_admin(user_id: int) -> dict | None:
+    """Catalog shop when this user may admin it (owner or shop admin).
+
+    MagicFactory2 /orders and the admin panel must list Mini App orders on
+    the Pages catalog shop, not a personal /start shop or title-sorted extra.
+    """
+    shop = find_catalog_shop()
+    if not shop:
+        return None
+    try:
+        uid = int(user_id)
+        sid = int(shop["chat_id"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    if not uid or not sid:
+        return None
+    try:
+        if db.is_admin(sid, uid):
+            return shop
+    except Exception:
+        return None
+    return None
+
+
+def recent_orders_snapshot(limit: int = 20) -> list[dict]:
+    """Newest orders: id, payment_code, chat_id, status, username. Read-only."""
+    try:
+        n = max(1, min(int(limit or 20), 50))
+    except (TypeError, ValueError):
+        n = 20
+    try:
+        with db.get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, payment_code, chat_id, status, username, created_at
+                FROM orders
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (n,),
+            ).fetchall()
+    except Exception:
+        return []
+    out: list[dict] = []
+    for r in rows:
+        try:
+            oid = int(r["id"])
+            cid = int(r["chat_id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        out.append(
+            {
+                "id": oid,
+                "payment_code": str(r["payment_code"] or ""),
+                "chat_id": cid,
+                "status": str(r["status"] or ""),
+                "username": str(r["username"] or ""),
+                "created_at": str(r["created_at"] or ""),
+            }
+        )
+    return out
+
+
+def keep_only_catalog_shop() -> dict:
+    """Reattach extra-shop orders to the catalog shop. Never DELETE.
+
+    Mini App POST /order writes to whichever shop the Pages key was bound to.
+    Extra personal /start shops and old Unicorn-titled binds must not orphan
+    those rows. Products and shop rows stay. Idempotent.
+    """
+    shop = find_catalog_shop()
+    if not shop:
+        return {"ok": False, "skipped": "no catalog shop", "moved": 0, "stray_shops": 0}
+    try:
+        keeper = int(shop["chat_id"])
+    except (TypeError, ValueError, KeyError):
+        return {"ok": False, "skipped": "bad catalog shop", "moved": 0, "stray_shops": 0}
+
+    moved = 0
+    stray_shops = 0
+    try:
+        with db.get_db() as conn:
+            extras = conn.execute(
+                "SELECT chat_id FROM shops WHERE chat_id != ?",
+                (keeper,),
+            ).fetchall()
+            for row in extras:
+                extra = int(row["chat_id"])
+                n_ord_row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM orders WHERE chat_id = ?",
+                    (extra,),
+                ).fetchone()
+                n_ord = int((n_ord_row["c"] if n_ord_row else 0) or 0)
+                if n_ord <= 0:
+                    continue
+                cur = conn.execute(
+                    "UPDATE orders SET chat_id = ? WHERE chat_id = ?",
+                    (keeper, extra),
+                )
+                n = int(cur.rowcount or 0)
+                if n:
+                    moved += n
+                    stray_shops += 1
+    except Exception:
+        return {
+            "ok": False,
+            "skipped": "reattach failed",
+            "moved": moved,
+            "stray_shops": stray_shops,
+            "keeper": keeper,
+        }
+
+    try:
+        import webpanel
+
+        webpanel.ensure_storefront_key_plain(keeper, pages_storefront_key())
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "keeper": keeper,
+        "moved": moved,
+        "stray_shops": stray_shops,
+    }
