@@ -167,6 +167,23 @@ later field errors (expired, missing user) carry `hash_ok=True`
 other tokens (`vendor_stores.py:1224`) so it never masks the real reason with
 "bad hash". So `expired` genuinely means "signed but stale," not "wrong bot."
 
+**But `bad_hash` is overloaded — read the log `reason`, not the buyer's code.**
+`initdata_error_code` (`vendor_stores.py:138`) only ever returns **two**
+buyer-facing codes: anything containing `"expired"` → `expired`, and
+**everything else → `bad_hash`**. So a session that *was* correctly signed but
+whose `user` field is missing or malformed (`missing user`, `bad user json`,
+`bad user id`, `bad auth_date` — `vendor_stores.py:330`–`342`, all raised with
+`hash_ok=True`) still hands the buyer `bad_hash`, even though the token matched.
+The **only** way to tell "wrong/absent token" from "signed but broken payload"
+is the server log `reason`:
+
+- `reason=bad hash` → genuinely no candidate token matched → add the buyer's
+  bot to `extra_tokens` (or it was the empty-initData redirect).
+- `reason=missing user` / `bad user …` / `bad auth_date` → the token matched,
+  but the client sent an incomplete `initData`. Usually an out-of-date Telegram
+  app, or a plain browser opening the Pages URL directly (no Telegram to inject
+  `user`). This is **not** a token-set fix — do not add `extra_tokens`.
+
 ---
 
 ## Diagnosing a live checkout failure (order of operations)
@@ -301,6 +318,24 @@ derives `chat_id` from the token, so a link only ever edits its own shop.
   from another shop returns `404` (`webpanel.py:1372`). Remember the
   delete-then-reboot trap above: for seeded types, **pause instead of delete**.
 
+**Endpoint responses** (`api_payment`, `webpanel.py:1363`) — the `error` string
+tells you which field the panel/curl call missed:
+
+| Status | Body | Cause |
+|--------|------|-------|
+| 200 | `{"ok":true,"id":<n>,"created":true}` | added |
+| 200 | `{"ok":true,"id":<n>,"created":false}` | updated in place |
+| 200 | `{"ok":true,"deleted":true}` | deleted |
+| 400 | `Name required` | add (no `id`) with no `name` (`webpanel.py:1386`) |
+| 400 | `Crypto wallet address required` | `crypto` add with no `address` (`webpanel.py:1390`) |
+| 400 | `Payment handle / number required` | venmo/paypal/zelle/apple_cash/cashapp add with no `handle`/`cashtag` (`webpanel.py:1392`) |
+| 400 | `Bad payment id` | `id` isn't an integer (`webpanel.py:1370`) |
+| 400 | `Payment id required` | `delete: true` with no `id` (`webpanel.py:1377`) |
+| 400 | `Nothing to update` | update carried no recognized field (`webpanel.py:1424`) |
+| 404 | `Payment method not found in your shop` | `id` is unknown or owned by another shop (`webpanel.py:1373`) |
+
+`name` is truncated to 60 chars, `instructions` to 1000 (`webpanel.py:1382`).
+
 **Reorder the pay screen** by setting `sort_order` — the buyer list is
 `ORDER BY sort_order, name` (`db.py:2025`). Lower `sort_order` shows first; ties
 break alphabetically by `name`.
@@ -324,6 +359,40 @@ curl -sS "https://unicornfartzz-bot.onrender.com/storefront?invite=YOUR_HEX" | \
 
 Expect a non-empty list of `"Name: instructions"` lines. Empty list → seed a
 method (any path above). Do **not** reset the DB to "fix" an empty pay screen.
+That JSON array is the raw `Name: instructions` render (`payment_display_lines`,
+`vendor_stores.py:433`); the trailing `": "` is stripped for rows with no
+instructions.
+
+### Handle format decides the tap-to-pay button
+
+The `storefront`/`order` JSON is plain text, but the **Telegram receipt** the
+buyer gets after ordering renders a one-tap **pay link** for some rails
+(`payment_pay_link`, `vendor_stores.py:476`; `_payment_method_html`,
+`vendor_stores.py:511`). Whether the buyer gets a button — and whether *you* can
+reconcile the payment to an order — depends on the **handle format** you seed:
+
+| Rail | Deep link | Prefilled | Format that produces a link |
+|------|-----------|-----------|-----------------------------|
+| Venmo | `account.venmo.com/pay` | amount **+ order code in the note** | any `@handle` |
+| Cash App | `cash.app/$tag/<amt>` | amount only | any `$Cashtag` |
+| PayPal | `paypal.me/<user>/<amt>` | amount only | **username only** — an email gets **no** link (`vendor_stores.py:506`) |
+| Zelle · Apple Cash · email-PayPal · crypto · custom | none | — | rendered as a tap-to-copy target only |
+
+Setup takeaways:
+
+- **Venmo reconciles itself.** The order code rides along as the payment note,
+  so you can match incoming Venmo payments to orders by note. Prefer Venmo when
+  you want hands-off reconciliation.
+- **Seed PayPal as a `paypal.me` username, not an email,** if you want the
+  one-tap button. An email still works — buyers just copy/paste it — but there's
+  no deep link (`paypal.me` can't address emails). The F&F vs G&S warning line
+  follows `network_note` (`vendor_stores.py:517`).
+- **Crypto** never gets a deep link and always shows the "double-check the
+  network — wrong network = lost funds" warning, plus `network_note` as
+  "Network: …" (`vendor_stores.py:523`).
+- Any row with a resolvable target shows it as a tap-to-copy `<code>` chip;
+  **custom/free-text** rows with no detectable target print their `instructions`
+  verbatim instead (`vendor_stores.py:527`).
 
 ### Notes / gotchas
 
@@ -345,9 +414,12 @@ method (any path above). Do **not** reset the DB to "fix" an empty pay screen.
 - Keep every Menu Button / `store_url` trailing-slashed (`…/unicorn/`).
 - Bump `STORE_URL_CACHE_BUST` after a Pages checkout-JS deploy.
 - Seed ≥1 active payment method per selling shop.
+- Seed PayPal as a `paypal.me` **username** (not an email) and prefer **Venmo**
+  when you want a one-tap pay button and order-code reconciliation.
 - **Pause** (`⏸`) a seeded payment default you don't want, rather than deleting
   it — a deleted seeded type is re-created on the next boot.
-- Read the `POST /order` log line before changing config.
+- Read the `POST /order` log line before changing config — trust the `reason`,
+  not the overloaded `bad_hash` buyer code.
 
 **Don't**
 - Wipe or reset `/data/inventory.db` to "fix" checkout or empty payments.
@@ -366,7 +438,8 @@ method (any path above). Do **not** reset the DB to "fix" an empty pay screen.
 | `POST /order` handler | `spbc_notify.py:1010` |
 | HMAC validate (one token) | `vendor_stores.py:263` |
 | HMAC validate (any bound token) | `vendor_stores.py:1201` |
-| Error code map | `vendor_stores.py:138` |
+| Error code map (`bad_hash`/`expired`) | `vendor_stores.py:138` |
+| Post-HMAC payload checks (still → `bad_hash`) | `vendor_stores.py:330` |
 | Token set for a shop | `vendor_stores.py:1145` |
 | Unicorn HMAC aliases | `vendor_stores.py:1112` |
 | Trailing-slash normalize | `vendor_stores.py:84` |
@@ -376,6 +449,8 @@ method (any path above). Do **not** reset the DB to "fix" an empty pay screen.
 | Idempotent payment seed | `webpanel.py:1429` |
 | Unicorn boot payment seed | `run_cloud.py:153` |
 | Panel payment write API (add/update/delete) | `webpanel.py:1363` |
+| Tap-to-pay deep-link builder | `vendor_stores.py:476` |
+| Payment method HTML render (receipt) | `vendor_stores.py:511` |
 | Buyer-visible list (active-only, sorted) | `db.py:2025` |
 | Telegram payments menu | `bot.py:5418` |
 | `payments` in storefront/order JSON | `vendor_stores.py:433` |
