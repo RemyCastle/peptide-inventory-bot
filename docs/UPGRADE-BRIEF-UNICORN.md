@@ -26,6 +26,7 @@ Context (already verified — do not rediscover):
 - Claim cancel URL + confirm-success tracking live on `991eb64`
 - Sanitizer harden live on `2340351` (live `/health` sha `2340351`, `payments.active` = 2)
 - Empty-handle rails live on `8829dfb` (`payments.usable` = 2)
+- PayPal/Apple Cash quick-add + refuse empty typed saves live on `3663272`
 
 ## Prior ships
 
@@ -105,7 +106,7 @@ already ignored those rows; this ship stops creating them from admin.
 - [x] Empty enabled Venmo update 400; pause-with-empty 200; empty
       PayPal create 400; empty custom create still 200
 - [x] Seeded Unicorn shop still `checkout_ready`; health `usable` ≥ 1
-- [ ] Live `/health` sha this commit, `payments.active` = 2,
+- [x] Live `/health` sha `3663272`, `payments.active` = 2,
       `payments.usable` = 2, `checkout_ready: true`,
       `store_url_cache_bust` `20260913`
 - [x] No secrets / `.env` / scratch import files committed
