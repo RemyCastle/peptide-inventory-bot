@@ -24,6 +24,24 @@ def _sym(shop: dict | None) -> str:
     return db.shop_display(shop)["currency_symbol"]
 
 
+def _report_label(raw: object, max_len: int = 80) -> str:
+    try:
+        from catalog_cleanup import storefront_label
+
+        return storefront_label(raw, max_len)
+    except Exception:
+        return " ".join(str(raw or "").split())[:max_len]
+
+
+def _report_product(raw: object) -> str:
+    try:
+        from catalog_cleanup import display_product_name
+
+        return display_product_name(str(raw or ""))
+    except Exception:
+        return str(raw or "")
+
+
 def generate_inventory_report(shop_id: int) -> str:
     """All products for a shop: name, price, stock, low-stock flag."""
     shop = db.get_shop(shop_id)
@@ -97,12 +115,17 @@ def generate_pending_orders_report(shop_id: int) -> str:
 
     for o in orders:
         items = db.get_order_items(int(o["id"]))
-        buyer = o.get("full_name") or o.get("username") or o.get("user_id")
+        buyer = (
+            _report_label(o.get("full_name"), 80)
+            or _report_label(o.get("username"), 80)
+            or o.get("user_id")
+        )
+        method = _report_label(o.get("payment_method_name"), 60) or "—"
         lines.append(
             f"Order #{o['id']} | {o['status']} | {o.get('created_at')}"
         )
         lines.append(f"  Buyer: {buyer} (id {o.get('user_id')})")
-        lines.append(f"  Method: {o.get('payment_method_name') or '—'}")
+        lines.append(f"  Method: {method}")
         lines.append(
             f"  Total: {sym}{float(o.get('total') or 0):.2f} "
             f"(sub {sym}{float(o.get('subtotal') or 0):.2f} + ship {sym}{float(o.get('shipping_fee') or 0):.2f})"
@@ -110,8 +133,9 @@ def generate_pending_orders_report(shop_id: int) -> str:
         if items:
             lines.append("  Items:")
             for it in items:
+                shown = _report_product(it.get("product_name"))
                 lines.append(
-                    f"    - {it.get('product_name')} x{it.get('quantity')} "
+                    f"    - {shown} x{it.get('quantity')} "
                     f"= {sym}{float(it.get('line_total') or 0):.2f}"
                 )
         else:

@@ -130,6 +130,25 @@ class ReportGeneratorTests(unittest.TestCase):
         self.assertEqual(reports.safe_filename_part("My Shop!"), "My_Shop")
         self.assertTrue(len(reports.safe_filename_part("x" * 100)) <= 32)
 
+    def test_pending_report_sanitizes_dirty_rows(self) -> None:
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET full_name = ?, payment_method_name = ? "
+                "WHERE id = ?",
+                ("Buyer\ufffd One", "Cash\u0000", int(self.order_pending["id"])),
+            )
+            conn.execute(
+                "UPDATE order_items SET product_name = ? WHERE order_id = ?",
+                ("Plenty (vial) $10.00\ufffd", int(self.order_pending["id"])),
+            )
+        text = reports.generate_pending_orders_report(self.shop_a)
+        self.assertIn("Buyer One", text)
+        self.assertIn("Cash", text)
+        self.assertIn("Plenty", text)
+        self.assertNotIn("(vial)", text)
+        self.assertNotIn("\ufffd", text)
+        self.assertNotIn("\u0000", text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1045,6 +1045,83 @@ class StorefrontGapTests(unittest.TestCase):
         self.assertEqual(item["unit"], "vial")
         self.assertEqual(item["description"], "lyo 10mg")
 
+    def test_storefront_photo_rejects_zwj_and_nbsp_percent(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE products SET photo_file_id = ? WHERE id = ?",
+                ("https://exam%E2%80%8Dple.com/p.png", pid),
+            )
+        code, body = webpanel.api_storefront(self.sf_key)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["products"][0]["photo_url"], "")
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE products SET photo_file_id = ? WHERE id = ?",
+                ("https://cdn.example.com/p%C2%A0.png", pid),
+            )
+        code, body = webpanel.api_storefront(self.sf_key)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["products"][0]["photo_url"], "")
+
+    def test_pending_orders_report_strips_buyer_method_item_junk(self) -> None:
+        import reports
+
+        pid = db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 3)
+        db.add_payment_method(SHOP, "Venmo", "@x")
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer",
+            "Buyer",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "Aod 5mg (vial) $15.00",
+                    "unit_price": 15.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo"},
+            "Buyer",
+            "1 St",
+            "",
+        )
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET full_name = ?, username = ?, "
+                "payment_method_name = ? WHERE id = ?",
+                ("Buyer\ufffd", "buyer\u0000", "Venmo\u0000\ufffd", int(order["id"])),
+            )
+            conn.execute(
+                "UPDATE order_items SET product_name = ? WHERE order_id = ?",
+                ("Aod 5mg (vial) $15.00\ufffd", int(order["id"])),
+            )
+        blob = reports.generate_pending_orders_report(SHOP)
+        self.assertIn("Buyer", blob)
+        self.assertIn("Venmo", blob)
+        self.assertIn("Aod 5mg", blob)
+        self.assertNotIn("(vial)", blob)
+        self.assertNotIn("\ufffd", blob)
+        self.assertNotIn("\u0000", blob)
+
+    def test_admin_state_empty_rail_hint_is_type_specific(self) -> None:
+        mid = db.add_payment_method(
+            SHOP, "USDT", "", method_type="crypto", handle=""
+        )
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE payment_methods SET address = '', handle = '', "
+                "cashtag = '' WHERE id = ?",
+                (mid,),
+            )
+        code, state = webpanel.api_state(self.tok)
+        self.assertEqual(code, 200)
+        row = next(p for p in state["payments"] if int(p["id"]) == mid)
+        self.assertFalse(row.get("rail_ready"))
+        self.assertIn("wallet address", row.get("empty_rail_hint") or "")
+        self.assertNotIn("handle", (row.get("empty_rail_hint") or "").lower())
+
 
 if __name__ == "__main__":
     unittest.main()

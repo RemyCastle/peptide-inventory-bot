@@ -192,6 +192,7 @@ Menu Button URL in BotFather must match `UNICORN_STORE_URL` / vendor
 | P1 | Claim ping cancel was text-only; confirm success had no tracking CTA | **live `991eb64`** (Cancel URL button + `/confirm` Add tracking) |
 | P1 | Enabled method with no handle still counted as checkout_ready | **live `8829dfb`** (`usable` rails only; health `payments.usable`) |
 | P1 | PayPal / Apple Cash quick-add buttons did not start the prompt; enabled typed rails could save empty | **live `3663272`** (handler regex + 400 on empty enabled save) |
+| P1 | Empty-rail admin copy said "handle" for crypto / Cash App / Apple Cash; URL ZWJ/NBSP kept | **this ship** (type-specific empty-target copy; URL fail closed) |
 | P2 | Native Telegram invoice (provider token unset) | Optional; Stars forbidden for physical goods |
 
 ---

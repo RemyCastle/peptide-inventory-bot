@@ -236,21 +236,24 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertIsNone(re.match(bot_mod.PAY_TPL_CALLBACK_RE, "paytpl:nope"))
         self.assertIn("Need a real handle", src)
         self.assertIn("_All methods paused._", src)
-        self.assertIn("_Enabled methods have no handle._", src)
+        self.assertIn("payment_empty_rails_admin_line", src)
         self.assertIn("_Buyers can checkout._", src)
-        self.assertIn("add a handle", src)
+        self.assertIn("add a pay target", src)
         self.assertIn("cashtag", src)
+        self.assertIn("Wallet address", src)
+        self.assertIn("payment_target_kind_label", src)
+        vs = (ROOT / "vendor_stores.py").read_text(encoding="utf-8")
+        self.assertIn("_Enabled methods have no pay target._", vs)
         panel = (ROOT / "webpanel.py").read_text(encoding="utf-8")
         self.assertIn("types.has('venmo')", panel)
         self.assertIn("checkout_ready", panel)
         self.assertIn("Buyers see:", panel)
         self.assertIn("buyer_hint", panel)
         self.assertIn("rail_ready", panel)
-        self.assertIn("No handle", panel)
-        self.assertIn(
-            "Add a handle so buyers can use this method (or uncheck enabled)",
-            panel,
-        )
+        self.assertIn("empty_rail_hint", panel)
+        self.assertIn("no pay target", panel)
+        self.assertIn("Add a wallet address so buyers can use this method", panel)
+        self.assertIn("a Cash App cashtag", panel)
         self.assertIn("_reject_unusable_enabled_payment", panel)
 
     def test_pay_url_venmo_prefill_paypal_username_not_email(self) -> None:
@@ -277,6 +280,41 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertIn("Copy", email_hint)
         self.assertNotIn("proton", email_hint)
         self.assertFalse(vendor_stores.public_invoices_enabled())
+
+    def test_empty_rail_copy_is_type_specific(self) -> None:
+        venmo = {
+            "name": "Venmo",
+            "method_type": "venmo",
+            "handle": "",
+            "instructions": "",
+        }
+        crypto = {
+            "name": "USDT",
+            "method_type": "crypto",
+            "address": "",
+            "instructions": "",
+        }
+        cash = {
+            "name": "Cash App",
+            "method_type": "cashapp",
+            "cashtag": "",
+            "instructions": "",
+        }
+        apple = {
+            "name": "Apple Cash",
+            "method_type": "apple_cash",
+            "handle": "",
+            "instructions": "",
+        }
+        self.assertIn("Venmo handle", vendor_stores.payment_target_kind_label(venmo))
+        self.assertIn("wallet address", vendor_stores.payment_target_kind_label(crypto))
+        self.assertIn("cashtag", vendor_stores.payment_target_kind_label(cash))
+        self.assertIn("Apple Cash number", vendor_stores.payment_target_kind_label(apple))
+        self.assertIn("wallet address", vendor_stores.payment_empty_rail_hint(crypto))
+        self.assertNotIn("handle", vendor_stores.payment_empty_rail_hint(crypto).lower())
+        banner = vendor_stores.payment_empty_rails_admin_line()
+        self.assertIn("pay target", banner)
+        self.assertNotIn("no handle", banner.lower())
 
     def test_payment_rail_usable_typed_vs_custom(self) -> None:
         venmo = payment_templates.render_venmo("@wineboos")

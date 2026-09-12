@@ -402,6 +402,11 @@ def _percent_payload_unsafe(text: str) -> bool:
 
     Loops a few times so `%2500` (double-encoded NUL) cannot sneak through.
     `%20` spaces and emoji code points stay allowed.
+
+    URLs are not product names: ZWJ / emoji tags (`_KEEP_CF`) that we keep
+    in catalog labels still fail closed here, so `exam%E2%80%8Dple.com`
+    cannot spoof `example.com`. NBSP / other Zs besides SPACE also fail
+    (`%C2%A0`); combining marks (Mn/Me) too.
     """
     s = str(text or "")
     if not s:
@@ -421,9 +426,11 @@ def _percent_payload_unsafe(text: str) -> bool:
             if _is_noncharacter(ch) or ch in _INVISIBLE_FILLERS:
                 return True
             cat = unicodedata.category(ch)
-            if cat in ("Zl", "Zp", "Cs", "Co"):
+            if cat in ("Zl", "Zp", "Cs", "Co", "Mn", "Me"):
                 return True
-            if cat[0] == "C" and ch not in _KEEP_CF:
+            if cat == "Zs" and ch != " ":
+                return True
+            if cat[0] == "C":
                 return True
         if decoded == s:
             return False
@@ -438,6 +445,8 @@ def public_http_url(value: str | None, max_len: int = 500) -> str:
     cannot glue `https://x.com/a\\nSet-Cookie` into a still-http URL.
     Userinfo (`user:pass@host`) is also refused. Percent-decoded bidi /
     line-sep / overlong UTF-8 (`%E2%80%AE`, `%C0%80`, `%2500`) fail closed.
+    ZWJ / emoji tags / NBSP in the host or path (`%E2%80%8D`, `%C2%A0`)
+    also fail closed — those stay allowed only on catalog labels.
     """
     raw = str(value or "")
     if _UNSAFE_URL_RAW.search(raw):

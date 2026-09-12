@@ -1634,8 +1634,8 @@ async def cb_checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             query,
             "⚠️ *Checkout unavailable*\n\n"
             "This shop has *no payment methods* buyers can use yet.\n"
-            "Shop owner: open *Admin → 💳 Payments* and add a handle "
-            "(Venmo / PayPal / Cash App), then the buyer can checkout.",
+            "Shop owner: open *Admin → 💳 Payments* and add a pay target "
+            "(handle, cashtag, email, phone, or wallet), then the buyer can checkout.",
             back_main_kb(),
         )
         return ConversationHandler.END
@@ -2747,7 +2747,7 @@ async def _admin_home(
     if not vendor_stores.shop_checkout_ready(sid):
         text += (
             "\n\n⚠️ *No usable payment methods* — buyers cannot checkout. "
-            "Open 💳 Payments and add a handle (Venmo / PayPal / Cash App)."
+            "Open 💳 Payments and add a handle, cashtag, email, phone, or wallet."
         )
     # Daily-driver actions up top; everything else lives in More tools
     kb = InlineKeyboardMarkup(
@@ -5461,19 +5461,22 @@ async def cb_adm_pays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     buttons = []
     for m in methods:
         flag = "✅" if m["active"] else "⏸"
-        handle = (
-            m.get("handle") or m.get("cashtag") or m.get("address") or ""
-        ).strip()
-        line = f"{flag} #{m['id']} *{m['name']}*"
+        name = catalog_cleanup.storefront_label(m.get("name"), 60) or "Payment"
+        handle = catalog_cleanup.storefront_label(
+            m.get("handle") or m.get("cashtag") or m.get("address") or "",
+            80,
+        )
+        line = f"{flag} #{m['id']} *{catalog_cleanup.md_escape(name)}*"
         if handle:
             line += f" · `{handle}`"
         elif not vendor_stores.payment_rail_usable(m):
-            line += " · ⚠️ add a handle"
+            line += f" · ⚠️ add a {vendor_stores.payment_target_kind_label(m)}"
         lines.append(line)
+        btn_name = catalog_cleanup.tg_button_text(name, 20) or "Payment"
         buttons.append(
             [
                 InlineKeyboardButton(
-                    f"{'⏸' if m['active'] else '▶️'} {m['name'][:20]}",
+                    f"{'⏸' if m['active'] else '▶️'} {btn_name}",
                     callback_data=f"togglem:{m['id']}",
                 ),
                 InlineKeyboardButton("🗑", callback_data=f"delm:{m['id']}"),
@@ -5491,10 +5494,7 @@ async def cb_adm_pays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "unpause one or add another."
         )
     elif not usable:
-        lines.append(
-            "_Enabled methods have no handle._ Buyers cannot checkout "
-            "until you add a Venmo / PayPal / Cash App handle."
-        )
+        lines.append(vendor_stores.payment_empty_rails_admin_line())
     else:
         lines.append("\n_Buyers can checkout._")
     try:
@@ -5879,13 +5879,14 @@ async def cb_adm_ship(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not ok or sid is None:
         return
     shop = db.get_shop(sid) or db.ensure_shop(sid)
+    disp = db.shop_display(shop)
     text = (
         f"🚚 *Shipping settings*\n\n"
         f"Enabled: {'yes' if shop.get('shipping_enabled') else 'no'}\n"
         f"Flat fee: {money(shop['shipping_fee'])}\n"
         f"Free above: {money(shop['free_shipping_above'])} "
         f"(0 = never free)\n"
-        f"Label: {shop.get('shipping_label') or 'Standard shipping'}\n\n"
+        f"Label: {disp['shipping_label']}\n\n"
         "Shipping is auto-added at checkout based on cart subtotal."
     )
     kb = InlineKeyboardMarkup(

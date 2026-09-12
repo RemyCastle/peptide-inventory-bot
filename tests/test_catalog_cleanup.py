@@ -512,6 +512,35 @@ class GlyphRepairTests(unittest.TestCase):
             "https://cdn.example.com/%F0%9F%A6%8C.png",
         )
 
+    def test_public_http_url_rejects_zwj_nbsp_and_combining(self) -> None:
+        """ZWJ stays in catalog names; URLs fail closed so hosts cannot spoof."""
+        pirate = "🏴\u200d☠️"
+        self.assertEqual(cc.sanitize_catalog_text(pirate), pirate)
+        self.assertEqual(
+            cc.public_http_url("https://exam%E2%80%8Dple.com/p.png"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://exam\u200dple.com/p.png"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/ok%C2%A0.png"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/ok%E3%80%80.png"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/ok%CC%81.png"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/p%20.png"),
+            "https://cdn.example.com/p%20.png",
+        )
+
 
 class CleanupApplyTests(unittest.TestCase):
     def setUp(self) -> None:

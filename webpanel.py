@@ -1212,6 +1212,7 @@ def api_state(tok: dict) -> tuple[int, dict]:
                 or "",
                 "rail_ready": vendor_stores.payment_rail_usable(m),
                 "buyer_hint": vendor_stores.payment_pay_hint(m),
+                "empty_rail_hint": vendor_stores.payment_empty_rail_hint(m),
             }
             for m in payments
         ],
@@ -3303,7 +3304,7 @@ function render(){
     ${(()=>{const enabled=(S.payments||[]).filter(m=>m.active);
       const usable=enabled.filter(m=>m.rail_ready!==false);
       if(!enabled.length) return '<p class="howto"><b>Buyers cannot pay.</b> Add at least one enabled method. Pause a seeded Venmo/PayPal row instead of deleting it.</p>';
-      if(!usable.length) return '<p class="howto"><b>Buyers cannot pay.</b> Enabled methods have no handle. Add a Venmo / PayPal / Cash App handle (or instructions on a custom method).</p>';
+      if(!usable.length) return '<p class="howto"><b>Buyers cannot pay.</b> Enabled methods have no pay target. Add a handle, cashtag, email, phone, or wallet (or instructions on a custom method).</p>';
       return '';})()}
     ${(()=>{const types=new Set((S.payments||[]).map(m=>String(m.method_type||'').toLowerCase()));
       return (S.shop&&S.shop.is_unicorn&&(!types.has('venmo')||!types.has('paypal')))
@@ -3340,7 +3341,7 @@ function render(){
         </div>
         <label>Instructions shown to buyers (auto-filled from the fields above — editable)</label>
         <textarea class="p-instr" style="min-height:60px">${esc(m.instructions)}</textarea>
-        ${m.active&&m.rail_ready===false?'<p class="howto" style="margin:6px 0 0">No handle — buyers cannot use this method until you add one.</p>':''}
+        ${m.active&&m.rail_ready===false?`<p class="howto" style="margin:6px 0 0">${esc(m.empty_rail_hint||'No pay target — buyers cannot use this method until you add one.')}</p>`:''}
         ${m.buyer_hint?`<p class="tag" style="margin:6px 0 0">Buyers see: ${esc(m.buyer_hint)}</p>`:''}
         <div class="flex" style="margin-top:8px">
           <label class="flex" style="margin:0"><input type="checkbox" class="p-act"
@@ -3576,11 +3577,14 @@ function wire(){
       const address=(el.querySelector('.p-addr')||{}).value||'';
       const active=el.querySelector('.p-act').checked;
       if(active && t==='crypto' && !String(address).trim()){
-        toast('Crypto wallet address required (or uncheck enabled)',true);
+        toast('Add a wallet address so buyers can use this method (or uncheck enabled)',true);
         return;
       }
       if(active && t!=='custom' && t!=='crypto' && !String(handle).trim()){
-        toast('Add a handle so buyers can use this method (or uncheck enabled)',true);
+        const need={venmo:'a Venmo handle',paypal:'a PayPal email or username',
+          cashapp:'a Cash App cashtag',zelle:'a Zelle contact',
+          apple_cash:'an Apple Cash number'}[t]||'a pay target';
+        toast('Add '+need+' so buyers can use this method (or uncheck enabled)',true);
         return;
       }
       const d=await api('payment',{

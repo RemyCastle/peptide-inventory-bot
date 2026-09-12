@@ -1,16 +1,16 @@
-# SHIP BRIEF — MEGA-UNICORN v2 storefront label sanitizer audit
+# SHIP BRIEF — MEGA-UNICORN v2 empty-rail copy + URL leftover
 
 Product: peptide (unicorn)  
 Repo: `C:\Users\Remy\peptide_inventory_bot`  
 Prod: https://unicornfartzz-bot.onrender.com  
 Priority: P1  
 Ship agent: grok  
-AUTOPUSH: this ship (glyph repair coverage + leftover buyer fields;
-no stock change; never wipe inventory.db)
+AUTOPUSH: this ship (empty-target payment copy + leftover URL/report
+fields; no stock change; never wipe inventory.db)
 
-Goal: Storefront labels stay clean: invisible fillers drop, percent-decoded
-URL controls fail closed, leftover branding/order/report fields sanitize
-on read; never wipe inventory.
+Goal: Empty payment rails name the missing target (cashtag / wallet /
+phone, not a generic "handle"); http URLs fail closed on ZWJ/NBSP;
+pending-order reports come out clean; never wipe inventory.
 
 Context (already verified — do not rediscover):
 
@@ -27,8 +27,10 @@ Context (already verified — do not rediscover):
 - Sanitizer harden live on `2340351` (live `/health` sha `2340351`, `payments.active` = 2)
 - Empty-handle rails live on `8829dfb` (`payments.usable` = 2)
 - PayPal/Apple Cash quick-add + refuse empty typed saves live on `3663272`
-- Sanitizer audit (this ship): invisible fillers, percent-decoded URL
-  controls, leftover branding/order/report fields
+- Sanitizer audit live on `4acf273` (invisible fillers, percent-decoded
+  URL C0/Cf, leftover branding/order/report fields)
+- This ship: type-specific empty-rail copy; URL ZWJ/NBSP fail closed;
+  pending-orders report leftover
 
 ## Prior ships
 
@@ -79,42 +81,42 @@ Add tracking. Claim still no stock change.
 typed methods with no handle do not count as a pay rail; `POST /order`
 409; health `payments.usable`; admin/panel warn.
 
+**Sanitizer audit — live on `4acf273`:** invisible fillers, percent-decoded
+C0/Cf/line-sep, leftover `shop_display` / order summary / payment HTML /
+inventory report / shipping label / tracking URL / site-sync.
+
 ## This ship
 
-**Storefront label sanitizer audit — glyph coverage + leftover fields.**
-Prior pass (`2340351`) dropped line-sep/private-use and rejected URL
-breaks/userinfo. Leftover: invisible blanks (object replacement, braille
-blank, Hangul fillers), percent-decoded bidi/line-sep/`%2500`/`%C0%80`
-in http URLs, and buyer/admin strings that still read dirty DB rows
-(`shop_display`, Telegram order summary, payment HTML, reports, shipping
-label, tracking URL, site-sync feed).
+**Empty-rail copy + leftover URL/report fields.** Payments P1 is live
+(Venmo+PayPal usable). Leftover: admin/panel still said "handle" for
+crypto wallets / Cash App cashtags / Apple Cash numbers; `public_http_url`
+kept ZWJ (catalog KEEP_CF) and NBSP so `exam%E2%80%8Dple.com` /
+`%C2%A0` could spoof; pending-orders report still echoed dirty names.
 
-- `_drop_controls` removes U+FFFC / U+2800 / Hangul fillers (incl. NFKC
-  U+115F/U+1160). Pirate flag + profession ZWJ stay.
-- `public_http_url` percent-decodes a few times and fails closed on C0 /
-  Cf / line-sep / invalid UTF-8. Raw NUL still strips to a valid https
-  URL. `%20` and emoji percents stay.
-- Read-path sanitizer: `shop_display`, `format_order_summary`,
-  `_payment_method_html`, reports titles/names, `/storefront`
-  `shipping_label`, `/order-status` `tracking_url`, admin brand /
-  description, currency write, site-sync feed text.
+- Type-specific empty-target copy: `payment_target_kind_label` /
+  `payment_empty_rail_hint` / `payment_empty_rails_admin_line`. Panel
+  per-row + save toast; Telegram payments list + checkout-blocked.
+- `public_http_url` fails closed on all Cf (incl. ZWJ/tags), Zs other
+  than SPACE, and combining marks. Pirate flag / profession ZWJ stay
+  on catalog labels. `%20` and emoji percents stay.
+- Pending-orders report sanitizes buyer / method / item names. Telegram
+  shipping label uses `shop_display`.
 - `STORE_URL_CACHE_BUST` stays `20260913`. No Pages JS. No DELETE.
 
 ## Acceptance (this ship)
 
-- [x] `python -m pytest -q -x` green on scratch DBs (685 passed)
+- [x] `python -m pytest -q -x` green on scratch DBs (691 passed)
 - [x] Docker COPY check still lists every imported module (26)
 - [x] No writes to laptop `inventory.db`; no DELETE of products
-- [x] Invisible fillers drop; pirate flag / profession ZWJ kept
-- [x] `public_http_url` rejects `%E2%80%A8` / `%E2%80%AE` / `%2500` /
-      `%C0%80`; keeps `%20` and emoji percents; NUL-in-path still repairs
-- [x] Dirty `shop_display` / order summary / reports / payment HTML /
-      shipping label / tracking URL / site-sync feed come out clean
+- [x] Crypto empty rail says wallet address, not handle
+- [x] `public_http_url` rejects `%E2%80%8D` / `%C2%A0` / `%CC%81`;
+      keeps `%20` and emoji percents; pirate ZWJ kept in names
+- [x] Dirty pending-orders report comes out clean
 - [x] No secrets / `.env` / scratch import files committed
 
-Prior `3663272` / `8829dfb` / `991eb64` / `2340351` checks stay true:
+Prior `4acf273` / `3663272` / `8829dfb` / `991eb64` checks stay true:
 PayPal/Apple Cash quick-add, usable rails only, Confirm + Cancel URL
-buttons, line-sep/userinfo URL reject, `can_mark_paid`.
+buttons, invisible fillers, `can_mark_paid`.
 
 ## Out of scope
 

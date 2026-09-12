@@ -823,6 +823,36 @@ def payment_pay_link(method: dict, total: float, code: str) -> str | None:
     except Exception:
         return built
 
+def payment_target_kind_label(method: dict | None = None) -> str:
+    """What to ask the admin for when this rail has no copyable target."""
+    mt = ""
+    if method:
+        mt, _target = _method_kind_and_target(method)
+    return {
+        "venmo": "Venmo handle",
+        "paypal": "PayPal email or username",
+        "cashapp": "Cash App cashtag",
+        "zelle": "Zelle contact",
+        "apple_cash": "Apple Cash number",
+        "crypto": "wallet address",
+        "custom": "payment instructions",
+    }.get(mt, "pay target")
+
+
+def payment_empty_rail_hint(method: dict) -> str:
+    """Panel/Telegram line when an enabled rail has no copyable target."""
+    label = payment_target_kind_label(method)
+    return f"No {label} — buyers cannot use this method until you add one."
+
+
+def payment_empty_rails_admin_line() -> str:
+    """Banner when every enabled method is missing a pay target."""
+    return (
+        "_Enabled methods have no pay target._ Buyers cannot checkout "
+        "until you add a handle, cashtag, email, phone, or wallet."
+    )
+
+
 def payment_rail_usable(method: dict) -> bool:
     """True when buyers can copy a target or open a pay URL.
 
