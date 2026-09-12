@@ -1269,6 +1269,7 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             "payment_methods": pay_objs,
             "message": message,
             "invoice_offered": bool(invoice_sent),
+            "invoices_enabled": vendor_stores.public_invoices_enabled(),
         }
     except Exception as exc:
         log.error("POST /order unexpected error: %s", exc, exc_info=exc)

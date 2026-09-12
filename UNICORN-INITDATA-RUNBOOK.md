@@ -225,7 +225,7 @@ Map from `initdata_error_code` (`vendor_stores.py:138`) and `api_order`:
 | 409 | `no_payment_methods` | Shop has zero *active* payment rows | Seed/unpause a method (Admin → Payments or panel). Order is **not** created. |
 | 409 | stock error | `create_order` rejected (sold out / stock race) | Expected when stock ran out mid-checkout; server re-checks authoritatively |
 
-401/409 JSON also includes `message` (buyer-facing, never a secret) and 401 includes `detail` (short `InitDataError.reason`). Mini App should alert `message`, not the raw `error` code. `GET /order-status` returns the same `payments` / `payment_methods` objects as `POST /order` so “check my order” can show pay links.
+401/409 JSON also includes `message` (buyer-facing, never a secret) and 401 includes `detail` (short `InitDataError.reason`). Mini App should alert `message`, not the raw `error` code. `GET /storefront` includes `message` + `invoices_enabled` (no handles). `GET /order-status` returns the same `payments` / `payment_methods` objects as `POST /order` (`pay_url` + `pay_hint` only while `needs_payment`) plus a status `message` so “check my order” can show pay links and copy-paste rails (PayPal email has no `pay_url`).
 
 **Why `bad_hash` vs `expired` is trustworthy:** once the HMAC matches a token,
 later field errors (expired, missing user) carry `hash_ok=True`

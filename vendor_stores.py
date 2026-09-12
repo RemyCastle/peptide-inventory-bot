@@ -83,6 +83,10 @@ NO_PAYMENTS_BUYER_LINE = (
     "No payment method is published yet. Message the seller — "
     "do not send money until they reply."
 )
+STOREFRONT_READY_LINE = (
+    "Pay after checkout. You'll get a payment code and "
+    "pay links on the next screen."
+)
 
 
 def _normalize_store_url(url: str) -> str:
@@ -504,6 +508,89 @@ def payment_display_lines(shop_chat_id: int) -> list[str]:
     return [p["line"] for p in payment_methods_public(shop_chat_id)]
 
 
+def public_invoices_enabled() -> bool:
+    """True only when a provider token is configured. Never returns the token."""
+    try:
+        import tg_payments
+
+        return bool(tg_payments.invoices_enabled())
+    except Exception:
+        return False
+
+
+def storefront_checkout_message(checkout_ready: bool) -> str:
+    """Catalog copy. Never includes handles or pay URLs."""
+    if checkout_ready:
+        return STOREFRONT_READY_LINE
+    return NO_PAYMENTS_BUYER_LINE
+
+
+def order_status_buyer_message(status: str, *, needs_payment: bool) -> str:
+    """Short Mini App copy for GET /order-status. Never a secret."""
+    st = (status or "").strip().lower()
+    if st in ("cancelled", "rejected"):
+        return (
+            "This order is no longer awaiting payment. "
+            "Message the seller if you already sent money."
+        )
+    if st == "shipped":
+        return "This order has shipped. Use the tracking details below."
+    if st in ("paid", "complete"):
+        return "This order is paid. Tracking will show here when it ships."
+    if st == "awaiting_confirmation":
+        return (
+            "Payment is waiting on the seller to confirm. "
+            "You can still pay with the methods below if you haven't yet."
+        )
+    if needs_payment or st == "pending_payment":
+        return (
+            "Pay using the methods below. Put the order code in the payment note."
+        )
+    return "Order found."
+
+
+def payment_pay_hint(method: dict, total: float = 0.0, code: str = "") -> str:
+    """How to use this rail. Never embeds the handle — `target` is separate."""
+    mt, _target = _method_kind_and_target(method)
+    has_url = bool(payment_pay_link(method, total, code))
+    if mt == "venmo":
+        if has_url:
+            return "Opens Venmo with amount and order code prefilled."
+        return (
+            "Copy the Venmo handle and send the total. "
+            "Put the order code in the note."
+        )
+    if mt == "paypal":
+        ff = (method.get("network_note") or "friends_family") == "friends_family"
+        mode = "Friends & Family" if ff else "Goods & Services"
+        if has_url:
+            return f"Opens PayPal with amount prefilled. Send as {mode}."
+        return (
+            f"Copy the PayPal email or username and send as {mode}. "
+            "Put the order code in the note."
+        )
+    if mt == "cashapp":
+        if has_url:
+            return "Opens Cash App with amount prefilled."
+        return (
+            "Copy the Cash App cashtag and send the total. "
+            "Put the order code in the note."
+        )
+    if mt == "zelle":
+        return (
+            "Copy the Zelle contact and send the total. "
+            "Put the order code in the note."
+        )
+    if mt == "apple_cash":
+        return (
+            "Send Apple Cash to the number below. "
+            "Put the order code in the note."
+        )
+    if mt == "crypto":
+        return "Send only on the listed network. Double-check the address."
+    return "Follow the instructions. Put the order code in the payment note."
+
+
 def payment_method_public(
     method: dict, total: float = 0.0, code: str = ""
 ) -> dict:
@@ -524,6 +611,7 @@ def payment_method_public(
         "target": target or None,
         "line": line,
         "pay_url": payment_pay_link(method, total, code),
+        "pay_hint": payment_pay_hint(method, total, code),
     }
 
 

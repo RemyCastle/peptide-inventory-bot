@@ -917,14 +917,15 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
     claim. Exposes names, prices, kit prices, stock, shipping terms and
     payment-method names only — no instructions, no admin data.
     """
+    import vendor_stores
+
     chat_id = resolve_storefront_key(raw_key)
     if chat_id is None:
-        import vendor_stores
-
         return 404, vendor_stores.checkout_error_body("unknown storefront")
     shop = db.get_shop(chat_id) or db.ensure_shop(chat_id)
     products = db.apply_available_stock(db.list_products(chat_id, active_only=True))
     payments = db.list_payment_methods(chat_id, active_only=True)
+    checkout_ready = bool(payments)
     try:
         from catalog_cleanup import buyer_shop_title
         import unicorn_shop
@@ -961,7 +962,9 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
             }
             for p in products
         ],
-        "checkout_ready": bool(payments),
+        "checkout_ready": checkout_ready,
+        "message": vendor_stores.storefront_checkout_message(checkout_ready),
+        "invoices_enabled": vendor_stores.public_invoices_enabled(),
         "payments": [_buyer_payment_name(m) for m in payments],
         "payment_methods": [
             {
@@ -999,11 +1002,16 @@ def api_order_status(raw_key: str, payment_code: str) -> tuple[int, dict]:
     if not needs_payment:
         for p in pay_objs:
             p["pay_url"] = None
+            p["pay_hint"] = None
     return 200, {
         "ok": True,
         "status": status,
         "code": code,
         "needs_payment": needs_payment,
+        "message": vendor_stores.order_status_buyer_message(
+            status, needs_payment=needs_payment
+        ),
+        "invoices_enabled": vendor_stores.public_invoices_enabled(),
         "items": [
             {
                 "name": _buyer_product_name({"name": it.get("product_name") or ""}),

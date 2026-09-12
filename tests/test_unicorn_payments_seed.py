@@ -106,6 +106,8 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         code, body = webpanel.api_storefront(PAGES_KEY)
         self.assertEqual(code, 200, body)
         self.assertTrue(body.get("checkout_ready"))
+        self.assertIn("Pay after checkout", body.get("message") or "")
+        self.assertFalse(body.get("invoices_enabled"))
         self.assertIn("Venmo", body["payments"])
         self.assertIn("PayPal", body["payments"])
         kinds = {m["method_type"] for m in body["payment_methods"]}
@@ -114,11 +116,13 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertNotIn("wineboos", blob)
         self.assertNotIn("proton", blob)
         self.assertNotIn("pay_url", blob)
+        self.assertNotIn("pay_hint", blob)
         for m in body["payment_methods"]:
             self.assertNotIn("handle", m)
             self.assertNotIn("instructions", m)
             self.assertNotIn("target", m)
             self.assertNotIn("pay_url", m)
+            self.assertNotIn("pay_hint", m)
 
     def test_storefront_checkout_ready_false_when_paused(self) -> None:
         webpanel.ensure_unicorn_shop_payments(UNICORN)
@@ -128,6 +132,9 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         code, body = webpanel.api_storefront(PAGES_KEY)
         self.assertEqual(code, 200, body)
         self.assertFalse(body.get("checkout_ready"))
+        self.assertIn("Message the seller", body.get("message") or "")
+        self.assertNotIn("DM'd", body.get("message") or "")
+        self.assertFalse(body.get("invoices_enabled"))
         self.assertEqual(body.get("payments"), [])
         self.assertEqual(body.get("payment_methods"), [])
 
@@ -173,6 +180,15 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertIsNone(vendor_stores.payment_pay_link(pp_email, 10, "X"))
         cash = payment_templates.render_cashapp("$tag")
         self.assertIn("cash.app", vendor_stores.payment_pay_link(cash, 3, "Z") or "")
+        venmo_hint = vendor_stores.payment_pay_hint(venmo, 12.5, "ABC123")
+        self.assertIn("Venmo", venmo_hint)
+        self.assertIn("prefilled", venmo_hint)
+        self.assertNotIn("wineboos", venmo_hint)
+        email_hint = vendor_stores.payment_pay_hint(pp_email, 10, "X")
+        self.assertIn("Friends & Family", email_hint)
+        self.assertIn("Copy", email_hint)
+        self.assertNotIn("proton", email_hint)
+        self.assertFalse(vendor_stores.public_invoices_enabled())
 
 
 if __name__ == "__main__":
