@@ -216,11 +216,25 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertIn("No payment method is published yet", html)
 
     def test_bot_registers_seed_and_paypal_quick_add(self) -> None:
+        import re
+
+        import bot as bot_mod
+        import payment_templates as pt_mod
+
         src = (ROOT / "bot.py").read_text(encoding="utf-8")
         self.assertIn('callback_data="adm_seedpays"', src)
         self.assertIn('callback_data="paytpl:paypal"', src)
         self.assertIn('callback_data="paytpl:apple_cash"', src)
+        self.assertIn("PAY_TPL_CALLBACK_RE", src)
         self.assertIn("cb_adm_seedpays", src)
+        for mt in pt_mod.METHOD_TYPES:
+            self.assertRegex(
+                f"paytpl:{mt}",
+                bot_mod.PAY_TPL_CALLBACK_RE,
+                msg=f"{mt} quick-add must match ConversationHandler",
+            )
+        self.assertIsNone(re.match(bot_mod.PAY_TPL_CALLBACK_RE, "paytpl:nope"))
+        self.assertIn("Need a real handle", src)
         self.assertIn("_All methods paused._", src)
         self.assertIn("_Enabled methods have no handle._", src)
         self.assertIn("_Buyers can checkout._", src)
@@ -233,6 +247,11 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertIn("buyer_hint", panel)
         self.assertIn("rail_ready", panel)
         self.assertIn("No handle", panel)
+        self.assertIn(
+            "Add a handle so buyers can use this method (or uncheck enabled)",
+            panel,
+        )
+        self.assertIn("_reject_unusable_enabled_payment", panel)
 
     def test_pay_url_venmo_prefill_paypal_username_not_email(self) -> None:
         venmo = payment_templates.render_venmo("@wineboos")

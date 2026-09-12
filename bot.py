@@ -77,6 +77,20 @@ from config import (
 
 log = logging.getLogger("inventory_bot")
 
+# ConversationHandler entry for Admin → 💳 Payments quick-add. Built from
+# payment_templates.METHOD_TYPES so a new typed rail cannot ship a button
+# without a matching handler (PayPal / Apple Cash used to be dead).
+PAY_TPL_CALLBACK_RE = r"^paytpl:(" + "|".join(pt.METHOD_TYPES) + r")$"
+PAY_TPL_PLACEHOLDERS = {
+    "cashapp": "$Cashtag...",
+    "venmo": "@Venmo handle...",
+    "paypal": "PayPal email or @username...",
+    "apple_cash": "Apple Cash phone...",
+    "crypto": "Coin e.g. USDT...",
+    "zelle": "Zelle email or phone...",
+    "custom": "Payment instructions...",
+}
+
 
 def setup_logging() -> None:
     """Log to stdout and a rotating file for post-crash debugging."""
@@ -5594,7 +5608,7 @@ async def cb_add_pay_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cb_pay_template_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Admin one-tap Cash App / Venmo / Crypto / Zelle / Custom."""
+    """Admin one-tap Cash App / Venmo / PayPal / Apple Cash / Crypto / Zelle / Custom."""
     query = update.callback_query
     await query.answer()
     sid, ok = _require_admin(update, context)
@@ -5607,18 +5621,9 @@ async def cb_pay_template_start(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["pay_tpl_answers"] = []
     set_awaiting(context, f"pay_tpl_{mt}")
     prompts = pt.template_prompts(mt)
-    placeholders = {
-        "cashapp": "$Cashtag...",
-        "venmo": "@Venmo handle...",
-        "paypal": "PayPal email or @username...",
-        "apple_cash": "Apple Cash phone...",
-        "crypto": "Coin e.g. USDT...",
-        "zelle": "Zelle email or phone...",
-        "custom": "Payment instructions...",
-    }
     await query.message.reply_text(
         prompts[0] + "\n\n/cancel",
-        reply_markup=force_reply(placeholders.get(mt, "Type your answer...")),
+        reply_markup=force_reply(PAY_TPL_PLACEHOLDERS.get(mt, "Type your answer...")),
     )
     return PAY_TPL_DETAILS
 
@@ -5636,14 +5641,7 @@ async def pay_tpl_details(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data["pay_tpl_answers"] = answers
     prompts = pt.template_prompts(mt)
     if len(answers) < len(prompts):
-        next_ph = {
-            1: "Wallet address...",
-            2: "Network note or - ...",
-        }.get(len(answers), "Type your answer...")
-        if mt == "crypto":
-            pass
-        else:
-            next_ph = "Type your answer..."
+        next_ph = "Type your answer..."
         if mt == "crypto" and len(answers) == 1:
             next_ph = "Wallet address..."
         elif mt == "crypto" and len(answers) == 2:
@@ -5655,6 +5653,20 @@ async def pay_tpl_details(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return PAY_TPL_DETAILS
     payload = pt.render_from_answers(mt, answers)
+    if not vendor_stores.payment_rail_usable(payload):
+        answers.pop()
+        context.user_data["pay_tpl_answers"] = answers
+        set_awaiting(context, f"pay_tpl_{mt}")
+        await update.message.reply_text(
+            "Need a real handle / cashtag / email / phone / wallet so "
+            "buyers can pay.\n\n"
+            + (prompts[-1] if prompts else "Enter the handle:")
+            + "\n\n/cancel",
+            reply_markup=force_reply(
+                PAY_TPL_PLACEHOLDERS.get(mt, "Type your answer...")
+            ),
+        )
+        return PAY_TPL_DETAILS
     mid = db.add_payment_from_template(sid, payload)
     context.user_data.pop("pay_tpl_type", None)
     context.user_data.pop("pay_tpl_answers", None)
@@ -5689,8 +5701,19 @@ async def add_pay_instr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if not ok or sid is None:
         clear_awaiting(context)
         return ConversationHandler.END
-    name = context.user_data.pop("new_pay_name", "Payment")
+    name = context.user_data.get("new_pay_name") or "Payment"
     instr = (update.message.text or "").strip()
+    if not vendor_stores.payment_rail_usable(
+        {"name": name, "instructions": instr, "method_type": "custom"}
+    ):
+        set_awaiting(context, "add_pay_instr")
+        await update.message.reply_text(
+            "Need a short instruction so buyers know how to pay "
+            "(at least a sentence).\n\n/cancel",
+            reply_markup=force_reply("Payment instructions..."),
+        )
+        return ADD_PAY_INSTR
+    context.user_data.pop("new_pay_name", None)
     mid = db.add_payment_method(sid, name, instr, method_type="custom")
     clear_awaiting(context)
     await update.message.reply_text(
@@ -7465,7 +7488,7 @@ def build_app(token: str | None = None) -> Application:
             CallbackQueryHandler(cb_set_coa_start, pattern=r"^setcoa:\d+$"),
             CallbackQueryHandler(cb_set_photo_start, pattern=r"^setphoto:\d+$"),
             CallbackQueryHandler(cb_add_pay_start, pattern=r"^adm_addpay$"),
-            CallbackQueryHandler(cb_pay_template_start, pattern=r"^paytpl:(cashapp|venmo|crypto|zelle|custom)$"),
+            CallbackQueryHandler(cb_pay_template_start, pattern=PAY_TPL_CALLBACK_RE),
             CallbackQueryHandler(cb_ship_fee_start, pattern=r"^ship_fee$"),
             CallbackQueryHandler(cb_ship_free_start, pattern=r"^ship_free$"),
             CallbackQueryHandler(cb_minord_custom_start, pattern=r"^minord_custom$"),

@@ -119,8 +119,8 @@ not send money.
 | Path | How |
 |---|---|
 | Boot seed | `run_cloud._seed_unicorn_payments` → `webpanel.ensure_unicorn_shop_payments`. Idempotent by `method_type` (paused rows count as present). **Pause, don't delete,** a seeded type you don't want. |
-| Telegram **💳 Payments** | `cb_adm_pays`. Quick-add templates + freeform. Pause / delete. PayPal + Apple Cash + a Unicorn-only **Seed Venmo + PayPal** when those types are missing (not only when the list is empty). Warns when **all methods are paused**. |
-| Web panel Payments card | Typed fields, quick-add, Save/Delete. Warns when nothing is enabled; same seed CTA when Venmo or PayPal types are missing. |
+| Telegram **💳 Payments** | `cb_adm_pays`. Quick-add templates + freeform. Pause / delete. PayPal + Apple Cash + a Unicorn-only **Seed Venmo + PayPal** when those types are missing (not only when the list is empty). Warns when **all methods are paused**. `paytpl:*` entry regex is every `METHOD_TYPES` value (PayPal / Apple Cash used to be dead buttons). Empty typed answers re-prompt; they do not insert an unusable row. |
+| Web panel Payments card | Typed fields, quick-add, Save/Delete. Warns when nothing is enabled; same seed CTA when Venmo or PayPal types are missing. Save of an **enabled** typed method with no handle returns 400 (pause still allowed). |
 | `POST /panel/api/payment` | Add / update / delete. This ship: `{seed_defaults: true}` (Unicorn shop only). |
 
 Seeded Unicorn defaults (buyer-facing handles, not secrets): Venmo `@wineboos`,
@@ -177,7 +177,7 @@ Menu Button URL in BotFather must match `UNICORN_STORE_URL` / vendor
 | P0 | Payment seed only ran when `UNICORN_CLAIM_TOKEN` was set | **live `16c6547`** |
 | P0 | Mini App `POST /order` did not refuse empty methods | **live `16c6547`** |
 | P0 | Admin empty-state was a quiet “_None configured._” | **live `16c6547` / `c5bbf40`** (paused warning + seed CTA) |
-| P1 | Telegram quick-add missing PayPal / Apple Cash | **live `16c6547`** |
+| P1 | Telegram quick-add missing PayPal / Apple Cash | **buttons `16c6547`; handler was dead until this ship** (`PAY_TPL_CALLBACK_RE` = all `METHOD_TYPES`) |
 | P1 | `payments` JSON is regex-parsed strings | Server returns `payment_methods` + `pay_url` (`52a5e5a`). Pages still regex-parses strings — **other repo** |
 | P1 | `/health` hid whether rails exist | **live `16c6547`** (`payments.active` / `total`) |
 | P1 | 401 `bad_hash` overloaded | **live `52a5e5a`** |
@@ -191,6 +191,7 @@ Menu Button URL in BotFather must match `UNICORN_STORE_URL` / vendor
 | P1 | Mini App claim ping had no confirm URL (vendor bot can't take `admconfirm`) | **live `6c3d68b`** (`/confirm?ct=` URL button + buyer DM) |
 | P1 | Claim ping cancel was text-only; confirm success had no tracking CTA | **live `991eb64`** (Cancel URL button + `/confirm` Add tracking) |
 | P1 | Enabled method with no handle still counted as checkout_ready | **live `8829dfb`** (`usable` rails only; health `payments.usable`) |
+| P1 | PayPal / Apple Cash quick-add buttons did not start the prompt; enabled typed rails could save empty | **this ship** (handler regex + 400 on empty enabled save) |
 | P2 | Native Telegram invoice (provider token unset) | Optional; Stars forbidden for physical goods |
 
 ---

@@ -1492,6 +1492,38 @@ def _shop_is_unicorn(chat_id: int, title: str | None = None) -> bool:
         return False
 
 
+def _reject_unusable_enabled_payment(row: dict) -> tuple[int, dict] | None:
+    """400 when an enabled rail has no copyable target / instructions.
+
+    Paused rows may stay empty. Never deletes. Empty custom create is
+    allowed elsewhere so the panel can draft a row.
+    """
+    active = row.get("active", 1)
+    if active in (0, False, "0", "false"):
+        return None
+    try:
+        import vendor_stores
+
+        if vendor_stores.payment_rail_usable(row):
+            return None
+    except Exception:
+        target = (
+            row.get("cashtag") or row.get("handle") or row.get("address") or ""
+        ).strip()
+        instr = " ".join(str(row.get("instructions") or "").split())
+        mt = (row.get("method_type") or "").lower()
+        if target or (mt not in (
+            "venmo", "paypal", "cashapp", "zelle", "apple_cash", "crypto"
+        ) and len(instr) >= 8):
+            return None
+    mt = (row.get("method_type") or "custom").lower()
+    if mt == "crypto":
+        return _err(400, "Crypto wallet address required")
+    if mt in ("venmo", "paypal", "zelle", "apple_cash", "cashapp"):
+        return _err(400, "Payment handle / number required")
+    return _err(400, "Add payment instructions so buyers know how to pay")
+
+
 def api_payment(tok: dict, payload: dict) -> tuple[int, dict]:
     chat_id = tok["chat_id"]
     if payload.get("seed_defaults"):
@@ -1522,14 +1554,12 @@ def api_payment(tok: dict, payload: dict) -> tuple[int, dict]:
     if mid is None:
         if not name:
             return _err(400, "Name required")
-        # Require a usable handle/address for structured types
+        # Require a usable handle/address for structured types. Empty custom
+        # is allowed so the panel can add a draft row, then Save instructions.
+        blocked = _reject_unusable_enabled_payment({**rendered, "active": 1})
         mt = (rendered.get("method_type") or "custom").lower()
-        if mt == "crypto" and not (rendered.get("address") or "").strip():
-            return _err(400, "Crypto wallet address required")
-        if mt in ("venmo", "paypal", "zelle", "apple_cash", "cashapp") and not (
-            (rendered.get("handle") or rendered.get("cashtag") or "").strip()
-        ):
-            return _err(400, "Payment handle / number required")
+        if blocked and mt != "custom":
+            return blocked
         new_id = db.add_payment_from_template(chat_id, rendered)
         return 200, {"ok": True, "id": new_id, "created": True}
 
@@ -1559,6 +1589,10 @@ def api_payment(tok: dict, payload: dict) -> tuple[int, dict]:
             fields["active"] = 1 if payload["active"] in (1, True, "1", "true") else 0
     if not fields:
         return _err(400, "Nothing to update")
+    merged = {**current, **fields}
+    blocked = _reject_unusable_enabled_payment(merged)
+    if blocked:
+        return blocked
     db.update_payment_method(mid, **fields)
     return 200, {"ok": True, "id": mid, "created": False}
 
@@ -3521,16 +3555,28 @@ function wire(){
     };
     if(typeSel){typeSel.onchange=syncFields;syncFields();}
     el.querySelector('.p-save').onclick=async()=>{
+      const t=typeSel?typeSel.value:'custom';
+      const handle=(el.querySelector('.p-handle')||{}).value||'';
+      const address=(el.querySelector('.p-addr')||{}).value||'';
+      const active=el.querySelector('.p-act').checked;
+      if(active && t==='crypto' && !String(address).trim()){
+        toast('Crypto wallet address required (or uncheck enabled)',true);
+        return;
+      }
+      if(active && t!=='custom' && t!=='crypto' && !String(handle).trim()){
+        toast('Add a handle so buyers can use this method (or uncheck enabled)',true);
+        return;
+      }
       const d=await api('payment',{
         id:el.dataset.mid,
-        method_type:typeSel?typeSel.value:'custom',
+        method_type:t,
         name:el.querySelector('.p-name').value,
-        handle:(el.querySelector('.p-handle')||{}).value||'',
+        handle:handle,
         chain:(el.querySelector('.p-chain')||{}).value||'',
-        address:(el.querySelector('.p-addr')||{}).value||'',
+        address:address,
         network_note:(el.querySelector('.p-note')||{}).value||'',
         instructions:el.querySelector('.p-instr').value,
-        active:el.querySelector('.p-act').checked});
+        active:active});
       if(d.ok){toast('Payment method saved');load();}};
     el.querySelector('.p-del').onclick=async()=>{
       if(!confirm('Delete this payment method?'))return;

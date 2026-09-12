@@ -633,6 +633,67 @@ class ApiTests(WebPanelBase):
         self.assertEqual(code, 200)
         self.assertIsNone(db.get_payment_method(mid))
 
+    def test_enabled_typed_method_cannot_save_empty_handle(self):
+        code, data = webpanel.api_payment(
+            self.tok, {"method_type": "venmo", "handle": "@wineboos"}
+        )
+        self.assertEqual(code, 200, data)
+        mid = data["id"]
+        code, data = webpanel.api_payment(
+            self.tok,
+            {
+                "id": mid,
+                "method_type": "venmo",
+                "handle": "",
+                "active": True,
+            },
+        )
+        self.assertEqual(code, 400, data)
+        self.assertIn("handle", (data.get("error") or "").lower())
+        self.assertEqual(db.get_payment_method(mid)["handle"], "@wineboos")
+        code, data = webpanel.api_payment(
+            self.tok,
+            {
+                "id": mid,
+                "method_type": "venmo",
+                "handle": "",
+                "active": False,
+            },
+        )
+        self.assertEqual(code, 200, data)
+        paused = db.get_payment_method(mid)
+        self.assertEqual(int(paused["active"]), 0)
+        code, data = webpanel.api_payment(
+            self.tok, {"method_type": "paypal", "handle": ""}
+        )
+        self.assertEqual(code, 400, data)
+        self.assertEqual(
+            [
+                m
+                for m in db.list_payment_methods(SHOP, active_only=False)
+                if m["method_type"] == "paypal"
+            ],
+            [],
+        )
+        # Panel "Add custom" still drafts an empty row; Save-while-enabled
+        # without instructions is refused.
+        code, data = webpanel.api_payment(
+            self.tok, {"method_type": "custom", "name": "Wire", "instructions": ""}
+        )
+        self.assertEqual(code, 200, data)
+        wire_id = data["id"]
+        code, data = webpanel.api_payment(
+            self.tok,
+            {
+                "id": wire_id,
+                "method_type": "custom",
+                "name": "Wire",
+                "instructions": "",
+                "active": True,
+            },
+        )
+        self.assertEqual(code, 400, data)
+
     def test_shipping_and_shop(self):
         code, _ = webpanel.api_shipping(
             self.tok, {"enabled": True, "fee": 9.5, "free_above": 200}
