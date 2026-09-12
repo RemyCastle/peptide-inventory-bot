@@ -77,7 +77,7 @@ INIT_DATA_MAX_AGE_SEC = 24 * 60 * 60
 
 # Bump this when the Pages Mini App HTML changes so Telegram WebView
 # does not keep serving a cached checkout.
-STORE_URL_CACHE_BUST = "20260912"
+STORE_URL_CACHE_BUST = "20260913"
 DEFAULT_UNICORN_STORE_URL = "https://remy-miniapp-demos.pages.dev/unicorn/"
 NO_PAYMENTS_BUYER_LINE = (
     "No payment method is published yet. Message the seller — "
@@ -188,6 +188,15 @@ def checkout_buyer_message(code: str) -> str:
         return "This shop isn't available. Re-open the store from the bot."
     if key in ("order not found", "order_not_found"):
         return "No order found for that code in this shop."
+    if key in ("not_your_order", "not your order"):
+        return (
+            "This order belongs to a different Telegram account. "
+            "Open the store from the bot you used to check out."
+        )
+    if key in ("already_processed", "already processed"):
+        return "This order is no longer waiting for a payment claim."
+    if key in ("missing_code", "missing code"):
+        return "Enter the payment code from your order receipt."
     if key in ("min_order", "below_minimum"):
         return (
             "This order is below the shop minimum. Add more items and try again."
@@ -523,6 +532,41 @@ def storefront_checkout_message(checkout_ready: bool) -> str:
     if checkout_ready:
         return STOREFRONT_READY_LINE
     return NO_PAYMENTS_BUYER_LINE
+
+
+def order_can_mark_paid(status: str) -> bool:
+    """True while the buyer may tap I've paid (pending only)."""
+    return (status or "").strip().lower() == "pending_payment"
+
+
+def mark_paid_buyer_hint(status: str) -> str:
+    """Short Mini App copy next to the I've paid button. Never a secret."""
+    st = (status or "").strip().lower()
+    if st == "pending_payment":
+        return (
+            "Tap I've paid after you send the money so the seller can confirm."
+        )
+    if st == "awaiting_confirmation":
+        return "The seller has your payment claim and will confirm it."
+    return ""
+
+
+def build_payment_claim_notify_text(order: dict) -> str:
+    """Vendor/admin plain-text ping when a Mini App buyer taps I've paid."""
+    oid = order.get("id")
+    code = (order.get("payment_code") or (f"#{oid}" if oid else "")).strip()
+    try:
+        total = float(order.get("total") or 0)
+    except (TypeError, ValueError):
+        total = 0.0
+    uname = (order.get("username") or "").strip()
+    who = f"@{uname}" if uname else (order.get("full_name") or "buyer")
+    return (
+        f"PAYMENT CLAIM — buyer says paid (Mini App)\n"
+        f"Order {code} · #{oid} · ${total:.2f}\n"
+        f"Buyer {who}\n"
+        "Confirm in Admin → Orders or /webpanel."
+    )
 
 
 def order_status_buyer_message(status: str, *, needs_payment: bool) -> str:

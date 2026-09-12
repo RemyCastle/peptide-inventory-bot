@@ -76,6 +76,10 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         body = spbc_notify._status_body()
         self.assertEqual(body["payments"]["active"], 2)
         self.assertEqual(body["payments"]["total"], 2)
+        self.assertTrue(body["payments"]["checkout_ready"])
+        self.assertEqual(
+            body.get("store_url_cache_bust"), vendor_stores.STORE_URL_CACHE_BUST
+        )
         blob = str(body["payments"])
         self.assertNotIn("wineboos", blob)
         self.assertNotIn("proton", blob)
@@ -96,9 +100,14 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         state_code, state = webpanel.api_state(uni_tok)
         self.assertEqual(state_code, 200)
         self.assertTrue(state["shop"]["is_unicorn"])
+        self.assertTrue(state["shop"]["checkout_ready"])
+        hints = [m.get("buyer_hint") or "" for m in state.get("payments") or []]
+        self.assertTrue(any("Venmo" in h or "PayPal" in h or "Copy" in h for h in hints))
+        self.assertFalse(any("wineboos" in h or "proton" in h for h in hints))
         other_code, other_state = webpanel.api_state(other_tok)
         self.assertEqual(other_code, 200)
         self.assertFalse(other_state["shop"]["is_unicorn"])
+        self.assertFalse(other_state["shop"]["checkout_ready"])
 
     def test_storefront_payment_methods_name_and_type_only(self) -> None:
         webpanel.ensure_unicorn_shop_payments(UNICORN)
@@ -161,9 +170,13 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertIn('callback_data="paytpl:apple_cash"', src)
         self.assertIn("cb_adm_seedpays", src)
         self.assertIn("_All methods paused._", src)
+        self.assertIn("_Buyers can checkout._", src)
+        self.assertIn("cashtag", src)
         panel = (ROOT / "webpanel.py").read_text(encoding="utf-8")
         self.assertIn("types.has('venmo')", panel)
         self.assertIn("checkout_ready", panel)
+        self.assertIn("Buyers see:", panel)
+        self.assertIn("buyer_hint", panel)
 
     def test_pay_url_venmo_prefill_paypal_username_not_email(self) -> None:
         venmo = payment_templates.render_venmo("@wineboos")

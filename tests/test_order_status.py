@@ -83,6 +83,8 @@ class OrderStatusTests(unittest.TestCase):
         self.assertNotIn("confirmed_by", body)
         self.assertNotIn("hidden_service_fee", body)
         self.assertTrue(body.get("needs_payment"))
+        self.assertTrue(body.get("can_mark_paid"))
+        self.assertIn("I've paid", body.get("mark_paid_hint") or "")
         self.assertIn("Pay using the methods below", body.get("message") or "")
         self.assertFalse(body.get("invoices_enabled"))
         self.assertTrue(body.get("payments"))
@@ -139,6 +141,8 @@ class OrderStatusTests(unittest.TestCase):
         self.assertEqual(code, 200, body)
         self.assertEqual(body["status"], "paid")
         self.assertFalse(body.get("needs_payment"))
+        self.assertFalse(body.get("can_mark_paid"))
+        self.assertFalse(body.get("mark_paid_hint"))
         self.assertIn("paid", (body.get("message") or "").lower())
         pms = body.get("payment_methods") or []
         self.assertTrue(pms)
@@ -154,6 +158,8 @@ class OrderStatusTests(unittest.TestCase):
         self.assertEqual(code, 200, body)
         self.assertEqual(body["status"], "awaiting_confirmation")
         self.assertTrue(body.get("needs_payment"))
+        self.assertFalse(body.get("can_mark_paid"))
+        self.assertIn("confirm", (body.get("mark_paid_hint") or "").lower())
         self.assertIn("confirm", (body.get("message") or "").lower())
         pms = body.get("payment_methods") or []
         self.assertTrue(pms[0].get("pay_url"))
@@ -168,6 +174,7 @@ class OrderStatusTests(unittest.TestCase):
         self.assertEqual(code, 200, body)
         self.assertEqual(body["status"], "cancelled")
         self.assertFalse(body.get("needs_payment"))
+        self.assertFalse(body.get("can_mark_paid"))
         self.assertIn("no longer awaiting payment", body.get("message") or "")
         pms = body.get("payment_methods") or []
         self.assertEqual(pms[0].get("method_type"), "venmo")

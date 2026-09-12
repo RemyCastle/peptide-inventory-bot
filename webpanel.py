@@ -1013,11 +1013,14 @@ def api_order_status(raw_key: str, payment_code: str) -> tuple[int, dict]:
         for p in pay_objs:
             p["pay_url"] = None
             p["pay_hint"] = None
+    can_mark_paid = vendor_stores.order_can_mark_paid(status)
     return 200, {
         "ok": True,
         "status": status,
         "code": code,
         "needs_payment": needs_payment,
+        "can_mark_paid": can_mark_paid,
+        "mark_paid_hint": vendor_stores.mark_paid_buyer_hint(status),
         "message": vendor_stores.order_status_buyer_message(
             status, needs_payment=needs_payment
         ),
@@ -1107,6 +1110,9 @@ def api_state(tok: dict) -> tuple[int, dict]:
     shop = db.get_shop(chat_id) or db.ensure_shop(chat_id)
     products = db.list_products(chat_id, active_only=False)
     payments = db.list_payment_methods(chat_id, active_only=False)
+    checkout_ready = any(int(m.get("active") or 0) for m in payments)
+    import vendor_stores
+
     return 200, {
         "ok": True,
         "shop": {
@@ -1119,6 +1125,7 @@ def api_state(tok: dict) -> tuple[int, dict]:
             "free_shipping_above": float(shop.get("free_shipping_above") or 0),
             "shipping_zones": db.parse_shipping_zones(shop),
             "is_unicorn": _shop_is_unicorn(chat_id, shop.get("title")),
+            "checkout_ready": checkout_ready,
         },
         "products": [_product_public(p) for p in products],
         "payments": [
@@ -1133,6 +1140,7 @@ def api_state(tok: dict) -> tuple[int, dict]:
                 "chain": m.get("chain") or "",
                 "address": m.get("address") or "",
                 "network_note": m.get("network_note") or "",
+                "buyer_hint": vendor_stores.payment_pay_hint(m),
             }
             for m in payments
         ],
@@ -3162,6 +3170,7 @@ function render(){
         </div>
         <label>Instructions shown to buyers (auto-filled from the fields above — editable)</label>
         <textarea class="p-instr" style="min-height:60px">${esc(m.instructions)}</textarea>
+        ${m.buyer_hint?`<p class="tag" style="margin:6px 0 0">Buyers see: ${esc(m.buyer_hint)}</p>`:''}
         <div class="flex" style="margin-top:8px">
           <label class="flex" style="margin:0"><input type="checkbox" class="p-act"
             style="width:auto" ${m.active?'checked':''}> enabled</label>

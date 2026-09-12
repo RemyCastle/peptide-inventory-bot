@@ -50,6 +50,8 @@ On a 200, `api_order` (`spbc_notify.py:1226`) returns:
      "pay_url": "https://account.venmo.com/pay?…", "line": "Venmo: …"}
   ],
   "message": "…buyer-facing confirmation text…",
+  "can_mark_paid": true,
+  "mark_paid_hint": "Tap I've paid after you send the money…",
   "invoice_offered": false
 }
 ```
@@ -224,8 +226,11 @@ Map from `initdata_error_code` (`vendor_stores.py:138`) and `api_order`:
 | 400 | `bad payload` / `empty cart` | Cart failed to parse or was empty | Client bug; check the Pages checkout JS |
 | 409 | `no_payment_methods` | Shop has zero *active* payment rows | Seed/unpause a method (Admin → Payments or panel). Order is **not** created. |
 | 409 | stock error | `create_order` rejected (sold out / stock race) | Expected when stock ran out mid-checkout; server re-checks authoritatively |
+| 400 | `missing_code` | `POST /order-paid` with empty `code` | Buyer must send the receipt payment code |
+| 403 | `not_your_order` | `POST /order-paid` initData user ≠ order buyer | Open from the same Telegram account that placed the order |
+| 409 | `already_processed` | `POST /order-paid` on paid/cancelled/rejected | Already confirmed or closed — no status change |
 
-401/409 JSON also includes `message` (buyer-facing, never a secret) and 401 includes `detail` (short `InitDataError.reason`). Mini App should alert `message`, not the raw `error` code. `GET /storefront` includes `message` + `invoices_enabled` (no handles). `GET /order-status` returns the same `payments` / `payment_methods` objects as `POST /order` (`pay_url` + `pay_hint` only while `needs_payment`) plus a status `message` so “check my order” can show pay links and copy-paste rails (PayPal email has no `pay_url`).
+401/409 JSON also includes `message` (buyer-facing, never a secret) and 401 includes `detail` (short `InitDataError.reason`). Mini App should alert `message`, not the raw `error` code. `GET /storefront` includes `message` + `invoices_enabled` (no handles). `GET /order-status` returns the same `payments` / `payment_methods` objects as `POST /order` (`pay_url` + `pay_hint` only while `needs_payment`) plus a status `message`, `can_mark_paid`, and `mark_paid_hint` so “check my order” can show pay links and I've paid. `POST /order-paid` uses the same initData HMAC as checkout and moves `pending_payment` → `awaiting_confirmation` (idempotent if already awaiting). Never confirms payment or deducts stock.
 
 **Why `bad_hash` vs `expired` is trustworthy:** once the HMAC matches a token,
 later field errors (expired, missing user) carry `hash_ok=True`

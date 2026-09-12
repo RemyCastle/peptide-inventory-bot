@@ -1010,10 +1010,18 @@ def _status_body() -> dict:
         shop = unicorn_shop.find_catalog_shop()
         if shop:
             rows = _db.list_payment_methods(int(shop["chat_id"]), active_only=False)
+            active = sum(1 for m in rows if m.get("active"))
             body["payments"] = {
-                "active": sum(1 for m in rows if m.get("active")),
+                "active": active,
                 "total": len(rows),
+                "checkout_ready": active > 0,
             }
+    except Exception:
+        pass
+    try:
+        import vendor_stores
+
+        body["store_url_cache_bust"] = vendor_stores.STORE_URL_CACHE_BUST
     except Exception:
         pass
     try:
@@ -1023,6 +1031,58 @@ def _status_body() -> dict:
     except Exception:
         body["invoices"] = {"enabled": False}
     return body
+
+
+def _miniapp_invite_and_init(payload: dict) -> tuple[str, str]:
+    invite = str(payload.get("invite") or "").strip()
+    init_data = payload.get("initData")
+    if init_data is not None and not isinstance(init_data, str):
+        init_data = str(init_data)
+    return invite, (init_data or "").strip()
+
+
+def _auth_miniapp_buyer(
+    invite: str, init_data: str, *, log_label: str
+) -> tuple[int | None, dict]:
+    """Storefront key + initData. Fail: (status, error_body). Ok: (None, ctx)."""
+    import vendor_stores
+    import webpanel
+
+    shop_chat_id = webpanel.resolve_storefront_key(invite)
+    if shop_chat_id is None:
+        log.info("%s unknown storefront invite", log_label)
+        return 404, vendor_stores.checkout_error_body("unknown storefront")
+
+    vendor_tokens = list(vendor_stores.get_bot_tokens_for_shop(shop_chat_id) or [])
+    one = vendor_stores.get_bot_token_for_shop(shop_chat_id)
+    if one and one not in vendor_tokens:
+        vendor_tokens.insert(0, one)
+    if not vendor_tokens:
+        log.warning("%s no vendor bot token for shop=%s", log_label, shop_chat_id)
+        return 401, vendor_stores.checkout_error_body("no_vendor_token")
+    vendor_token = vendor_tokens[0]
+    try:
+        buyer = vendor_stores.validate_webapp_init_data_any(
+            init_data, vendor_tokens
+        )
+    except vendor_stores.InitDataError as exc:
+        err = vendor_stores.initdata_error_code(exc)
+        log.info(
+            "%s initData rejected shop=%s reason=%s error=%s",
+            log_label,
+            shop_chat_id,
+            getattr(exc, "reason", None) or exc,
+            err,
+        )
+        return 401, vendor_stores.checkout_error_body(
+            err,
+            detail=str(getattr(exc, "reason", None) or err)[:80],
+        )
+    return None, {
+        "shop_chat_id": int(shop_chat_id),
+        "buyer": buyer,
+        "vendor_token": vendor_token,
+    }
 
 
 def handle_http_order(payload: dict) -> tuple[int, dict]:
@@ -1039,11 +1099,7 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
         if not isinstance(payload, dict):
             return 400, vendor_stores.checkout_error_body("bad payload")
 
-        invite = str(payload.get("invite") or "").strip()
-        init_data = payload.get("initData")
-        if init_data is not None and not isinstance(init_data, str):
-            init_data = str(init_data)
-        init_data = (init_data or "").strip()
+        invite, init_data = _miniapp_invite_and_init(payload)
         raw_items = payload.get("items")
 
         log.info(
@@ -1053,41 +1109,14 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             len(raw_items) if isinstance(raw_items, list) else type(raw_items).__name__,
         )
 
-        # 1) Resolve shop via public storefront_keys only
-        shop_chat_id = webpanel.resolve_storefront_key(invite)
-        if shop_chat_id is None:
-            log.info("POST /order unknown storefront invite")
-            return 404, vendor_stores.checkout_error_body("unknown storefront")
-
-        # 2) Auth boundary: initData signed with any token bound to this shop
-        # (primary polling bot + extra_tokens aliases, e.g. MagicFactory2Bot
-        # and UnicornMagicFactoryBot sharing one catalog).
-        vendor_tokens = list(vendor_stores.get_bot_tokens_for_shop(shop_chat_id) or [])
-        one = vendor_stores.get_bot_token_for_shop(shop_chat_id)
-        if one and one not in vendor_tokens:
-            vendor_tokens.insert(0, one)
-        if not vendor_tokens:
-            log.warning(
-                "POST /order no vendor bot token for shop=%s", shop_chat_id
-            )
-            return 401, vendor_stores.checkout_error_body("no_vendor_token")
-        vendor_token = vendor_tokens[0]
-        try:
-            buyer = vendor_stores.validate_webapp_init_data_any(
-                init_data, vendor_tokens
-            )
-        except vendor_stores.InitDataError as exc:
-            err = vendor_stores.initdata_error_code(exc)
-            log.info(
-                "POST /order initData rejected shop=%s reason=%s error=%s",
-                shop_chat_id,
-                getattr(exc, "reason", None) or exc,
-                err,
-            )
-            return 401, vendor_stores.checkout_error_body(
-                err,
-                detail=str(getattr(exc, "reason", None) or err)[:80],
-            )
+        err_status, auth = _auth_miniapp_buyer(
+            invite, init_data, log_label="POST /order"
+        )
+        if err_status is not None:
+            return err_status, auth
+        shop_chat_id = int(auth["shop_chat_id"])
+        buyer = auth["buyer"]
+        vendor_token = auth["vendor_token"]
 
         buyer_id = int(buyer["user_id"])
         username = buyer.get("username")
@@ -1265,6 +1294,8 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             "code": code,
             "total": total,
             "needs_payment": True,
+            "can_mark_paid": True,
+            "mark_paid_hint": vendor_stores.mark_paid_buyer_hint("pending_payment"),
             "payments": payments,
             "payment_methods": pay_objs,
             "message": message,
@@ -1276,6 +1307,106 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
         }
     except Exception as exc:
         log.error("POST /order unexpected error: %s", exc, exc_info=exc)
+        return 400, vendor_stores.checkout_error_body("bad payload")
+
+
+def _notify_vendor_payment_claim(
+    shop_chat_id: int, vendor_token: str, order: dict
+) -> None:
+    """Plain-text ping (HTTP thread). No stock change. Never raises."""
+    import vendor_stores
+    import webpanel
+
+    note = vendor_stores.build_payment_claim_notify_text(order)
+    base_ids = vendor_stores.base_notify_ids_for_shop(shop_chat_id)
+    recipients = vendor_stores.build_notify_recipient_ids(base_ids, shop_chat_id)
+    for rid in recipients:
+        try:
+            webpanel.telegram_send_with_token(
+                vendor_token, rid, note, parse_mode=None
+            )
+        except Exception:
+            log.exception(
+                "POST /order-paid vendor notify failed shop=%s rid=%s",
+                shop_chat_id,
+                rid,
+            )
+
+
+def handle_http_order_paid(payload: dict) -> tuple[int, dict]:
+    """POST /order-paid — Mini App buyer taps I've paid (initData auth).
+
+    pending_payment → awaiting_confirmation. Idempotent if already awaiting.
+    Never confirms payment, never changes stock. Never raises.
+    """
+    import db
+    import vendor_stores
+    import webpanel
+
+    try:
+        if not isinstance(payload, dict):
+            return 400, vendor_stores.checkout_error_body("bad payload")
+
+        invite, init_data = _miniapp_invite_and_init(payload)
+        code = str(payload.get("code") or "").strip()
+        log.info(
+            "POST /order-paid invite=%s initData_len=%s code_len=%s",
+            (invite[:8] + "…") if len(invite) > 8 else invite,
+            len(init_data),
+            len(code),
+        )
+        if not code:
+            return 400, vendor_stores.checkout_error_body("missing_code")
+
+        err_status, auth = _auth_miniapp_buyer(
+            invite, init_data, log_label="POST /order-paid"
+        )
+        if err_status is not None:
+            return err_status, auth
+        shop_chat_id = int(auth["shop_chat_id"])
+        buyer = auth["buyer"]
+        vendor_token = auth["vendor_token"]
+        buyer_id = int(buyer["user_id"])
+
+        order = db.get_order_by_payment_code(code)
+        if not order or int(order.get("chat_id") or 0) != shop_chat_id:
+            return 404, vendor_stores.checkout_error_body("order not found")
+        if int(order.get("user_id") or 0) != buyer_id:
+            log.info(
+                "POST /order-paid not_your_order shop=%s buyer=%s order=%s",
+                shop_chat_id,
+                buyer_id,
+                order.get("id"),
+            )
+            return 403, vendor_stores.checkout_error_body("not_your_order")
+
+        status = (order.get("status") or "").strip().lower()
+        newly_claimed = False
+        if status == "pending_payment":
+            ok = db.mark_order_awaiting_confirmation(int(order["id"]))
+            if not ok:
+                return 409, vendor_stores.checkout_error_body("already_processed")
+            newly_claimed = True
+            order = db.get_order(int(order["id"])) or order
+            _notify_vendor_payment_claim(shop_chat_id, vendor_token, order)
+            log.info(
+                "POST /order-paid claimed order_id=%s code=%s shop=%s",
+                order.get("id"),
+                code,
+                shop_chat_id,
+            )
+        elif status != "awaiting_confirmation":
+            return 409, vendor_stores.checkout_error_body("already_processed")
+
+        st, body = webpanel.api_order_status(invite, code)
+        if st != 200:
+            return st, body
+        body["ok"] = True
+        body["claimed"] = True
+        body["newly_claimed"] = newly_claimed
+        return 200, body
+    except Exception as exc:
+        log.error("POST /order-paid unexpected error: %s", exc, exc_info=exc)
         return 400, vendor_stores.checkout_error_body("bad payload")
 
 
@@ -1351,7 +1482,7 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
-        if path == "/order":
+        if path in ("/order", "/order-paid"):
             self.send_response(204)
             self._cors_order_headers()
             self.send_header("Content-Length", "0")
@@ -1363,8 +1494,8 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        if path == "/order":
-            # CORS-visible method probe; checkout is POST only.
+        if path in ("/order", "/order-paid"):
+            # CORS-visible method probe; checkout / I've paid are POST only.
             self._json(
                 405,
                 {"ok": False, "error": "method not allowed"},
@@ -1565,6 +1696,25 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
                 self._json(code, body, cors=True)
             except Exception as exc:
                 log.error("POST /order handler crash: %s", exc, exc_info=exc)
+                try:
+                    self._json(
+                        400, {"ok": False, "error": "bad payload"}, cors=True
+                    )
+                except Exception:
+                    pass
+            return
+        if path == "/order-paid":
+            try:
+                payload = self._read_json()
+                if payload is None:
+                    self._json(
+                        400, {"ok": False, "error": "bad payload"}, cors=True
+                    )
+                    return
+                code, body = handle_http_order_paid(payload)
+                self._json(code, body, cors=True)
+            except Exception as exc:
+                log.error("POST /order-paid handler crash: %s", exc, exc_info=exc)
                 try:
                     self._json(
                         400, {"ok": False, "error": "bad payload"}, cors=True

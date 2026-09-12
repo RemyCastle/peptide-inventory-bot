@@ -5,10 +5,11 @@ Repo: `C:\Users\Remy\peptide_inventory_bot`
 Prod: https://unicornfartzz-bot.onrender.com  
 Priority: P0  
 Ship agent: grok  
-AUTOPUSH: this ship (Pages checkout JS + `STORE_URL_CACHE_BUST=20260912`)
+AUTOPUSH: this ship (Mini App I've paid + admin rails preview +
+`STORE_URL_CACHE_BUST=20260913`)
 
-Goal: Mini App uses structured `pay_url` / `pay_hint` / `message` (no mockup
-copy, no regex-only pay buttons); never wipe inventory.
+Goal: Mini App buyers can tap I've paid (`POST /order-paid`); admin payments
+list shows handles + buyer hint; never wipe inventory.
 
 Context (already verified — do not rediscover):
 
@@ -48,40 +49,44 @@ has `pay_url`. `/storefront` `checkout_ready` (names+types only). Telegram
 warns when all methods are paused; Unicorn seed CTA shows when Venmo or
 PayPal types are missing (web panel same rule).
 
+**Pages checkout JS + cache bust — live on `fe857ec`:** Mini App uses
+`pay_url` / `pay_hint` / `checkout_message`; submit disabled when
+`checkout_ready` is false; mockup chrome gone. `STORE_URL_CACHE_BUST`
+was `20260912`.
+
 ## This ship
 
-**Pages checkout JS + cache bust.** Mini App (`miniapp-demos/unicorn/index.html`,
-Cloudflare Pages, not this git remote) now:
+**Mini App I've paid + admin rails preview.** Briefs' P0/P1 were already
+live; next batch is payments UX:
 
-- Uses `payment_methods[].pay_url` / `pay_hint` (string `payments` regex is
-  fallback only)
-- Surfaces storefront `checkout_ready` + `message` (submit disabled when empty)
-- Order lookup shows status `message` and pay rails only while `needs_payment`
-- Checkout errors use buyer `message` (`sold_out` / `min_order` / `no_payment_methods`)
-- Drops mockup chrome (“sample data”, “make-believe”, fake 12s-ago livebar)
-- SKU on cards already rendered when `/storefront` sends `sku`
+- `POST /order-paid` `{invite, initData, code}` — same HMAC as `/order`;
+  shop-scoped; buyer `user_id` must match; `pending_payment` →
+  `awaiting_confirmation`; idempotent if already awaiting; 403
+  `not_your_order`, 409 `already_processed`. Never confirms payment, never
+  changes stock. Vendor gets a plain-text PAYMENT CLAIM ping.
+- `GET /order-status` and `POST /order` include `can_mark_paid` +
+  `mark_paid_hint` (true only while `pending_payment`).
+- `/health` adds `payments.checkout_ready` + `store_url_cache_bust`.
+- Telegram Payments list shows handle/cashtag/address; “Buyers can checkout.”
+- Web panel Payments card shows buyer-facing `buyer_hint` (no handle in the
+  hint). `api_state.shop.checkout_ready`.
+- Pages: I've paid on receipt + order lookup; Copy target when there is no
+  `pay_url` (PayPal email). `STORE_URL_CACHE_BUST=20260913`.
 
-This repo: `POST /order` adds short `checkout_message`; `STORE_URL_CACHE_BUST`
-`20260912` so Telegram refetches Pages HTML.
+## Acceptance (this ship)
 
-**Buyer copy + `pay_hint` — live on `2054b95`:** `/storefront` `message` +
-`invoices_enabled`; `/order-status` status `message` and null `pay_hint`
-after paid/cancelled/rejected; `POST /order` rails include `pay_hint`
-(PayPal email = copy Friends & Family; no handle inside the hint).
-
-## Acceptance (this ship — `fe857ec`, Pages `9c914f77`)
-
-- [x] `python -m pytest -q -x` green on scratch DBs (611 passed)
+- [x] `python -m pytest -q -x` green on scratch DBs (618 passed)
 - [x] Docker COPY check still lists every imported module (26)
 - [x] No writes to laptop `inventory.db`; no DELETE of products
-- [x] `POST /order` success includes short `checkout_message` (not the full DM)
-- [x] Mini App HTML: no “sample data” / “make-believe”; uses `pay_url` / `pay_hint`
-- [x] Mini App disables submit when `checkout_ready` is false
-- [x] Live Pages `/unicorn/` no longer shows mockup chrome
-- [x] Live `/health` `git_sha` `fe857ec…`, `payments.active` = 2; store URL `?v=20260912`
+- [x] `POST /order` success has `can_mark_paid: true`
+- [x] `POST /order-paid` moves pending → awaiting; second tap is 200 idempotent
+- [x] Wrong Telegram user → 403 `not_your_order` (order stays pending)
+- [x] Mini App HTML has I've paid + `order-paid` + copy target
+- [ ] Live `/health` new `git_sha`, `payments.active` ≥ 1, `checkout_ready`,
+      `store_url_cache_bust` `20260913` (after AUTOPUSH)
 - [x] No secrets / `.env` / scratch import files committed
 
-Prior 2054b95 checks stay true: storefront names-only, paid-order null `pay_url`.
+Prior fe857ec checks stay true: storefront names-only, paid-order null `pay_url`.
 
 ## Out of scope
 
@@ -94,7 +99,9 @@ Prior 2054b95 checks stay true: storefront names-only, paid-order null `pay_url`
 
 ## Verify in 60s
 
-1. GET https://unicornfartzz-bot.onrender.com/health → `ok: true`, `payments.active` ≥ 1
-2. Open https://remy-miniapp-demos.pages.dev/unicorn/ — no “sample data” / “make-believe”;
-   livebar says live catalog; checkout note names Venmo / PayPal.
+1. GET https://unicornfartzz-bot.onrender.com/health → `ok: true`,
+   `payments.active` ≥ 1, `payments.checkout_ready: true`,
+   `store_url_cache_bust` `20260913`
+2. Open https://remy-miniapp-demos.pages.dev/unicorn/ — receipt/lookup have
+   I've paid; PayPal email is Copy, not a fake paypal.me link.
 3. Place nothing. Do not run local `start.bat`. Do not wipe `/data`.

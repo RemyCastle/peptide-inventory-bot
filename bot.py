@@ -5428,7 +5428,13 @@ async def cb_adm_pays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     buttons = []
     for m in methods:
         flag = "✅" if m["active"] else "⏸"
-        lines.append(f"{flag} #{m['id']} *{m['name']}*")
+        handle = (
+            m.get("handle") or m.get("cashtag") or m.get("address") or ""
+        ).strip()
+        line = f"{flag} #{m['id']} *{m['name']}*"
+        if handle:
+            line += f" · `{handle}`"
+        lines.append(line)
         buttons.append(
             [
                 InlineKeyboardButton(
@@ -5448,6 +5454,8 @@ async def cb_adm_pays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "_All methods paused._ Buyers cannot checkout until you "
             "unpause one or add another."
         )
+    else:
+        lines.append("\n_Buyers can checkout._")
     try:
         import unicorn_shop
 

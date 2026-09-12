@@ -361,6 +361,10 @@ class MiniAppPagesContractTests(unittest.TestCase):
         self.assertIn("checkout_message", self.src)
         self.assertIn("renderPayMethods", self.src)
         self.assertIn("updateCheckoutCopy", self.src)
+        self.assertIn("order-paid", self.src)
+        self.assertIn("can_mark_paid", self.src)
+        self.assertIn("I've paid", self.src)
+        self.assertIn("copytarget", self.src)
 
     def test_drops_mockup_copy(self) -> None:
         low = self.src.lower()

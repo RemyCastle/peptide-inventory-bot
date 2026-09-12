@@ -176,6 +176,8 @@ class OrderHttpTests(unittest.TestCase):
         self.assertIn(pm0.get("method_type"), ("venmo", "custom"))
         self.assertTrue(pm0.get("line"))
         self.assertTrue(body.get("needs_payment"))
+        self.assertTrue(body.get("can_mark_paid"))
+        self.assertIn("I've paid", body.get("mark_paid_hint") or "")
         self.assertFalse(body.get("invoices_enabled"))
         self.assertFalse(body.get("invoice_offered"))
         self.assertTrue(pm0.get("pay_hint"))
@@ -497,6 +499,115 @@ class OrderHttpTests(unittest.TestCase):
         self.assertIn("total", data)
         self.assertIn("payments", data)
         self.assertIn("message", data)
+        self.assertTrue(data.get("can_mark_paid"))
+
+    def test_order_paid_pending_to_awaiting_notifies_vendor(self) -> None:
+        code, created = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 200, created)
+        pay_code = created["code"]
+        self.sent.clear()
+        st, body = spbc_notify.handle_http_order_paid(
+            {"invite": self.sf_key, "initData": build_valid_init_data(VENDOR_TOKEN), "code": pay_code}
+        )
+        self.assertEqual(st, 200, body)
+        self.assertTrue(body.get("ok"))
+        self.assertTrue(body.get("claimed"))
+        self.assertTrue(body.get("newly_claimed"))
+        self.assertEqual(body.get("status"), "awaiting_confirmation")
+        self.assertTrue(body.get("needs_payment"))
+        self.assertFalse(body.get("can_mark_paid"))
+        self.assertIn("confirm", (body.get("mark_paid_hint") or "").lower())
+        order = db.get_order_by_payment_code(pay_code)
+        self.assertEqual(order["status"], "awaiting_confirmation")
+        vendor_sends = [s for s in self.sent if s[0] == "vendor"]
+        self.assertTrue(any("PAYMENT CLAIM" in (s[3] or "") for s in vendor_sends))
+        self.assertTrue(any(s[2] in (OWNER, ADMIN) for s in vendor_sends))
+
+    def test_order_paid_idempotent_when_already_awaiting(self) -> None:
+        code, created = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 200, created)
+        pay_code = created["code"]
+        st1, body1 = spbc_notify.handle_http_order_paid(
+            {"invite": self.sf_key, "initData": build_valid_init_data(VENDOR_TOKEN), "code": pay_code}
+        )
+        self.assertEqual(st1, 200, body1)
+        self.sent.clear()
+        st2, body2 = spbc_notify.handle_http_order_paid(
+            {"invite": self.sf_key, "initData": build_valid_init_data(VENDOR_TOKEN), "code": pay_code}
+        )
+        self.assertEqual(st2, 200, body2)
+        self.assertTrue(body2.get("claimed"))
+        self.assertFalse(body2.get("newly_claimed"))
+        self.assertEqual(body2.get("status"), "awaiting_confirmation")
+        self.assertEqual(self.sent, [])
+
+    def test_order_paid_wrong_buyer_403(self) -> None:
+        code, created = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 200, created)
+        other = build_valid_init_data(VENDOR_TOKEN, user_id=BUYER + 99, username="other")
+        st, body = spbc_notify.handle_http_order_paid(
+            {"invite": self.sf_key, "initData": other, "code": created["code"]}
+        )
+        self.assertEqual(st, 403, body)
+        self.assertEqual(body.get("error"), "not_your_order")
+        self.assertIn("different Telegram", body.get("message") or "")
+        order = db.get_order_by_payment_code(created["code"])
+        self.assertEqual(order["status"], "pending_payment")
+
+    def test_order_paid_paid_order_409(self) -> None:
+        code, created = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 200, created)
+        order = db.get_order_by_payment_code(created["code"])
+        ok, msg, _ = db.confirm_order_payment(int(order["id"]), ADMIN, tracking_number="-")
+        self.assertTrue(ok, msg)
+        st, body = spbc_notify.handle_http_order_paid(
+            {
+                "invite": self.sf_key,
+                "initData": build_valid_init_data(VENDOR_TOKEN),
+                "code": created["code"],
+            }
+        )
+        self.assertEqual(st, 409, body)
+        self.assertEqual(body.get("error"), "already_processed")
+
+    def test_order_paid_missing_code_400(self) -> None:
+        st, body = spbc_notify.handle_http_order_paid(
+            {"invite": self.sf_key, "initData": build_valid_init_data(VENDOR_TOKEN), "code": ""}
+        )
+        self.assertEqual(st, 400, body)
+        self.assertEqual(body.get("error"), "missing_code")
+
+    def test_order_paid_empty_initdata_401(self) -> None:
+        code, created = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 200, created)
+        st, body = spbc_notify.handle_http_order_paid(
+            {"invite": self.sf_key, "initData": "", "code": created["code"]}
+        )
+        self.assertEqual(st, 401, body)
+        self.assertEqual(body.get("error"), "empty_initdata")
+
+    def test_options_order_paid_cors_headers(self) -> None:
+        handler = object.__new__(spbc_notify.NotifyHTTPHandler)
+        handler.path = "/order-paid"
+        captured: dict = {"headers": [], "code": None}
+
+        def send_response(code, *a, **k):
+            captured["code"] = code
+
+        def send_header(name, value):
+            captured["headers"].append((name, value))
+
+        def end_headers():
+            captured["ended"] = True
+
+        handler.send_response = send_response  # type: ignore[method-assign]
+        handler.send_header = send_header  # type: ignore[method-assign]
+        handler.end_headers = end_headers  # type: ignore[method-assign]
+        handler.do_OPTIONS()
+        self.assertEqual(captured["code"], 204)
+        hdrs = {k.lower(): v for k, v in captured["headers"]}
+        self.assertEqual(hdrs.get("access-control-allow-origin"), "*")
+        self.assertIn("POST", hdrs.get("access-control-allow-methods", ""))
 
 
 if __name__ == "__main__":

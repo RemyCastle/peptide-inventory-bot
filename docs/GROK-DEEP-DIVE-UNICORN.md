@@ -107,7 +107,7 @@ Buyers only see `active=1`, `ORDER BY sort_order, name`.
 |---|---|
 | Telegram cart checkout | Inline method picker. **Blocked** if none active. |
 | Vendor-bot DM after Mini App order | HTML receipt: tap-to-copy code, handle, Friends & Family warning, pay URL, QR (`segno`). |
-| Mini App success sheet | `payment_methods` with `pay_url` + `pay_hint` (string `payments` regex is fallback only). |
+| Mini App success sheet | `payment_methods` with `pay_url` + `pay_hint` (string `payments` regex is fallback only). **I've paid** → `POST /order-paid` while `can_mark_paid`. |
 | `GET /storefront` | **Names only** (`payment_methods` name+type, `message`, `invoices_enabled`). Handles / `pay_url` / `pay_hint` stay off the public catalog. |
 
 Empty-copy used to say “Payment details will be DM'd to you.” That is a lie
@@ -186,7 +186,8 @@ Menu Button URL in BotFather must match `UNICORN_STORE_URL` / vendor
 | P1 | Sold-out `error` was a long sentence; min-order looked like sold-out | **live `c5bbf40`** (`sold_out` / `min_order`) |
 | P1 | All methods paused hid the Unicorn seed CTA | **live `c5bbf40`** |
 | P1 | Catalog / order-status had no buyer `message`; PayPal email had no copy hint | **live `2054b95`** (`message` + `pay_hint` + `invoices_enabled`) |
-| P2 | Pages mockup copy / SKU on cards / use `pay_url` client-side | **this ship** (`miniapp-demos` + cache bust `20260912`) |
+| P2 | Pages mockup copy / SKU on cards / use `pay_url` client-side | **live `fe857ec`** (`miniapp-demos` + cache bust `20260912`) |
+| P1 | Mini App had no I've paid (Telegram cart does) | **this ship** (`POST /order-paid` + `can_mark_paid`) |
 | P2 | Native Telegram invoice (provider token unset) | Optional; Stars forbidden for physical goods |
 
 ---
