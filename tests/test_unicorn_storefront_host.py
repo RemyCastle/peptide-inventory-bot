@@ -243,6 +243,9 @@ class HealthHostTests(unittest.TestCase):
         self.assertEqual(
             body["storefront_host"], "https://unicornfartzz-bot.onrender.com"
         )
+        self.assertIn("notify", body)
+        self.assertIn("order_ok", body["notify"])
+        self.assertIn("claim_ok", body["notify"])
 
     def test_health_true_from_bound_catalog_shop(self) -> None:
         import spbc_notify

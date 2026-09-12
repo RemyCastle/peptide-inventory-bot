@@ -83,7 +83,33 @@ class NotifyOrderRecipientTests(unittest.TestCase):
                 vendor_stores.notify_order_recipient(SHOP, VENDOR_ADMIN, "note")
             )
         self.assertTrue(ok)
-        self.assertEqual(calls, ["vendor", "main"])
+        self.assertEqual(calls[0], "vendor")
+        self.assertIn("main", calls)
+
+    def test_unicorn_vendor_fail_does_not_skip_main(self) -> None:
+        calls: list[str] = []
+
+        def fake_vendor(*_a, **_k):
+            calls.append("vendor")
+            return False
+
+        def fake_main(chat_id, text):
+            calls.append("main")
+            return {}
+
+        with mock.patch(
+            "unicorn_shop.is_unicorn_shop", return_value=True
+        ), mock.patch.object(
+            vendor_stores, "get_bot_token_for_shop", return_value=VENDOR_TOKEN
+        ), mock.patch.object(
+            webpanel, "telegram_send_with_token", side_effect=fake_vendor
+        ), mock.patch.object(spbc_notify, "send_telegram", side_effect=fake_main):
+            ok = _run(
+                vendor_stores.notify_order_recipient(SHOP, VENDOR_ADMIN, "note")
+            )
+        self.assertTrue(ok)
+        self.assertEqual(calls[0], "vendor")
+        self.assertIn("main", calls)
 
     def test_no_vendor_token_uses_main(self) -> None:
         calls: list[str] = []

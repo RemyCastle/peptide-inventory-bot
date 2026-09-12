@@ -61,6 +61,15 @@ _bot_token: str = ""
 _sessions: dict[str, dict] = {}
 # chat_id(str) -> {telegram_chat_id, username, first_name, title, type}
 _recent_chats: "OrderedDict[str, dict]" = OrderedDict()
+_NOTIFY_STAT_KEYS = (
+    "order_ok",
+    "order_fail",
+    "order_empty_recipients",
+    "claim_ok",
+    "claim_fail",
+    "claim_empty_recipients",
+)
+_notify_stats: dict[str, int] = {k: 0 for k in _NOTIFY_STAT_KEYS}
 
 
 def set_bot_token(token: str) -> None:
@@ -119,6 +128,180 @@ def send_telegram(chat_id: str | int, text: str) -> dict:
             data.get("description") or "Telegram send failed", code="telegram_failed"
         )
     return data.get("result") or {}
+
+
+def notify_stats() -> dict[str, int]:
+    """Process-lifetime Mini App staff-notify counters for /health."""
+    with _state_lock:
+        return {k: int(_notify_stats.get(k) or 0) for k in _NOTIFY_STAT_KEYS}
+
+
+def _bump_notify(key: str) -> None:
+    with _state_lock:
+        _notify_stats[key] = int(_notify_stats.get(key) or 0) + 1
+
+
+def _live_bot_token() -> str:
+    """Poller token, then TELEGRAM_BOT_TOKEN env/config."""
+    with _state_lock:
+        tok = (_bot_token or "").strip()
+    if tok:
+        return tok
+    env = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    if env:
+        return env
+    try:
+        from config import TELEGRAM_BOT_TOKEN as _cfg
+
+        return (_cfg or "").strip()
+    except Exception:
+        return ""
+
+
+def _owner_chat_id() -> int | None:
+    raw = str(OWNER_TELEGRAM_CHAT_ID or "").strip()
+    if not raw:
+        raw = (os.getenv("OWNER_TELEGRAM_CHAT_ID") or "").strip()
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    return None
+
+
+def _deliver_staff_dm(
+    rid: int,
+    text: str,
+    vendor_token: str,
+    *,
+    parse_mode: str | None = None,
+    reply_markup: dict | None = None,
+    log_label: str = "notify",
+) -> bool:
+    """Vendor HMAC token first, then TELEGRAM_BOT_TOKEN / poller. Never skip Unicorn."""
+    import webpanel
+
+    def try_token(tok: str, why: str, tried: list[str]) -> bool:
+        tok = (tok or "").strip()
+        if not tok or tok in tried:
+            return False
+        tried.append(tok)
+        try:
+            ok = bool(
+                webpanel.telegram_send_with_token(
+                    tok,
+                    rid,
+                    text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                )
+            )
+        except Exception:
+            log.exception("%s %s send error rid=%s", log_label, why, rid)
+            return False
+        if ok:
+            log.info("%s notified rid=%s via %s", log_label, rid, why)
+            return True
+        log.info("%s %s failed rid=%s", log_label, why, rid)
+        return False
+
+    tried: list[str] = []
+    if try_token(vendor_token, "vendor_token", tried):
+        return True
+    live = _live_bot_token()
+    if try_token(live, "TELEGRAM_BOT_TOKEN", tried):
+        return True
+    try:
+        send_telegram(rid, text)
+        log.info("%s notified rid=%s via main bot", log_label, rid)
+        return True
+    except Exception as exc:
+        log.warning("%s main bot failed rid=%s: %s", log_label, rid, exc)
+        return False
+
+
+def _notify_staff(
+    shop_chat_id: int,
+    vendor_token: str,
+    text: str,
+    *,
+    order_id: Any = None,
+    kind: str = "order",
+    log_label: str = "POST /order",
+    reply_markup: dict | None = None,
+) -> bool:
+    """DM shop staff. Empty recipients and notified_any=false escalate to OWNER."""
+    import vendor_stores
+
+    base_ids = vendor_stores.base_notify_ids_for_shop(shop_chat_id)
+    recipients = vendor_stores.build_notify_recipient_ids(base_ids, shop_chat_id)
+    if not recipients:
+        log.warning(
+            "%s empty recipients shop=%s order=%s — escalating to OWNER",
+            log_label,
+            shop_chat_id,
+            order_id,
+        )
+        _bump_notify(f"{kind}_empty_recipients")
+        owner = _owner_chat_id()
+        if owner:
+            recipients = [owner]
+        else:
+            log.warning(
+                "%s empty recipients and no OWNER_TELEGRAM_CHAT_ID "
+                "shop=%s order=%s",
+                log_label,
+                shop_chat_id,
+                order_id,
+            )
+            _bump_notify(f"{kind}_fail")
+            return False
+
+    notified_any = False
+    for rid in recipients:
+        try:
+            ok = _deliver_staff_dm(
+                int(rid),
+                text,
+                vendor_token,
+                parse_mode=None,
+                reply_markup=reply_markup,
+                log_label=log_label,
+            )
+        except Exception:
+            log.exception("%s deliver error shop=%s rid=%s", log_label, shop_chat_id, rid)
+            ok = False
+        if ok:
+            notified_any = True
+
+    if not notified_any:
+        log.warning(
+            "%s notified_any=false shop=%s order=%s — escalating",
+            log_label,
+            shop_chat_id,
+            order_id,
+        )
+        owner = _owner_chat_id()
+        seen = set()
+        for rid in recipients:
+            try:
+                seen.add(int(rid))
+            except (TypeError, ValueError):
+                continue
+        if owner and owner not in seen:
+            if _deliver_staff_dm(
+                owner,
+                text,
+                vendor_token,
+                parse_mode=None,
+                reply_markup=reply_markup,
+                log_label=f"{log_label} owner-escalate",
+            ):
+                notified_any = True
+        if not notified_any:
+            _bump_notify(f"{kind}_fail")
+            return False
+
+    _bump_notify(f"{kind}_ok")
+    return True
 
 
 # ── Payload helpers (faithful port of server.js) ─────────────────────────────
@@ -1036,6 +1219,7 @@ def _status_body() -> dict:
         body["invoices"] = {"enabled": bool(tg_payments.invoices_enabled())}
     except Exception:
         body["invoices"] = {"enabled": False}
+    body["notify"] = notify_stats()
     return body
 
 
@@ -1202,45 +1386,14 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             emoji=emoji,
             order_lines=order_lines,
         )
-        base_ids = vendor_stores.base_notify_ids_for_shop(shop_chat_id)
-        recipients = vendor_stores.build_notify_recipient_ids(base_ids, shop_chat_id)
-        for rid in recipients:
-            delivered = False
-            try:
-                delivered = bool(
-                    webpanel.telegram_send_with_token(
-                        vendor_token, rid, note, parse_mode=None
-                    )
-                )
-            except Exception:
-                log.exception(
-                    "POST /order vendor notify failed shop=%s rid=%s",
-                    shop_chat_id,
-                    rid,
-                )
-            if delivered:
-                log.info(
-                    "POST /order notified rid=%s via vendor bot", rid
-                )
-                continue
-            try:
-                from unicorn_shop import is_unicorn_shop
-
-                if is_unicorn_shop(shop_chat_id):
-                    log.info(
-                        "POST /order Unicorn shop — skip SPBC main-bot notify rid=%s",
-                        rid,
-                    )
-                    continue
-            except Exception:
-                pass
-            try:
-                send_telegram(rid, note)
-                log.info("POST /order notified rid=%s via main bot", rid)
-            except Exception as exc:
-                log.warning(
-                    "POST /order notify failed rid=%s: %s", rid, exc
-                )
+        _notify_staff(
+            shop_chat_id,
+            vendor_token,
+            note,
+            order_id=order_id,
+            kind="order",
+            log_label="POST /order",
+        )
 
         # 6) Buyer confirmation — HTML (tap-to-copy code + pay links),
         #    plain-text fallback.
@@ -1323,29 +1476,21 @@ def _notify_vendor_payment_claim(
 
     Confirm is a URL button (/confirm?ct=) so it works on the vendor bot,
     which does not handle admconfirm callbacks.
+    Vendor token first, then TELEGRAM_BOT_TOKEN / OWNER. Empty recipients escalate.
     """
     import vendor_stores
-    import webpanel
 
     note = vendor_stores.build_payment_claim_notify_text(order)
     markup = vendor_stores.payment_claim_reply_markup(order)
-    base_ids = vendor_stores.base_notify_ids_for_shop(shop_chat_id)
-    recipients = vendor_stores.build_notify_recipient_ids(base_ids, shop_chat_id)
-    for rid in recipients:
-        try:
-            webpanel.telegram_send_with_token(
-                vendor_token,
-                rid,
-                note,
-                parse_mode=None,
-                reply_markup=markup,
-            )
-        except Exception:
-            log.exception(
-                "POST /order-paid vendor notify failed shop=%s rid=%s",
-                shop_chat_id,
-                rid,
-            )
+    _notify_staff(
+        shop_chat_id,
+        vendor_token,
+        note,
+        order_id=order.get("id"),
+        kind="claim",
+        log_label="POST /order-paid",
+        reply_markup=markup,
+    )
 
 
 def _notify_buyer_payment_claim(

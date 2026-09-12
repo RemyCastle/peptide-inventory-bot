@@ -685,5 +685,179 @@ class OrderHttpTests(unittest.TestCase):
         self.assertIn("POST", hdrs.get("access-control-allow-methods", ""))
 
 
+    def test_unicorn_vendor_fail_falls_back_to_main_bot(self) -> None:
+        def fail_vendor(token, chat_id, text, **kwargs):
+            self.sent.append(("vendor", token, int(chat_id), text, kwargs))
+            return False
+
+        before = spbc_notify.notify_stats()
+        with mock.patch(
+            "unicorn_shop.is_unicorn_shop", return_value=True
+        ), mock.patch.object(
+            webpanel, "telegram_send_with_token", side_effect=fail_vendor
+        ):
+            code, body = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 200, body)
+        main_sends = [s for s in self.sent if s[0] == "main"]
+        self.assertTrue(
+            any(s[1] in (OWNER, ADMIN) for s in main_sends),
+            msg=f"expected main-bot staff fallback, sent={self.sent!r}",
+        )
+        after = spbc_notify.notify_stats()
+        self.assertEqual(after["order_ok"], before["order_ok"] + 1)
+        self.assertEqual(after["order_fail"], before["order_fail"])
+
+    def test_vendor_token_fail_tries_telegram_bot_token(self) -> None:
+        live = "111111111:LIVE-POLLER-TOKEN"
+        tokens: list[str] = []
+
+        def send(token, chat_id, text, **kwargs):
+            tokens.append(str(token))
+            self.sent.append(("vendor", token, int(chat_id), text, kwargs))
+            return token == live
+
+        with mock.patch.object(
+            webpanel, "telegram_send_with_token", side_effect=send
+        ), mock.patch.object(spbc_notify, "_live_bot_token", return_value=live):
+            code, body = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 200, body)
+        self.assertIn(VENDOR_TOKEN, tokens)
+        self.assertIn(live, tokens)
+        staff_live = [
+            s
+            for s in self.sent
+            if s[0] == "vendor"
+            and s[1] == live
+            and s[2] in (OWNER, ADMIN)
+            and "NEW ORDER" in (s[3] or "")
+        ]
+        self.assertTrue(staff_live, msg=f"live-token staff DM missing, sent={self.sent!r}")
+
+    def test_empty_recipients_warns_and_escalates_to_owner(self) -> None:
+        before = spbc_notify.notify_stats()
+        with mock.patch.object(
+            vendor_stores, "build_notify_recipient_ids", return_value=[]
+        ), mock.patch.object(
+            spbc_notify, "OWNER_TELEGRAM_CHAT_ID", str(OWNER)
+        ), mock.patch.object(spbc_notify.log, "warning") as warn:
+            code, body = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 200, body)
+        vendor_sends = [s for s in self.sent if s[0] == "vendor"]
+        staff = [
+            s
+            for s in vendor_sends
+            if s[2] == OWNER and "NEW ORDER" in (s[3] or "")
+        ]
+        self.assertTrue(staff, msg=f"owner escalate missing, sent={self.sent!r}")
+        blobs = " ".join(str(c.args) for c in warn.call_args_list)
+        self.assertIn("empty recipients", blobs)
+        after = spbc_notify.notify_stats()
+        self.assertEqual(
+            after["order_empty_recipients"], before["order_empty_recipients"] + 1
+        )
+        self.assertEqual(after["order_ok"], before["order_ok"] + 1)
+
+    def test_notified_any_false_warns_and_counts_fail(self) -> None:
+        def fail_vendor(token, chat_id, text, **kwargs):
+            self.sent.append(("vendor", token, int(chat_id), text, kwargs))
+            return False
+
+        def fail_main(*_a, **_k):
+            raise spbc_notify.NotifyError("boom", code="telegram_failed")
+
+        before = spbc_notify.notify_stats()
+        with mock.patch.object(
+            webpanel, "telegram_send_with_token", side_effect=fail_vendor
+        ), mock.patch.object(
+            spbc_notify, "send_telegram", side_effect=fail_main
+        ), mock.patch.object(
+            spbc_notify, "OWNER_TELEGRAM_CHAT_ID", ""
+        ), mock.patch.object(spbc_notify, "_live_bot_token", return_value=""), mock.patch.object(
+            spbc_notify.log, "warning"
+        ) as warn:
+            code, body = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 200, body)
+        blobs = " ".join(str(c.args) for c in warn.call_args_list)
+        self.assertIn("notified_any=false", blobs)
+        after = spbc_notify.notify_stats()
+        self.assertEqual(after["order_fail"], before["order_fail"] + 1)
+
+    def test_order_paid_vendor_fail_falls_back_to_main(self) -> None:
+        code, created = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 200, created)
+        self.sent.clear()
+
+        def fail_vendor(token, chat_id, text, **kwargs):
+            self.sent.append(("vendor", token, int(chat_id), text, kwargs))
+            return False
+
+        before = spbc_notify.notify_stats()
+        with mock.patch.object(
+            webpanel, "telegram_send_with_token", side_effect=fail_vendor
+        ), mock.patch.object(webpanel, "PANEL_BASE_URL", "https://bot.example.com"):
+            st, body = spbc_notify.handle_http_order_paid(
+                {
+                    "invite": self.sf_key,
+                    "initData": build_valid_init_data(VENDOR_TOKEN),
+                    "code": created["code"],
+                }
+            )
+        self.assertEqual(st, 200, body)
+        main_sends = [s for s in self.sent if s[0] == "main"]
+        self.assertTrue(
+            main_sends, msg=f"expected claim main-bot fallback, sent={self.sent!r}"
+        )
+        after = spbc_notify.notify_stats()
+        self.assertEqual(after["claim_ok"], before["claim_ok"] + 1)
+
+    def test_order_paid_empty_recipients_warns_and_escalates(self) -> None:
+        code, created = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 200, created)
+        self.sent.clear()
+        before = spbc_notify.notify_stats()
+        with mock.patch.object(
+            vendor_stores, "build_notify_recipient_ids", return_value=[]
+        ), mock.patch.object(
+            spbc_notify, "OWNER_TELEGRAM_CHAT_ID", str(OWNER)
+        ), mock.patch.object(
+            webpanel, "PANEL_BASE_URL", "https://bot.example.com"
+        ), mock.patch.object(spbc_notify.log, "warning") as warn:
+            st, body = spbc_notify.handle_http_order_paid(
+                {
+                    "invite": self.sf_key,
+                    "initData": build_valid_init_data(VENDOR_TOKEN),
+                    "code": created["code"],
+                }
+            )
+        self.assertEqual(st, 200, body)
+        blobs = " ".join(str(c.args) for c in warn.call_args_list)
+        self.assertIn("empty recipients", blobs)
+        staff = [
+            s
+            for s in self.sent
+            if s[0] == "vendor" and s[2] == OWNER and "PAYMENT CLAIM" in (s[3] or "")
+        ]
+        self.assertTrue(staff, msg=f"claim owner escalate missing, sent={self.sent!r}")
+        after = spbc_notify.notify_stats()
+        self.assertEqual(
+            after["claim_empty_recipients"], before["claim_empty_recipients"] + 1
+        )
+        self.assertEqual(after["claim_ok"], before["claim_ok"] + 1)
+
+    def test_health_exposes_notify_counters(self) -> None:
+        body = spbc_notify._status_body()
+        self.assertIn("notify", body)
+        for key in (
+            "order_ok",
+            "order_fail",
+            "order_empty_recipients",
+            "claim_ok",
+            "claim_fail",
+            "claim_empty_recipients",
+        ):
+            self.assertIn(key, body["notify"])
+            self.assertIsInstance(body["notify"][key], int)
+
+
 if __name__ == "__main__":
     unittest.main()

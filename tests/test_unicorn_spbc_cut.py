@@ -234,7 +234,7 @@ class NotifyAndHandoffCutTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_unicorn_notify_does_not_fall_back_to_spbc_bot(self) -> None:
+    def test_unicorn_notify_falls_back_to_telegram_bot_token(self) -> None:
         calls: list[str] = []
 
         def fake_vendor(*_a, **_k):
@@ -253,8 +253,9 @@ class NotifyAndHandoffCutTests(unittest.TestCase):
             ok = _run(
                 vendor_stores.notify_order_recipient(UNICORN, ADMIN, "NEW ORDER")
             )
-        self.assertFalse(ok)
-        self.assertEqual(calls, ["vendor"])
+        self.assertTrue(ok)
+        self.assertEqual(calls[0], "vendor")
+        self.assertIn("main", calls)
 
     def test_other_shop_still_falls_back_to_main(self) -> None:
         db.ensure_shop(OTHER, title="Vendy")
@@ -277,7 +278,8 @@ class NotifyAndHandoffCutTests(unittest.TestCase):
                 vendor_stores.notify_order_recipient(OTHER, ADMIN, "note")
             )
         self.assertTrue(ok)
-        self.assertEqual(calls, ["vendor", "main"])
+        self.assertEqual(calls[0], "vendor")
+        self.assertIn("main", calls)
 
     def test_vendor_bot_for_user_skips_unicorn(self) -> None:
         with mock.patch.object(
@@ -391,7 +393,7 @@ class CheckoutStillLocalTests(unittest.TestCase):
         self.assertEqual(db.get_order_by_payment_code(code)["id"], order["id"])
         self.assertEqual(int(order["chat_id"]), UNICORN)
 
-    def test_http_order_skips_main_bot_on_unicorn(self) -> None:
+    def test_http_order_falls_back_to_main_bot_on_unicorn(self) -> None:
         webpanel.ensure_webpanel_tables()
         sf = webpanel._ensure_storefront_key(UNICORN)
         sent: list[str] = []
@@ -446,7 +448,7 @@ class CheckoutStillLocalTests(unittest.TestCase):
         self.assertTrue(body.get("ok"))
         self.assertTrue(str(body.get("code") or "").startswith("🎁"))
         self.assertIn("vendor", sent)
-        self.assertNotIn("main", sent)
+        self.assertIn("main", sent)
 
 
 class RunCloudVendorOnlyTests(unittest.TestCase):

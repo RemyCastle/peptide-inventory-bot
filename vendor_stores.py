@@ -1265,13 +1265,14 @@ async def notify_order_recipient(
     text: str,
     context=None,
 ) -> bool:
-    """Deliver one NEW ORDER DM: vendor storefront bot first, then main SPBC bot.
+    """Deliver one NEW ORDER DM: vendor token, then TELEGRAM_BOT_TOKEN, then poller.
 
-    Recipients may have /start'd *either* the shop's vendor bot or @SPBCOrderBot
-    (claim link). Trying both avoids silent failure when only one is opened.
+    Recipients may have /start'd *either* the shop's vendor bot or the live poller.
+    Unicorn must not skip fallback — Mini App HMAC may be an extra/old bot token.
 
     1) get_bot_token_for_shop → webpanel.telegram_send_with_token (parse_mode=None)
-    2) On fail/False → spbc_notify.send_telegram (main bot)
+    2) On fail, TELEGRAM_BOT_TOKEN if it differs from the vendor token
+    3) On fail → spbc_notify.send_telegram (poller / TELEGRAM_BOT_TOKEN)
 
     Both sends are sync HTTP; run via asyncio.to_thread. Never raises.
     ``context`` is accepted for call-site flexibility (unused; delivery is token-based).
@@ -1313,10 +1314,36 @@ async def notify_order_recipient(
                 return True
             log.info(
                 "notify_order_recipient: vendor bot send failed shop=%s to=%s; "
-                "trying main bot",
+                "trying TELEGRAM_BOT_TOKEN then main bot",
                 shop,
                 rid,
             )
+            live = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+            if not live:
+                try:
+                    from config import TELEGRAM_BOT_TOKEN as _cfg
+
+                    live = (_cfg or "").strip()
+                except Exception:
+                    live = ""
+            if live and live != token:
+                vendor_ok = bool(
+                    await asyncio.to_thread(
+                        _webpanel.telegram_send_with_token,
+                        live,
+                        rid,
+                        text,
+                        parse_mode=None,
+                    )
+                )
+                if vendor_ok:
+                    log.info(
+                        "notify_order_recipient: delivered via TELEGRAM_BOT_TOKEN "
+                        "shop=%s to=%s",
+                        shop,
+                        rid,
+                    )
+                    return True
         else:
             log.info(
                 "notify_order_recipient: no vendor token for shop=%s; trying main bot",
@@ -1329,21 +1356,8 @@ async def notify_order_recipient(
             rid,
         )
 
-    # 2) Main bot fallback (@SPBCOrderBot / pool token).
-    # Unicorn never uses the SPBC bot — vendor token only.
-    try:
-        from unicorn_shop import is_unicorn_shop
-
-        if is_unicorn_shop(shop):
-            log.info(
-                "notify_order_recipient: Unicorn shop — no SPBC main-bot "
-                "fallback shop=%s to=%s",
-                shop,
-                rid,
-            )
-            return False
-    except Exception:
-        pass
+    # 2) Main bot fallback (TELEGRAM_BOT_TOKEN / poller). Unicorn included —
+    # vendor HMAC token may be an extra/old bot; do not skip this path.
     try:
         import spbc_notify
 
