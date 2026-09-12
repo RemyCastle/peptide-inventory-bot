@@ -53,6 +53,44 @@ data_check_string = "\n".join(sorted "k=v" pairs, excluding hash)
   from — not necessarily the polling bot.** That is the whole reason
   `extra_tokens` exists (see next section).
 
+### Manually verify an `initData` string (offline, no DB)
+
+When a buyer reports `bad_hash` and you need to know *which* token (if any)
+signed their session, verify it offline — this never touches stock or the DB
+and answers "wrong bot vs. empty/tampered initData" definitively.
+
+**Grab the raw string** from the buyer's client: in the open Mini App, run
+`Telegram.WebApp.initData` in the devtools console (desktop Telegram → right-
+click → Inspect), or read it from the server log line — `api_order` logs
+`initData_len=…` but never the value itself. It looks like
+`user=%7B…%7D&chat_instance=…&auth_date=1700000000&hash=abcd…`.
+
+**Reproduce the exact server check** (`validate_webapp_init_data`,
+`vendor_stores.py:263`). Run each candidate token — primary + every
+`extra_tokens`/alias — through it:
+
+```python
+import hmac, hashlib
+from urllib.parse import parse_qsl
+
+def check(init_data: str, bot_token: str) -> bool:
+    pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+    got = pairs.pop("hash", "")
+    dcs = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+    exp = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(exp, got)
+```
+
+- `True` for some token → that bot signed it. If the server still says
+  `bad_hash`, that token isn't in the shop's set → add it to `extra_tokens`.
+- `True` for **none** → the string is empty, truncated, or re-encoded (the
+  trailing-slash gotcha strips the fragment on iOS; a copy/paste can mangle the
+  `%`-encoding). `hash` matching but `auth_date` old is a separate `expired`, not
+  `bad_hash`.
+- Use the **exact** query string — do not re-URL-decode `user`; the check is
+  over the raw `k=v` pairs, `hash` excluded, sorted lexicographically.
+
 ---
 
 ## Multi-bot signing: `extra_tokens` / `UNICORN_EXTRA_BOT_TOKENS`
@@ -182,8 +220,17 @@ On Unicorn boot, `run_cloud.py:153` calls
 ```
 
 - **Idempotent by `method_type`**: `ensure_shop_payments`
-  (`webpanel.py:1429`) only inserts a type that isn't already present. An
-  existing Venmo/PayPal row (even edited by the vendor) is **left alone**.
+  (`webpanel.py:1429`) only inserts a type that isn't already present. It reads
+  the shop's rows with `active_only=False` (`webpanel.py:1437`), so a row of that
+  type blocks a re-seed **even when it is paused/inactive**. An existing
+  Venmo/PayPal row (edited or paused by the vendor) is **left alone**.
+- **The delete-then-reboot trap.** Because the seed keys off "type present at
+  all," **deleting** a seeded Venmo/PayPal row (`🗑` in the wizard, or a panel
+  delete) means it is **absent** on the next boot and gets **re-created** with
+  the `run_cloud.py:155` default handle. To make a default go away and *stay*
+  gone, **pause it** (`⏸`, sets `active=0`) instead of deleting — the paused row
+  still counts as present and is never shown to buyers. Deleting only sticks if
+  you also drop it from the `run_cloud.py:155` list (a redeploy).
 - To change the seeded defaults, edit the list at `run_cloud.py:155`. To add a
   brand-new rail permanently, prefer the Telegram/panel path below so you don't
   redeploy for a handle change.
@@ -217,8 +264,56 @@ If `PANEL_BASE_URL` is set, `/webpanel` issues a 3-day admin link
 `payment_templates.render_from_fields` (`payment_templates.py:228`) and
 `db.add_payment_from_template`. Fields accepted: `method_type`, `handle`,
 `address`, `chain`, `network_note`, `cashtag`, `name`, `instructions`.
+
+**Which field each `method_type` actually reads** (`render_from_fields`,
+`payment_templates.py:240`) — send the primary field; the rest are ignored:
+
+| `method_type` | Primary field(s) | Notes |
+|---------------|------------------|-------|
+| `cashapp`     | `cashtag` (or `handle`) | `$` auto-prepended |
+| `venmo`       | `handle` (or `cashtag`) | `@` auto-prepended |
+| `paypal`      | `handle` (or `address`) | `network_note` sets the label (see below) |
+| `zelle`       | `handle` (or `address`) | email **or** phone |
+| `apple_cash`  | `handle` (or `address`) | phone number |
+| `crypto`      | `chain` (coin) + `address` | `network_note` shown as "Network: …" |
+| `custom`      | `instructions` + `name`    | free text, rendered verbatim |
+
 `network_note = "friends_family"` (default) vs `"goods_services"` controls the
-PayPal label (`payment_templates.py:142`).
+PayPal label (`payment_templates.py:142`); for PayPal it accepts the fuzzy
+truthy set `ff/friends/1/true/yes/""` → friends & family
+(`payment_templates.py:246`). For crypto it is a free-text network hint.
+
+All payment writes go to **one** endpoint: `POST /panel/api/payment`
+(`api_payment`, `webpanel.py:1363`; routed from `spbc_notify` /panel*). Auth is
+the magic-link token in the query string (`?t=<issued token>`) — the handler
+derives `chat_id` from the token, so a link only ever edits its own shop.
+
+**Add / update / delete on the one endpoint:**
+- **Add** — POST with **no `id`** and a `name` (`webpanel.py:1385`). Structured
+  types are validated: `crypto` needs an `address`; `venmo/paypal/zelle/
+  apple_cash/cashapp` need a `handle`/`cashtag` (`webpanel.py:1390`), else `400`.
+- **Update** — POST with an existing `id`; it updates in place. A partial update
+  carrying only `name`/`instructions`/`active` (no structured fields) is allowed
+  and will **not** wipe the stored `handle`/`address` (`webpanel.py:1411`) — use
+  it to just rename or pause a row. Set `active` to `0`/`1` to pause/enable;
+  buyers only ever see `active = 1` rows.
+- **Delete** — POST `{"id": <id>, "delete": true}` (`webpanel.py:1375`). An `id`
+  from another shop returns `404` (`webpanel.py:1372`). Remember the
+  delete-then-reboot trap above: for seeded types, **pause instead of delete**.
+
+**Reorder the pay screen** by setting `sort_order` — the buyer list is
+`ORDER BY sort_order, name` (`db.py:2025`). Lower `sort_order` shows first; ties
+break alphabetically by `name`.
+
+Example — add a Cash App rail without a redeploy (`$T` = the `t=` token from the
+`/webpanel` admin link):
+
+```bash
+curl -sS -X POST "https://unicornfartzz-bot.onrender.com/panel/api/payment?t=$T" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Cash App","method_type":"cashapp","cashtag":"unicornfartzz","active":1}'
+# → {"ok": true, "id": <n>, "created": true}
+```
 
 ### Verify the buyer will see them
 
@@ -250,6 +345,8 @@ method (any path above). Do **not** reset the DB to "fix" an empty pay screen.
 - Keep every Menu Button / `store_url` trailing-slashed (`…/unicorn/`).
 - Bump `STORE_URL_CACHE_BUST` after a Pages checkout-JS deploy.
 - Seed ≥1 active payment method per selling shop.
+- **Pause** (`⏸`) a seeded payment default you don't want, rather than deleting
+  it — a deleted seeded type is re-created on the next boot.
 - Read the `POST /order` log line before changing config.
 
 **Don't**
@@ -275,7 +372,10 @@ method (any path above). Do **not** reset the DB to "fix" an empty pay screen.
 | Trailing-slash normalize | `vendor_stores.py:84` |
 | Cache-bust store URL | `vendor_stores.py:104` |
 | Payment templates | `payment_templates.py` |
+| Field → template routing | `payment_templates.py:228` |
 | Idempotent payment seed | `webpanel.py:1429` |
 | Unicorn boot payment seed | `run_cloud.py:153` |
+| Panel payment write API (add/update/delete) | `webpanel.py:1363` |
+| Buyer-visible list (active-only, sorted) | `db.py:2025` |
 | Telegram payments menu | `bot.py:5418` |
 | `payments` in storefront/order JSON | `vendor_stores.py:433` |
