@@ -498,24 +498,61 @@ def shop_display(shop: dict | None) -> dict[str, Any]:
     min_qty = shop.get("min_order_qty")
     if min_qty is None:
         min_qty = DEFAULT_MIN_ORDER_QTY
-    label = (shop.get("min_order_label") or DEFAULT_MIN_ORDER_LABEL or "vial").strip()
+    try:
+        from catalog_cleanup import sanitize_multiline, storefront_label
+
+        title = storefront_label(shop.get("title") or "Shop", 80) or "Shop"
+        brand = storefront_label(shop.get("brand_name") or BRAND_NAME, 80) or BRAND_NAME
+        welcome = (
+            sanitize_multiline(shop.get("welcome_text") or WELCOME_TEXT, 500)
+            or WELCOME_TEXT
+        )
+        label = (
+            storefront_label(
+                shop.get("min_order_label") or DEFAULT_MIN_ORDER_LABEL or "vial",
+                40,
+            )
+            or "vial"
+        )
+        currency = storefront_label(shop.get("currency") or CURRENCY, 8) or CURRENCY
+        symbol = (
+            storefront_label(shop.get("currency_symbol") or CURRENCY_SYMBOL, 8)
+            or CURRENCY_SYMBOL
+        )
+        ship_label = (
+            storefront_label(shop.get("shipping_label") or "Standard shipping", 40)
+            or "Standard shipping"
+        )
+    except Exception:
+        title = shop.get("title") or "Shop"
+        brand = (shop.get("brand_name") or BRAND_NAME).strip() or BRAND_NAME
+        welcome = (shop.get("welcome_text") or WELCOME_TEXT).strip() or WELCOME_TEXT
+        label = (shop.get("min_order_label") or DEFAULT_MIN_ORDER_LABEL or "vial").strip()
+        currency = (shop.get("currency") or CURRENCY).strip() or CURRENCY
+        symbol = (shop.get("currency_symbol") or CURRENCY_SYMBOL).strip() or CURRENCY_SYMBOL
+        ship_label = (shop.get("shipping_label") or "Standard shipping").strip()
     return {
-        "brand_name": (shop.get("brand_name") or BRAND_NAME).strip() or BRAND_NAME,
-        "currency": (shop.get("currency") or CURRENCY).strip() or CURRENCY,
-        "currency_symbol": (shop.get("currency_symbol") or CURRENCY_SYMBOL).strip()
-        or CURRENCY_SYMBOL,
-        "welcome_text": (shop.get("welcome_text") or WELCOME_TEXT).strip() or WELCOME_TEXT,
+        "brand_name": brand,
+        "currency": currency,
+        "currency_symbol": symbol,
+        "welcome_text": welcome,
         "low_stock_threshold": int(threshold),
         "min_order_qty": max(0, int(min_qty or 0)),
         "min_order_label": label or "vial",
-        "title": shop.get("title") or "Shop",
+        "shipping_label": ship_label or "Standard shipping",
+        "title": title,
     }
 
 
 def format_min_order_rule(qty: int, label: str = "vial") -> str:
     """Human line e.g. '2 vial minimum' / '1 kit minimum'."""
     q = max(0, int(qty or 0))
-    unit = (label or "vial").strip() or "vial"
+    try:
+        from catalog_cleanup import storefront_label
+
+        unit = storefront_label(label or "vial", 40) or "vial"
+    except Exception:
+        unit = (label or "vial").strip() or "vial"
     if q <= 0:
         return "No minimum"
     if q == 1:
@@ -817,6 +854,14 @@ def update_shop(chat_id: int, **fields: Any) -> None:
                     )
                 except Exception:
                     v = " ".join(v.split())[:80]
+            elif k in ("currency", "currency_symbol") and isinstance(v, str):
+                try:
+                    from catalog_cleanup import storefront_label
+
+                    fallback = CURRENCY if k == "currency" else CURRENCY_SYMBOL
+                    v = storefront_label(v, 8) or fallback
+                except Exception:
+                    v = " ".join(v.split())[:8]
             cols.append(f"{k} = ?")
             vals.append(v)
     if not cols:
@@ -836,8 +881,14 @@ def rename_shop(
     if by_user is not None and not is_admin(chat_id, by_user):
         return False, "Admin only."
     title = (new_title or "").strip()
-    # Strip accidental newlines / markdown bombs
-    title = " ".join(title.split())
+    # Strip accidental newlines / markdown bombs; same sanitizer as storefront.
+    # Do not clip here — over-length titles are rejected, not silently trimmed.
+    try:
+        from catalog_cleanup import sanitize_catalog_text
+
+        title = sanitize_catalog_text(title)
+    except Exception:
+        title = " ".join(title.split())
     if not title:
         return False, "Title cannot be empty."
     if len(title) > max_len:
@@ -846,7 +897,8 @@ def rename_shop(
     if not shop:
         return False, "Shop not found."
     update_shop(chat_id, title=title)
-    return True, title
+    fresh = get_shop(chat_id) or {}
+    return True, str(fresh.get("title") or title)
 
 
 def ensure_shop_transfer_tables() -> None:
@@ -1309,7 +1361,12 @@ def set_min_order(
         return False, "Quantity too high (max 100)."
     fields: dict[str, Any] = {"min_order_qty": q}
     if label is not None:
-        lab = " ".join(str(label).strip().split())
+        try:
+            from catalog_cleanup import storefront_label
+
+            lab = storefront_label(label, 20)
+        except Exception:
+            lab = " ".join(str(label).strip().split())
         if not lab:
             return False, "Label cannot be empty."
         if len(lab) > 20:
@@ -3098,16 +3155,50 @@ def format_product_line(p: dict, symbol: str = CURRENCY_SYMBOL) -> str:
 
 
 def format_order_summary(order: dict, items: list[dict], symbol: str = CURRENCY_SYMBOL) -> str:
+    try:
+        from catalog_cleanup import (
+            display_product_name,
+            sanitize_multiline,
+            storefront_label,
+        )
+
+        def _lab(value: object, cap: int) -> str:
+            return storefront_label(value, cap) or ""
+
+        full = _lab(order.get("full_name"), 80) or "—"
+        uname = _lab(order.get("username"), 40) or "n/a"
+        pay_name = _lab(order.get("payment_method_name"), 60) or "—"
+        ship_name = _lab(order.get("ship_name"), 80) or "—"
+        ship_addr = sanitize_multiline(order.get("ship_address"), 200) or "—"
+        ship_notes = sanitize_multiline(order.get("ship_notes"), 200)
+        track = _lab(order.get("tracking_number"), 80)
+        car = _lab(order.get("tracking_carrier"), 40)
+        code = _lab(order.get("payment_code"), 32)
+    except Exception:
+        def _item_name(raw: object) -> str:
+            return str(raw or "")
+
+        display_product_name = _item_name  # type: ignore[assignment]
+        full = order.get("full_name") or "—"
+        uname = order.get("username") or "n/a"
+        pay_name = order.get("payment_method_name") or "—"
+        ship_name = order.get("ship_name") or "—"
+        ship_addr = order.get("ship_address") or "—"
+        ship_notes = (order.get("ship_notes") or "").strip()
+        track = (order.get("tracking_number") or "").strip()
+        car = (order.get("tracking_carrier") or "").strip()
+        code = (order.get("payment_code") or "").strip()
     lines = [
         f"*Order #{order['id']}* — `{order['status']}`",
-        f"Customer: {order.get('full_name') or '—'} (@{order.get('username') or 'n/a'})",
+        f"Customer: {full} (@{uname})",
         f"User ID: `{order['user_id']}`",
         "",
         "*Items:*",
     ]
     for it in items:
+        shown = display_product_name(str(it.get("product_name") or ""))
         lines.append(
-            f"• {it['product_name']} × {it['quantity']} "
+            f"• {shown} × {it['quantity']} "
             f"= {money(float(it['line_total']), symbol)}"
         )
     lines += [
@@ -3115,23 +3206,20 @@ def format_order_summary(order: dict, items: list[dict], symbol: str = CURRENCY_
         f"Subtotal: {money(float(order['subtotal']), symbol)}",
         f"Shipping: {money(float(order['shipping_fee']), symbol)}",
         f"*Total: {money(float(order['total']), symbol)}*",
-        f"Payment: {order.get('payment_method_name') or '—'}",
+        f"Payment: {pay_name}",
     ]
-    code = (order.get("payment_code") or "").strip()
     if code:
         lines.append(f"*Payment code (memo):* `{code}`")
     if order.get("payment_proof_file_id"):
         lines.append("Payment proof: ✅ screenshot on file")
     lines += [
         "",
-        f"*Ship to:* {order.get('ship_name') or '—'}",
-        order.get("ship_address") or "—",
+        f"*Ship to:* {ship_name}",
+        ship_addr,
     ]
-    if order.get("ship_notes"):
-        lines.append(f"Notes: {order['ship_notes']}")
-    track = (order.get("tracking_number") or "").strip()
+    if ship_notes:
+        lines.append(f"Notes: {ship_notes}")
     if track:
-        car = (order.get("tracking_carrier") or "").strip()
         track_line = f"*Tracking:* `{track}`"
         if car:
             track_line += f" ({car})"

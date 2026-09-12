@@ -990,6 +990,10 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
             "shipping_enabled": int(shop.get("shipping_enabled") or 0),
             "shipping_fee": float(shop.get("shipping_fee") or 0),
             "free_shipping_above": float(shop.get("free_shipping_above") or 0),
+            "shipping_label": _buyer_field(
+                shop.get("shipping_label") or "Standard shipping", 40
+            )
+            or "Standard shipping",
             "shipping_zones": _buyer_zones(db.parse_shipping_zones(shop)),
         },
         "products": [
@@ -1077,6 +1081,11 @@ def api_order_status(raw_key: str, payment_code: str) -> tuple[int, dict]:
         "created_at": order.get("created_at") or "",
         "tracking_number": _buyer_field(order.get("tracking_number"), 80) or "",
         "tracking_carrier": _buyer_field(order.get("tracking_carrier"), 40) or "",
+        "tracking_url": tracking_url(
+            _buyer_field(order.get("tracking_carrier"), 40),
+            _buyer_field(order.get("tracking_number"), 80),
+        )
+        or "",
         "ship_name": _buyer_field(order.get("ship_name"), 80) or "",
         "ship_address": _buyer_field(order.get("ship_address"), 200) or "",
         "payments": [p.get("line") for p in pay_objs],
@@ -1123,10 +1132,12 @@ def _product_public(p: dict) -> dict:
     shown = _buyer_product_name(p)
     stored = str(p.get("name") or "")
     unit = _optional_text(p.get("unit") or "vial", 20) or "vial"
+    desc = _optional_text(p.get("description"), 500) or ""
     return {
         "id": p["id"],
         "name": p["name"],
         "display_name": shown,
+        "description": desc,
         "name_needs_clean": bool(shown and stored and shown != stored),
         "price": p["price"],
         "kit_price": p.get("kit_price"),
@@ -1168,10 +1179,15 @@ def api_state(tok: dict) -> tuple[int, dict]:
             "chat_id": chat_id,
             "title": _buyer_field(shop.get("title"), 80) or "Shop",
             "welcome_text": welcome or "",
-            "currency_symbol": "$",
+            "brand_name": _buyer_field(shop.get("brand_name"), 80) or "",
+            "currency_symbol": _buyer_field(shop.get("currency_symbol") or "$", 8)
+            or "$",
             "shipping_enabled": int(shop.get("shipping_enabled") or 0),
             "shipping_fee": float(shop.get("shipping_fee") or 0),
             "free_shipping_above": float(shop.get("free_shipping_above") or 0),
+            "shipping_label": _buyer_field(shop.get("shipping_label"), 40) or "",
+            "min_order_label": _buyer_field(shop.get("min_order_label"), 40)
+            or "vial",
             "shipping_zones": _buyer_zones(db.parse_shipping_zones(shop)),
             "is_unicorn": _shop_is_unicorn(chat_id, shop.get("title")),
             "checkout_ready": checkout_ready,

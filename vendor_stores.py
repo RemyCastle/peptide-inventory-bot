@@ -856,7 +856,17 @@ def shop_checkout_ready(shop_chat_id: int) -> bool:
 def _payment_method_html(p: dict, total: float, code: str) -> str:
     """One payment method as Telegram-HTML lines with tap-to-copy target."""
     mt, target = _method_kind_and_target(p)
-    lines = [f"• <b>{_h(p.get('name') or 'Payment')}</b>"]
+    try:
+        from catalog_cleanup import sanitize_catalog_text, storefront_label
+
+        name = storefront_label(p.get("name") or "Payment", 60) or "Payment"
+        net = storefront_label(p.get("network_note") or "", 80)
+        instr = sanitize_catalog_text(p.get("instructions") or "")
+    except Exception:
+        name = str(p.get("name") or "Payment")[:60] or "Payment"
+        net = " ".join(str(p.get("network_note") or "").split())[:80]
+        instr = " ".join(str(p.get("instructions") or "").split())
+    lines = [f"• <b>{_h(name)}</b>"]
     if target:
         lines[0] += f" — send to <code>{_h(target)}</code>"
     if mt == "paypal":
@@ -866,12 +876,11 @@ def _payment_method_html(p: dict, total: float, code: str) -> str:
             else "   Send as <b>Goods &amp; Services</b>"
         )
     elif mt == "crypto":
-        if p.get("network_note"):
-            lines.append(f"   Network: {_h(p['network_note'])}")
+        if net:
+            lines.append(f"   Network: {_h(net)}")
         lines.append("   ⚠️ Double-check the network before sending.")
     elif not target:
-        # custom / free-text method: show its instructions verbatim (escaped)
-        instr = (p.get("instructions") or "").strip()
+        # custom / free-text method: show its instructions (escaped + sanitized)
         if instr:
             lines.append(f"   {_h(instr)}")
     link = payment_pay_link(p, total, code)

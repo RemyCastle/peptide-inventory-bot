@@ -9,8 +9,14 @@ import db
 
 
 def _shop_title(shop: dict | None, shop_id: int) -> str:
-    if shop and shop.get("title"):
-        return str(shop["title"])
+    raw = (shop or {}).get("title")
+    if raw:
+        try:
+            from catalog_cleanup import storefront_label
+
+            return storefront_label(raw, 80) or f"Shop {shop_id}"
+        except Exception:
+            return str(raw)
     return f"Shop {shop_id}"
 
 
@@ -48,7 +54,12 @@ def generate_inventory_report(shop_id: int) -> str:
             flag = "LOW" if stock > 0 else "OUT"
         if not p.get("active"):
             flag = (flag + " INACTIVE").strip()
-        name = str(p.get("name") or "")[:28]
+        try:
+            from catalog_cleanup import display_product_name
+
+            name = display_product_name(str(p.get("name") or ""))[:28]
+        except Exception:
+            name = str(p.get("name") or "")[:28]
         price = float(p.get("price") or 0)
         lines.append(
             f"{int(p['id']):>5}  {name:<28}  {sym}{price:>8.2f}  {stock:>6}  {flag} [{active}]"

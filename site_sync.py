@@ -166,9 +166,22 @@ def _norm(name: str) -> str:
     return " ".join(str(name).split()).lower()
 
 
+def _clean_feed_text(value: object, *, cap: int | None = None) -> str:
+    """Feed strings go through the same sanitizer as catalog writes."""
+    raw = str(value or "")
+    try:
+        from catalog_cleanup import sanitize_catalog_text, storefront_label
+
+        if cap is not None:
+            return storefront_label(raw, cap)
+        return sanitize_catalog_text(raw)
+    except Exception:
+        return " ".join(raw.split())
+
+
 def _spbc_fields(p: dict) -> dict:
     """SPBC shape → bot product fields (stock stays bot-managed)."""
-    name = " ".join(str(p["name"]).split())
+    name = _clean_feed_text(p["name"])
     vial = p.get("vial_price")
     pack = p.get("pack_price")
     kit_only = bool(p.get("kit_only"))
@@ -197,7 +210,7 @@ def _spbc_fields(p: dict) -> dict:
 
 def _generic_fields(p: dict) -> dict | None:
     """Generic shape → bot product fields (stock followed when provided)."""
-    name = " ".join(str(p["name"]).split())
+    name = _clean_feed_text(p["name"])
     try:
         price = float(p["price"])
     except (TypeError, ValueError, KeyError):
@@ -219,8 +232,8 @@ def _generic_fields(p: dict) -> dict | None:
         "name": name,
         "price": price,
         "kit_price": kit_price,
-        "unit": (str(p.get("unit") or "vial").strip() or "vial")[:20],
-        "description": str(p.get("description") or "").strip()[:500],
+        "unit": _clean_feed_text(p.get("unit") or "vial", cap=20) or "vial",
+        "description": _clean_feed_text(p.get("description") or "")[:500],
         "active": 1 if p.get("active", True) else 0,
         "sort_order": int(p.get("sort_order") or 0),
         "stock": stock,

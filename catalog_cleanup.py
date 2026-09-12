@@ -20,6 +20,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from urllib.parse import unquote_to_bytes
 
 import db
 
@@ -68,6 +69,18 @@ _CRLF_PCT = re.compile(r"%0[0da]|%00", re.IGNORECASE)
 # NUL is stripped by storefront_label (dirty catalog) and is not a break.
 _UNSAFE_URL_RAW = re.compile(
     r"[\x09\x0a\x0b\x0c\x0d\x7f\u2028\u2029]|%(?:0[0-9a-fA-F]|1[0-9a-fA-F]|7[fF])"
+)
+# Invisible "blank" glyphs that are not Cf/Cc (so they survived prior passes).
+# U+115F/U+1160 are the NFKC forms of Hangul fillers — drop those too.
+_INVISIBLE_FILLERS = frozenset(
+    {
+        "\uFFFC",  # object replacement
+        "\u2800",  # braille blank
+        "\u3164",  # hangul filler
+        "\uFFA0",  # halfwidth hangul filler (NFKC → U+3164 → U+1160)
+        "\u115F",  # hangul choseong filler
+        "\u1160",  # hangul jungseong filler
+    }
 )
 
 
@@ -146,7 +159,7 @@ def _drop_controls(text: str, *, keep_newlines: bool = False) -> str:
         if keep_newlines and ch in "\r\n":
             out.append(ch)
             continue
-        if _is_noncharacter(ch):
+        if _is_noncharacter(ch) or ch in _INVISIBLE_FILLERS:
             continue
         cat = unicodedata.category(ch)
         if cat in ("Zl", "Zp"):
@@ -384,18 +397,58 @@ def storefront_label(text: str | None, max_len: int | None = None) -> str:
     return s
 
 
+def _percent_payload_unsafe(text: str) -> bool:
+    """True when percent-decoding yields C0/Cf/bidi/line-sep/nonchars/invalid UTF-8.
+
+    Loops a few times so `%2500` (double-encoded NUL) cannot sneak through.
+    `%20` spaces and emoji code points stay allowed.
+    """
+    s = str(text or "")
+    if not s:
+        return False
+    for _ in range(3):
+        try:
+            raw_b = unquote_to_bytes(s)
+        except Exception:
+            return True
+        if any(b < 0x20 or b == 0x7F for b in raw_b):
+            return True
+        try:
+            decoded = raw_b.decode("utf-8")
+        except UnicodeDecodeError:
+            return True
+        for ch in decoded:
+            if _is_noncharacter(ch) or ch in _INVISIBLE_FILLERS:
+                return True
+            cat = unicodedata.category(ch)
+            if cat in ("Zl", "Zp", "Cs", "Co"):
+                return True
+            if cat[0] == "C" and ch not in _KEEP_CF:
+                return True
+        if decoded == s:
+            return False
+        s = decoded
+    return False
+
+
 def public_http_url(value: str | None, max_len: int = 500) -> str:
     """Buyer-facing http(s) URL. Glyph junk stripped; non-http dropped.
 
     Rejects raw C0 / line-sep / percent-encoded C0 so stripping controls
     cannot glue `https://x.com/a\\nSet-Cookie` into a still-http URL.
-    Userinfo (`user:pass@host`) is also refused.
+    Userinfo (`user:pass@host`) is also refused. Percent-decoded bidi /
+    line-sep / overlong UTF-8 (`%E2%80%AE`, `%C0%80`, `%2500`) fail closed.
     """
     raw = str(value or "")
     if _UNSAFE_URL_RAW.search(raw):
         return ""
     s = storefront_label(value, max_len)
-    if not s or _CRLF_PCT.search(s) or _UNSAFE_URL_RAW.search(s):
+    if (
+        not s
+        or _CRLF_PCT.search(s)
+        or _UNSAFE_URL_RAW.search(s)
+        or _percent_payload_unsafe(s)
+    ):
         return ""
     low = s.lower()
     if low.startswith("https://"):

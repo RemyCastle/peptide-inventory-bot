@@ -457,6 +457,61 @@ class GlyphRepairTests(unittest.TestCase):
         self.assertTrue(label.startswith("🦄"))
         label.encode("utf-16-le")
 
+    def test_invisible_fillers_dropped(self) -> None:
+        raw = "A\uFFFCB\u2800C\u3164D\uFFA0E"
+        out = cc.sanitize_catalog_text(raw)
+        self.assertEqual(out, "ABCDE")
+        self.assertNotIn("\uFFFC", out)
+        self.assertNotIn("\u2800", out)
+        self.assertNotIn("\u3164", out)
+        self.assertNotIn("\uFFA0", out)
+        welcome = cc.display_shop_text("Hi\u2800 there")
+        self.assertEqual(welcome, "Hi there")
+        self.assertEqual(cc.sanitize_catalog_text("A\u1160B"), "AB")
+
+    def test_pirate_flag_and_profession_zwj_kept(self) -> None:
+        pirate = "🏴\u200d☠️"
+        coder = "👩\u200d💻"
+        self.assertEqual(cc.sanitize_catalog_text(pirate), pirate)
+        self.assertEqual(cc.sanitize_catalog_text(coder), coder)
+        self.assertIn("\u200d", cc.sanitize_catalog_text(pirate + "\u0000"))
+        clipped = cc.clip_label(pirate + " West", 64)
+        self.assertTrue(clipped.startswith(pirate))
+        clipped.encode("utf-16-le")
+
+    def test_bidi_isolates_dropped(self) -> None:
+        raw = "AB\u2066CD\u2069EF"
+        out = cc.sanitize_catalog_text(raw)
+        self.assertEqual(out, "ABCDEF")
+        self.assertNotIn("\u2066", out)
+        self.assertNotIn("\u2069", out)
+
+    def test_public_http_url_rejects_percent_decoded_controls(self) -> None:
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/ok%E2%80%A8x"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/ok%E2%80%AEx"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/ok%2500.jpg"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/ok%C0%80.jpg"),
+            "",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/p%20.png"),
+            "https://cdn.example.com/p%20.png",
+        )
+        self.assertEqual(
+            cc.public_http_url("https://cdn.example.com/%F0%9F%A6%8C.png"),
+            "https://cdn.example.com/%F0%9F%A6%8C.png",
+        )
+
 
 class CleanupApplyTests(unittest.TestCase):
     def setUp(self) -> None:

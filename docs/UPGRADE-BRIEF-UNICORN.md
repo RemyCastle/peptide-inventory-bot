@@ -1,16 +1,16 @@
-# SHIP BRIEF — Unicorn PayPal/Apple Cash quick-add + refuse empty typed saves
+# SHIP BRIEF — MEGA-UNICORN v2 storefront label sanitizer audit
 
 Product: peptide (unicorn)  
 Repo: `C:\Users\Remy\peptide_inventory_bot`  
 Prod: https://unicornfartzz-bot.onrender.com  
 Priority: P1  
 Ship agent: grok  
-AUTOPUSH: this ship (Telegram ➕ PayPal / Apple Cash actually start
-the handle prompt; enabled typed rails cannot save without a handle;
-no stock change)
+AUTOPUSH: this ship (glyph repair coverage + leftover buyer fields;
+no stock change; never wipe inventory.db)
 
-Goal: Admin Payments quick-add for PayPal and Apple Cash works, and
-an enabled typed method cannot be saved empty; never wipe inventory.
+Goal: Storefront labels stay clean: invisible fillers drop, percent-decoded
+URL controls fail closed, leftover branding/order/report fields sanitize
+on read; never wipe inventory.
 
 Context (already verified — do not rediscover):
 
@@ -27,6 +27,8 @@ Context (already verified — do not rediscover):
 - Sanitizer harden live on `2340351` (live `/health` sha `2340351`, `payments.active` = 2)
 - Empty-handle rails live on `8829dfb` (`payments.usable` = 2)
 - PayPal/Apple Cash quick-add + refuse empty typed saves live on `3663272`
+- Sanitizer audit (this ship): invisible fillers, percent-decoded URL
+  controls, leftover branding/order/report fields
 
 ## Prior ships
 
@@ -79,41 +81,40 @@ typed methods with no handle do not count as a pay rail; `POST /order`
 
 ## This ship
 
-**PayPal / Apple Cash Telegram quick-add actually runs, and enabled
-typed rails cannot be saved empty.** The 16c6547 buttons existed, but
-ConversationHandler only matched cashapp/venmo/crypto/zelle/custom, so
-➕ PayPal and ➕ Apple Cash did nothing. Empty-handle checkout_ready
-already ignored those rows; this ship stops creating them from admin.
+**Storefront label sanitizer audit — glyph coverage + leftover fields.**
+Prior pass (`2340351`) dropped line-sep/private-use and rejected URL
+breaks/userinfo. Leftover: invisible blanks (object replacement, braille
+blank, Hangul fillers), percent-decoded bidi/line-sep/`%2500`/`%C0%80`
+in http URLs, and buyer/admin strings that still read dirty DB rows
+(`shop_display`, Telegram order summary, payment HTML, reports, shipping
+label, tracking URL, site-sync feed).
 
-- `PAY_TPL_CALLBACK_RE` is built from `payment_templates.METHOD_TYPES`
-  (includes `paypal` + `apple_cash`).
-- Telegram template flow re-prompts instead of inserting an empty
-  Venmo/PayPal/Cash App/crypto row. Freeform custom needs a short
-  instruction.
-- `POST /panel/api/payment` 400 when an **enabled** typed method has
-  no handle (pause still allowed). Empty custom create still drafts.
-- Panel Save toasts before the request if enabled + no handle.
-- Seeded Unicorn Venmo + PayPal still pass. `STORE_URL_CACHE_BUST`
-  stays `20260913`. No Pages JS.
+- `_drop_controls` removes U+FFFC / U+2800 / Hangul fillers (incl. NFKC
+  U+115F/U+1160). Pirate flag + profession ZWJ stay.
+- `public_http_url` percent-decodes a few times and fails closed on C0 /
+  Cf / line-sep / invalid UTF-8. Raw NUL still strips to a valid https
+  URL. `%20` and emoji percents stay.
+- Read-path sanitizer: `shop_display`, `format_order_summary`,
+  `_payment_method_html`, reports titles/names, `/storefront`
+  `shipping_label`, `/order-status` `tracking_url`, admin brand /
+  description, currency write, site-sync feed text.
+- `STORE_URL_CACHE_BUST` stays `20260913`. No Pages JS. No DELETE.
 
 ## Acceptance (this ship)
 
-- [x] `python -m pytest -q -x` green on scratch DBs (672 passed)
+- [x] `python -m pytest -q -x` green on scratch DBs (685 passed)
 - [x] Docker COPY check still lists every imported module (26)
 - [x] No writes to laptop `inventory.db`; no DELETE of products
-- [x] `paytpl:paypal` and `paytpl:apple_cash` match the conversation
-      entry regex (every `METHOD_TYPES` value does)
-- [x] Empty enabled Venmo update 400; pause-with-empty 200; empty
-      PayPal create 400; empty custom create still 200
-- [x] Seeded Unicorn shop still `checkout_ready`; health `usable` ≥ 1
-- [x] Live `/health` sha `3663272`, `payments.active` = 2,
-      `payments.usable` = 2, `checkout_ready: true`,
-      `store_url_cache_bust` `20260913`
+- [x] Invisible fillers drop; pirate flag / profession ZWJ kept
+- [x] `public_http_url` rejects `%E2%80%A8` / `%E2%80%AE` / `%2500` /
+      `%C0%80`; keeps `%20` and emoji percents; NUL-in-path still repairs
+- [x] Dirty `shop_display` / order summary / reports / payment HTML /
+      shipping label / tracking URL / site-sync feed come out clean
 - [x] No secrets / `.env` / scratch import files committed
 
-Prior `8829dfb` / `991eb64` / `6c3d68b` / `bef4d5f` checks stay true:
-usable rails only, Confirm + Cancel URL buttons, `/confirm` Add
-tracking, `can_mark_paid`, Pages I've paid, buyer claim DM.
+Prior `3663272` / `8829dfb` / `991eb64` / `2340351` checks stay true:
+PayPal/Apple Cash quick-add, usable rails only, Confirm + Cancel URL
+buttons, line-sep/userinfo URL reject, `can_mark_paid`.
 
 ## Out of scope
 

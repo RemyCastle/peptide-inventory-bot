@@ -829,6 +829,222 @@ class StorefrontGapTests(unittest.TestCase):
         self.assertNotEqual(order.get("payment_method_name"), "Venmo\u0000")
         self.assertNotIn("\ufffd", str(order.get("payment_method_name") or ""))
 
+    def test_storefront_shipping_label_sanitized(self) -> None:
+        db.update_shop(SHOP, shipping_label="2-day\u0000\ufffd")
+        code, body = webpanel.api_storefront(self.sf_key)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["shop"]["shipping_label"], "2-day")
+        self.assertNotIn("\ufffd", body["shop"]["shipping_label"])
+
+    def test_order_status_tracking_url_sanitized(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        db.add_payment_method(SHOP, "Venmo", "@x")
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer",
+            "Buyer",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "SEMA 10MG",
+                    "unit_price": 10.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo"},
+            "Buyer",
+            "1 St",
+            "",
+        )
+        self.assertTrue(db.set_order_tracking(order["id"], "1Z\u0000999\ufffd", "UPS\u200b"))
+        code, body = webpanel.api_order_status(self.sf_key, order["payment_code"])
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["tracking_number"], "1Z999")
+        self.assertEqual(body["tracking_carrier"], "UPS")
+        url = body.get("tracking_url") or ""
+        self.assertIn("ups.com", url.lower())
+        self.assertIn("1Z999", url)
+        self.assertNotIn("\ufffd", url)
+        self.assertNotIn("%00", url)
+        self.assertTrue(url.startswith("https://"))
+
+    def test_shop_display_read_strips_junk(self) -> None:
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE shops SET title = ?, brand_name = ?, welcome_text = ?, "
+                "min_order_label = ?, shipping_label = ?, currency_symbol = ? "
+                "WHERE chat_id = ?",
+                (
+                    "Unicorn\u0000 Magic\ufffd",
+                    "Brand\u200b",
+                    _mojibake("🦄 Hi\nthere") + "\u0000",
+                    "vial\ufffd",
+                    "2-day\u2800",
+                    "$\u0000",
+                    SHOP,
+                ),
+            )
+        display = db.shop_display(db.get_shop(SHOP))
+        self.assertEqual(display["title"], "Unicorn Magic")
+        self.assertEqual(display["brand_name"], "Brand")
+        self.assertIn("🦄", display["welcome_text"])
+        self.assertIn("\n", display["welcome_text"])
+        self.assertEqual(display["min_order_label"], "vial")
+        self.assertEqual(display["shipping_label"], "2-day")
+        self.assertEqual(display["currency_symbol"], "$")
+        self.assertNotIn("\ufffd", display["welcome_text"])
+        self.assertNotIn("\u2800", display["shipping_label"])
+
+    def test_format_order_summary_strips_item_and_ship_junk(self) -> None:
+        pid = db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 3)
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer\u0000",
+            "Buyer\ufffd",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "Aod 5mg (vial) $15.00",
+                    "unit_price": 15.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo\ufffd"},
+            "Buyer\u0000",
+            "1 St\u200b",
+            "Leave\u0000 at door\ufffd",
+        )
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET full_name = ?, username = ?, "
+                "payment_method_name = ?, ship_name = ?, ship_address = ?, "
+                "ship_notes = ?, tracking_number = ?, tracking_carrier = ? "
+                "WHERE id = ?",
+                (
+                    "Buyer\ufffd",
+                    "buyer\u0000",
+                    "Venmo\ufffd",
+                    "Buyer\u0000",
+                    "1 St\u200b",
+                    "Leave\u0000 at door\ufffd",
+                    "1Z\u0000999\ufffd",
+                    "UPS\u200b",
+                    int(order["id"]),
+                ),
+            )
+            conn.execute(
+                "UPDATE order_items SET product_name = ? WHERE order_id = ?",
+                ("Aod 5mg (vial) $15.00\ufffd", int(order["id"])),
+            )
+        dirty = db.get_order(order["id"])
+        summary = db.format_order_summary(dirty, db.get_order_items(order["id"]))
+        item_block = summary.split("*Items:*")[1].split("Subtotal")[0]
+        self.assertIn("Aod 5mg", item_block)
+        self.assertNotIn("(vial)", item_block)
+        self.assertIn("Buyer", summary)
+        self.assertIn("1 St", summary)
+        self.assertIn("Leave at door", summary)
+        self.assertIn("1Z999", summary)
+        self.assertIn("UPS", summary)
+        self.assertNotIn("\ufffd", summary)
+        self.assertNotIn("\u0000", summary)
+
+    def test_admin_state_brand_ship_label_and_description(self) -> None:
+        db.update_shop(
+            SHOP,
+            brand_name="Unicorn\u0000 Magic\ufffd",
+            shipping_label="2-day\u200b",
+            min_order_label="kit\ufffd",
+        )
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE products SET description = ? WHERE id = ?",
+                ("lyo\u0000 10mg\ufffd", pid),
+            )
+        code, state = webpanel.api_state(self.tok)
+        self.assertEqual(code, 200)
+        self.assertEqual(state["shop"]["brand_name"], "Unicorn Magic")
+        self.assertEqual(state["shop"]["shipping_label"], "2-day")
+        self.assertEqual(state["shop"]["min_order_label"], "kit")
+        row = next(p for p in state["products"] if p["id"] == pid)
+        self.assertEqual(row["description"], "lyo 10mg")
+        self.assertNotIn("\ufffd", row["description"])
+
+    def test_payment_html_and_reports_strip_junk(self) -> None:
+        mid = db.add_payment_method(
+            SHOP, "Crypto\ufffd", "send", method_type="crypto"
+        )
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE payment_methods SET name = ?, network_note = ?, "
+                "address = ? WHERE id = ?",
+                ("USDT\u0000\ufffd", "TRC20\u200b", "Txyz", mid),
+            )
+        row = db.get_payment_method(mid)
+        html = vendor_stores._payment_method_html(row, 10.0, "ABC123")
+        self.assertIn("USDT", html)
+        self.assertIn("TRC20", html)
+        self.assertNotIn("\ufffd", html)
+        self.assertNotIn("\u0000", html)
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE shops SET title = ? WHERE chat_id = ?",
+                ("Alpha\u0000 Shop\ufffd", SHOP),
+            )
+        pid = db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 3)
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE products SET name = ? WHERE id = ?",
+                ("Aod 5mg (vial) $15.00\ufffd", pid),
+            )
+        import reports
+
+        blob = reports.generate_inventory_report(SHOP)
+        self.assertIn("Alpha Shop", blob)
+        self.assertIn("Aod 5mg", blob)
+        self.assertNotIn("\ufffd", blob)
+        self.assertNotIn("\u0000", blob)
+
+    def test_currency_write_and_rename_shop_strip_junk(self) -> None:
+        db.update_shop(SHOP, currency="USD\u0000", currency_symbol="$\ufffd")
+        shop = db.get_shop(SHOP)
+        self.assertEqual(shop["currency"], "USD")
+        self.assertEqual(shop["currency_symbol"], "$")
+        ok, title = db.rename_shop(SHOP, "Unicorn\u0000 Magic\ufffd")
+        self.assertTrue(ok)
+        self.assertEqual(title, "Unicorn Magic")
+        self.assertEqual(db.get_shop(SHOP)["title"], "Unicorn Magic")
+
+    def test_storefront_photo_rejects_percent_line_sep(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE products SET photo_file_id = ? WHERE id = ?",
+                ("https://cdn.example.com/p.png%E2%80%A8x", pid),
+            )
+        code, body = webpanel.api_storefront(self.sf_key)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["products"][0]["photo_url"], "")
+
+    def test_site_sync_feed_name_and_description_sanitized(self) -> None:
+        import site_sync
+
+        item = site_sync.normalize_item(
+            {
+                "name": "SEMA\u0000 10MG\ufffd",
+                "price": 60,
+                "unit": "vial\u200b",
+                "description": "lyo\u0000 10mg\ufffd",
+            }
+        )
+        self.assertIsNotNone(item)
+        self.assertEqual(item["name"], "SEMA 10MG")
+        self.assertEqual(item["unit"], "vial")
+        self.assertEqual(item["description"], "lyo 10mg")
+
 
 if __name__ == "__main__":
     unittest.main()
