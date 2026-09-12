@@ -5,10 +5,10 @@ Repo: `C:\Users\Remy\peptide_inventory_bot`
 Prod: https://unicornfartzz-bot.onrender.com  
 Priority: P0  
 Ship agent: grok  
-AUTOPUSH: live on `2054b95` — do not re-push / do not restart Render
+AUTOPUSH: this ship (Pages checkout JS + `STORE_URL_CACHE_BUST=20260912`)
 
-Goal: Buyers always get a `message` on catalog and order lookup, and each
-checkout rail has a `pay_hint` (copy-paste vs tap-to-pay); never wipe inventory.
+Goal: Mini App uses structured `pay_url` / `pay_hint` / `message` (no mockup
+copy, no regex-only pay buttons); never wipe inventory.
 
 Context (already verified — do not rediscover):
 
@@ -50,48 +50,51 @@ PayPal types are missing (web panel same rule).
 
 ## This ship
 
-**None in this repo.** `2054b95` is on `origin/master` and live
-(`/health` `git_sha` `2054b95…`, `payments.active` = 2, storefront
-`checkout_ready: true`, `message` present, `invoices_enabled: false`,
-PayPal+Venmo names only). Do not re-dispatch this brief. Next work is Pages
-(other git remote: use `pay_url` / `pay_hint` / `message`, drop mockup copy)
-or Remy invoice token.
+**Pages checkout JS + cache bust.** Mini App (`miniapp-demos/unicorn/index.html`,
+Cloudflare Pages, not this git remote) now:
+
+- Uses `payment_methods[].pay_url` / `pay_hint` (string `payments` regex is
+  fallback only)
+- Surfaces storefront `checkout_ready` + `message` (submit disabled when empty)
+- Order lookup shows status `message` and pay rails only while `needs_payment`
+- Checkout errors use buyer `message` (`sold_out` / `min_order` / `no_payment_methods`)
+- Drops mockup chrome (“sample data”, “make-believe”, fake 12s-ago livebar)
+- SKU on cards already rendered when `/storefront` sends `sku`
+
+This repo: `POST /order` adds short `checkout_message`; `STORE_URL_CACHE_BUST`
+`20260912` so Telegram refetches Pages HTML.
 
 **Buyer copy + `pay_hint` — live on `2054b95`:** `/storefront` `message` +
 `invoices_enabled`; `/order-status` status `message` and null `pay_hint`
 after paid/cancelled/rejected; `POST /order` rails include `pay_hint`
 (PayPal email = copy Friends & Family; no handle inside the hint).
 
-## Acceptance (2054b95 — verified 2026-09-12)
+## Acceptance (this ship)
 
-- [x] `python -m pytest -q -x` green on scratch DBs (591 passed)
-- [x] Docker COPY check still lists every imported module (26)
-- [x] No writes to laptop `inventory.db`; no DELETE of products
-- [x] `/storefront` `checkout_ready: true` → `message` mentions pay after checkout;
-      paused methods → `message` tells the buyer to message the seller
-- [x] `/storefront` has `invoices_enabled: false`; no handles / pay URLs / pay_hint
-- [x] Pending `GET /order-status` has `message` + Venmo `pay_url` + `pay_hint`
-- [x] Paid / cancelled / rejected `GET /order-status` have `needs_payment: false`
-      and null `pay_url` / `pay_hint`
-- [x] PayPal email `pay_hint` says copy + Friends & Family (no proton address)
-- [x] Live `/health` `ok: true`, `git_sha` `2054b95…`, `payments.active` = 2
-- [x] No secrets / `.env` / scratch import files committed
+- [ ] `python -m pytest -q -x` green on scratch DBs
+- [ ] Docker COPY check still lists every imported module
+- [ ] No writes to laptop `inventory.db`; no DELETE of products
+- [ ] `POST /order` success includes short `checkout_message` (not the full DM)
+- [ ] Mini App HTML: no “sample data” / “make-believe”; uses `pay_url` / `pay_hint`
+- [ ] Mini App disables submit when `checkout_ready` is false
+- [ ] Live Pages `/unicorn/` no longer shows mockup chrome
+- [ ] After peptide push: `/health` `git_sha` matches this commit; Telegram store URL `?v=20260912`
+- [ ] No secrets / `.env` / scratch import files committed
+
+Prior 2054b95 checks stay true: storefront names-only, paid-order null `pay_url`.
 
 ## Out of scope
 
-- Cloudflare Pages HTML (SKU on cards, mockup copy, using `pay_url` client-side)
+- Native Telegram invoice (needs Remy provider token)
 - Hard-delete / DB wipe / importer against live stock
-- Telegram Stars; enabling invoices (needs Remy provider token)
+- Telegram Stars
 - PayPal.me for email handles (seeded PayPal is an email — copy/paste only)
 - SPBC back-room; other vendor shops' default handles
 - Force-push; committing untracked scratch
 
 ## Verify in 60s
 
-1. GET https://unicornfartzz-bot.onrender.com/health → `ok: true`, `git_sha`
-   starts with `2054b95`, `payments.active` ≥ 1, `invoices.enabled` present
-   (false until Remy sets a provider token).
-2. GET `/storefront?invite=` (Pages key) → `checkout_ready: true`, `message`
-   present, `invoices_enabled: false`, `payments` names only (no handles /
-   pay URLs / pay_hint).
+1. GET https://unicornfartzz-bot.onrender.com/health → `ok: true`, `payments.active` ≥ 1
+2. Open https://remy-miniapp-demos.pages.dev/unicorn/ — no “sample data” / “make-believe”;
+   livebar says live catalog; checkout note names Venmo / PayPal.
 3. Place nothing. Do not run local `start.bat`. Do not wipe `/data`.

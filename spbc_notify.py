@@ -1268,6 +1268,9 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             "payments": payments,
             "payment_methods": pay_objs,
             "message": message,
+            "checkout_message": vendor_stores.order_status_buyer_message(
+                "pending_payment", needs_payment=True
+            ),
             "invoice_offered": bool(invoice_sent),
             "invoices_enabled": vendor_stores.public_invoices_enabled(),
         }

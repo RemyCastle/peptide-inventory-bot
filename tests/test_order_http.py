@@ -182,6 +182,8 @@ class OrderHttpTests(unittest.TestCase):
         self.assertIn("Order received", body["message"])
         self.assertIn(body["code"], body["message"])
         self.assertIn("1 Test St", body["message"])
+        self.assertIn("Pay using the methods below", body.get("checkout_message") or "")
+        self.assertLess(len(body.get("checkout_message") or ""), 180)
 
         # Exactly one order
         with db.get_db() as conn:

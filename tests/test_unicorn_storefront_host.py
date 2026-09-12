@@ -337,5 +337,38 @@ class HealthHostTests(unittest.TestCase):
         self.assertEqual(recorded.get("shop_title"), "Unicorn Magic Factory")
 
 
+MINIAPP_HTML = Path(r"C:\Users\Remy\projects\miniapp-demos\unicorn\index.html")
+
+
+class MiniAppPagesContractTests(unittest.TestCase):
+    """Pages HTML (other folder) must consume structured checkout rails."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not MINIAPP_HTML.is_file():
+            raise unittest.SkipTest("Pages Mini App HTML is not on this machine")
+        cls.src = MINIAPP_HTML.read_text(encoding="utf-8")
+
+    def test_public_key_matches_bot(self) -> None:
+        self.assertIn(PAGES_KEY, self.src)
+        self.assertIn("unicornfartzz-bot.onrender.com", self.src)
+
+    def test_uses_structured_pay_rails(self) -> None:
+        self.assertIn("payment_methods", self.src)
+        self.assertIn("pay_url", self.src)
+        self.assertIn("pay_hint", self.src)
+        self.assertIn("checkout_ready", self.src)
+        self.assertIn("checkout_message", self.src)
+        self.assertIn("renderPayMethods", self.src)
+        self.assertIn("updateCheckoutCopy", self.src)
+
+    def test_drops_mockup_copy(self) -> None:
+        low = self.src.lower()
+        self.assertNotIn("sample data for this mockup", low)
+        self.assertNotIn("make-believe", low)
+        self.assertNotIn("mini app concept", low)
+        self.assertNotIn("synced by fairy bot 12s ago", low)
+
+
 if __name__ == "__main__":
     unittest.main()

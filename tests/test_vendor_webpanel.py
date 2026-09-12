@@ -38,14 +38,15 @@ class CacheBustStoreUrlTests(unittest.TestCase):
         )
         self.assertEqual(
             url,
-            "https://remy-miniapp-demos.pages.dev/unicorn/?v=20260828",
+            "https://remy-miniapp-demos.pages.dev/unicorn/?v="
+            + vendor_stores.STORE_URL_CACHE_BUST,
         )
 
     def test_replaces_existing_v(self) -> None:
         url = vendor_stores.cache_bust_store_url(
             "https://example.com/shop/?v=old&invite=abc"
         )
-        self.assertIn("v=20260828", url)
+        self.assertIn("v=" + vendor_stores.STORE_URL_CACHE_BUST, url)
         self.assertNotIn("v=old", url)
         self.assertIn("invite=abc", url)
 
@@ -63,7 +64,8 @@ class CacheBustStoreUrlTests(unittest.TestCase):
         unicorn = next(v for v in vendors if v.get("token") == "123456:TESTTOKEN")
         self.assertEqual(
             unicorn["store_url"],
-            "https://remy-miniapp-demos.pages.dev/unicorn/?v=20260828",
+            "https://remy-miniapp-demos.pages.dev/unicorn/?v="
+            + vendor_stores.STORE_URL_CACHE_BUST,
         )
 
 
@@ -90,7 +92,8 @@ class NormalizeStoreUrlTests(unittest.TestCase):
         unicorn = next(v for v in vendors if v.get("token") == "123456:SLASHTOKEN")
         self.assertEqual(
             unicorn["store_url"],
-            "https://remy-miniapp-demos.pages.dev/unicorn/?v=20260828",
+            "https://remy-miniapp-demos.pages.dev/unicorn/?v="
+            + vendor_stores.STORE_URL_CACHE_BUST,
         )
 
 

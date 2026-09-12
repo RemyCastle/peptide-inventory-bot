@@ -77,7 +77,7 @@ INIT_DATA_MAX_AGE_SEC = 24 * 60 * 60
 
 # Bump this when the Pages Mini App HTML changes so Telegram WebView
 # does not keep serving a cached checkout.
-STORE_URL_CACHE_BUST = "20260828"
+STORE_URL_CACHE_BUST = "20260912"
 DEFAULT_UNICORN_STORE_URL = "https://remy-miniapp-demos.pages.dev/unicorn/"
 NO_PAYMENTS_BUYER_LINE = (
     "No payment method is published yet. Message the seller — "
