@@ -45,6 +45,10 @@ On a 200, `api_order` (`spbc_notify.py:1226`) returns:
   "code": "UMF-AB12CD",
   "total": 149.00,
   "payments": ["Venmo: 💙 *Venmo*\nSend payment to: `@wineboos`…", …],
+  "payment_methods": [
+    {"name": "Venmo", "method_type": "venmo", "target": "@wineboos",
+     "pay_url": "https://account.venmo.com/pay?…", "line": "Venmo: …"}
+  ],
   "message": "…buyer-facing confirmation text…",
   "invoice_offered": false
 }

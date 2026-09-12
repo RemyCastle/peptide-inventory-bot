@@ -16,37 +16,42 @@ Context (already verified — do not rediscover):
 - `POST /order` auth + HMAC: [`../UNICORN-INITDATA-RUNBOOK.md`](../UNICORN-INITDATA-RUNBOOK.md)
 - Catalog vs Pages: [`../UNICORN-MINIAPP-PARITY.md`](../UNICORN-MINIAPP-PARITY.md)
 - P0 seed/409/health live on `16c6547` (`payments.active` = 2)
+- Checkout JSON follow-up live on `52a5e5a` (order-status `pay_url`, 401 split, `invoices.enabled`)
 - Laptop `inventory.db` is not live; Render `/data/inventory.db` is never opened from tests
 
-## Prior ship (P0 + top P1) — live on `16c6547`
+## Prior ships
 
-1. Boot seed if empty — `run_cloud._seed_unicorn_payments` even without claim env.
-2. Admin path if empty — Telegram **Seed Venmo + PayPal**; panel `{seed_defaults: true}`.
-3. Mini App `POST /order` 409 `no_payment_methods` before `create_order`.
-4. Buyer JSON `payment_methods` on `POST /order`.
-5. Telegram quick-add PayPal + Apple Cash.
-6. `/health` `payments.active` / `payments.total`.
-7. 401 `detail`.
-8. Honest empty copy.
+**P0 + top P1 — live on `16c6547`:** boot seed, admin seed, `POST /order` 409
+`no_payment_methods`, buyer `payment_methods`, PayPal/Apple Cash quick-add,
+`/health` payment counts, 401 `detail`, honest empty copy.
 
-## This ship (checkout JSON follow-up)
+**Checkout JSON follow-up — live on `52a5e5a`:** `GET /order-status` pay rails,
+401/409 `message` on initData + empty methods, 401 `error` split
+(`empty_initdata` / `bad_payload` / `bad_hash` / `expired`),
+`/health` `invoices.enabled`.
 
-1. **`GET /order-status`** returns `payments` string lines + `payment_methods`
-   `{name, method_type, target, pay_url, line}` (same shape as `POST /order`)
-   so “check my order” can show pay links. Public `/storefront` stays names only.
-2. **401/409 `message`** — buyer-facing alert text (never a secret).
-3. **401 `error` split** — `empty_initdata` / `bad_payload` / `bad_hash` /
-   `expired` so the Mini App can say “open from the bot” vs “wrong bot”.
-4. **`/health` `invoices.enabled`** — boolean only; no provider token.
+## This ship (checkout error `message` + paid-order rails)
+
+1. **Every `POST /order` error** includes buyer `message` (never a secret):
+   `no_vendor_token`, `unknown storefront`, `empty cart`, `bad payload`,
+   sold-out. Short `error` codes stay stable so Pages can keep branching.
+2. **`GET /order-status` 404** includes the same `message` (`order not found` /
+   `unknown storefront`).
+3. **`needs_payment`** on `GET /order-status`. `pay_url` is present only while
+   status is `pending_payment` or `awaiting_confirmation`; paid / cancelled /
+   rejected keep method names but `pay_url` is null.
+4. Public `/storefront` stays names + types only (no handles, no pay URLs).
 
 ## Acceptance
 
 - [ ] `python -m pytest -q -x` green on scratch DBs
 - [ ] Docker COPY check still lists every imported module
 - [ ] No writes to laptop `inventory.db`; no DELETE of products
-- [ ] `GET /order-status` includes `payment_methods[].pay_url` for Venmo
+- [ ] Pending `GET /order-status` includes `needs_payment: true` and Venmo `pay_url`
+- [ ] Paid `GET /order-status` includes `needs_payment: false` and null `pay_url`
 - [ ] Empty `initData` → 401 `empty_initdata` + `message`; zero new orders
 - [ ] Zero active methods → 409 `no_payment_methods` + `message`
+- [ ] Sold-out / empty cart / no vendor token / unknown storefront all have `message`
 - [ ] Live `/health` `ok: true`, new `git_sha`, `payments.active` ≥ 1,
       `invoices.enabled` is a boolean
 - [ ] No secrets / `.env` / scratch import files committed

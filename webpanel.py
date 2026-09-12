@@ -960,25 +960,31 @@ def api_order_status(raw_key: str, payment_code: str) -> tuple[int, dict]:
     Shop-scoped: a valid catalog key cannot see another shop's order.
     Claim tokens (vendor_invites) never resolve. No write/confirm/claim.
     """
+    import vendor_stores
+
     chat_id = resolve_storefront_key(raw_key)
     if chat_id is None:
-        return _err(404, "unknown storefront")
+        return 404, vendor_stores.checkout_error_body("unknown storefront")
     order = db.get_order_by_payment_code(payment_code)
     if not order or int(order.get("chat_id") or 0) != int(chat_id):
-        return _err(404, "order not found")
+        return 404, vendor_stores.checkout_error_body("order not found")
     items = db.get_order_items(int(order["id"]))
     code = order.get("payment_code") or ""
     total = float(order.get("total") or 0)
+    status = order.get("status") or ""
+    needs_payment = status in ("pending_payment", "awaiting_confirmation")
     try:
-        import vendor_stores
-
         pay_objs = vendor_stores.payment_methods_public(chat_id, total, code)
     except Exception:
         pay_objs = []
+    if not needs_payment:
+        for p in pay_objs:
+            p["pay_url"] = None
     return 200, {
         "ok": True,
-        "status": order.get("status") or "",
+        "status": status,
         "code": code,
+        "needs_payment": needs_payment,
         "items": [
             {
                 "name": it.get("product_name") or "",

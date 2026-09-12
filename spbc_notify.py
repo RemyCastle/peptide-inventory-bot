@@ -1037,7 +1037,7 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
 
     try:
         if not isinstance(payload, dict):
-            return 400, {"ok": False, "error": "bad payload"}
+            return 400, vendor_stores.checkout_error_body("bad payload")
 
         invite = str(payload.get("invite") or "").strip()
         init_data = payload.get("initData")
@@ -1057,7 +1057,7 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
         shop_chat_id = webpanel.resolve_storefront_key(invite)
         if shop_chat_id is None:
             log.info("POST /order unknown storefront invite")
-            return 404, {"ok": False, "error": "unknown storefront"}
+            return 404, vendor_stores.checkout_error_body("unknown storefront")
 
         # 2) Auth boundary: initData signed with any token bound to this shop
         # (primary polling bot + extra_tokens aliases, e.g. MagicFactory2Bot
@@ -1070,7 +1070,7 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             log.warning(
                 "POST /order no vendor bot token for shop=%s", shop_chat_id
             )
-            return 401, {"ok": False, "error": "no_vendor_token"}
+            return 401, vendor_stores.checkout_error_body("no_vendor_token")
         vendor_token = vendor_tokens[0]
         try:
             buyer = vendor_stores.validate_webapp_init_data_any(
@@ -1084,12 +1084,10 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
                 getattr(exc, "reason", None) or exc,
                 err,
             )
-            return 401, {
-                "ok": False,
-                "error": err,
-                "detail": str(getattr(exc, "reason", None) or err)[:80],
-                "message": vendor_stores.checkout_buyer_message(err),
-            }
+            return 401, vendor_stores.checkout_error_body(
+                err,
+                detail=str(getattr(exc, "reason", None) or err)[:80],
+            )
 
         buyer_id = int(buyer["user_id"])
         username = buyer.get("username")
@@ -1106,19 +1104,13 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             items = vendor_stores.parse_miniapp_cart_items(raw_items)
         except Exception as exc:
             log.info("POST /order bad cart shop=%s: %s", shop_chat_id, exc)
-            return 400, {"ok": False, "error": "bad payload"}
+            return 400, vendor_stores.checkout_error_body("bad payload")
         if not items:
-            return 400, {"ok": False, "error": "empty cart"}
+            return 400, vendor_stores.checkout_error_body("empty cart")
 
         if not db.list_payment_methods(shop_chat_id, active_only=True):
             log.info("POST /order no payment methods shop=%s", shop_chat_id)
-            return 409, {
-                "ok": False,
-                "error": "no_payment_methods",
-                "message": vendor_stores.checkout_buyer_message(
-                    "no_payment_methods"
-                ),
-            }
+            return 409, vendor_stores.checkout_error_body("no_payment_methods")
 
         ship_name, ship_address, ship_notes = vendor_stores.parse_ship_fields(
             payload
@@ -1142,7 +1134,7 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
                 shop_chat_id,
                 buyer_id,
             )
-            return 409, {"ok": False, "error": ORDER_STOCK_ERROR}
+            return 409, vendor_stores.checkout_error_body(ORDER_STOCK_ERROR)
 
         order_id = int(order["id"])
         code = order.get("payment_code") or f"#{order_id}"
@@ -1271,7 +1263,7 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
         }
     except Exception as exc:
         log.error("POST /order unexpected error: %s", exc, exc_info=exc)
-        return 400, {"ok": False, "error": "bad payload"}
+        return 400, vendor_stores.checkout_error_body("bad payload")
 
 
 class NotifyHTTPHandler(BaseHTTPRequestHandler):

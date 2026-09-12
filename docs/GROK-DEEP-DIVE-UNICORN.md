@@ -180,7 +180,9 @@ Menu Button URL in BotFather must match `UNICORN_STORE_URL` / vendor
 | P1 | Telegram quick-add missing PayPal / Apple Cash | Types exist in templates; UI hid them |
 | P1 | `payments` JSON is regex-parsed strings | Fragile Venmo/Cash App links in Pages |
 | P1 | `/health` hid whether rails exist | Had to guess or dump DB |
-| P1 | 401 `bad_hash` overloaded | Buyer alert can't say “re-open” vs “wrong bot” |
+| P1 | 401 `bad_hash` overloaded | Buyer alert can't say “re-open” vs “wrong bot” — **live `52a5e5a`** |
+| P1 | Remaining `POST /order` errors had no `message` | Mini App `alert(d.error)` showed codes for empty cart / no vendor token |
+| P1 | `GET /order-status` still offered `pay_url` after paid | “Check my order” could re-prompt a paid buyer |
 | P2 | Pages mockup copy / SKU on cards | Out of this repo |
 | P2 | Native Telegram invoice (provider token unset) | Optional; Stars forbidden for physical goods |
 

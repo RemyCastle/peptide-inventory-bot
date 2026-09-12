@@ -164,7 +164,8 @@ def initdata_error_code(exc: BaseException | None) -> str:
 def checkout_buyer_message(code: str) -> str:
     """Short Mini App alert text for checkout errors. Never a secret."""
     key = (code or "").strip()
-    if key == "expired":
+    low = key.lower()
+    if key == "expired" or "expired" in low:
         return "This checkout session expired. Re-open the store from the bot."
     if key == "empty_initdata":
         return "Open the store from the Telegram bot and try again."
@@ -177,10 +178,34 @@ def checkout_buyer_message(code: str) -> str:
         return NO_PAYMENTS_BUYER_LINE
     if key == "no_vendor_token":
         return "This store is not ready for checkout. Message the seller."
+    if key in ("empty cart", "empty_cart"):
+        return "Your cart is empty. Add something before checkout."
+    if key in ("unknown storefront", "unknown_storefront"):
+        return "This shop isn't available. Re-open the store from the bot."
+    if key in ("order not found", "order_not_found"):
+        return "No order found for that code in this shop."
+    if key == "sold_out" or "sold" in low:
+        return (
+            "Couldn't place that order — something in your cart just sold "
+            "out or the quantity isn't available. Reopen the store to see live stock."
+        )
+    if key == "bad payload":
+        return "That checkout request wasn't valid. Re-open the store and try again."
     return (
         "This store couldn't verify the Telegram session. "
         "Re-open it from the bot."
     )
+
+
+def checkout_error_body(code: str, **extra) -> dict:
+    """Buyer-facing Mini App error JSON. Never a secret."""
+    body = {
+        "ok": False,
+        "error": code,
+        "message": checkout_buyer_message(code),
+    }
+    body.update(extra)
+    return body
 
 
 def _coerce_cart_int(value) -> int:

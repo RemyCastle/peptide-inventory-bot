@@ -134,6 +134,20 @@ class UnicornBotTokenTests(unittest.TestCase):
             "expired",
             vendor_stores.checkout_buyer_message("expired").lower(),
         )
+        self.assertIn(
+            "empty",
+            vendor_stores.checkout_buyer_message("empty cart").lower(),
+        )
+        self.assertIn(
+            "seller",
+            vendor_stores.checkout_buyer_message("no_vendor_token").lower(),
+        )
+        sold = vendor_stores.checkout_buyer_message(spbc_notify.ORDER_STOCK_ERROR)
+        self.assertIn("sold", sold.lower())
+        err = vendor_stores.checkout_error_body("no_vendor_token")
+        self.assertFalse(err["ok"])
+        self.assertEqual(err["error"], "no_vendor_token")
+        self.assertTrue(err["message"])
 
 
 def _sign_init_data(bot_token: str, user_id: int = 66001) -> str:

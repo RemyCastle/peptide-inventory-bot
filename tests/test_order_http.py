@@ -322,6 +322,7 @@ class OrderHttpTests(unittest.TestCase):
         self.assertEqual(code, 401)
         self.assertFalse(body.get("ok"))
         self.assertEqual(body.get("error"), "no_vendor_token")
+        self.assertIn("Message the seller", body.get("message") or "")
         with db.get_db() as conn:
             n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
         self.assertEqual(n, 0)
@@ -333,6 +334,7 @@ class OrderHttpTests(unittest.TestCase):
         self.assertEqual(code, 404)
         self.assertFalse(body.get("ok"))
         self.assertIn("storefront", body.get("error", "").lower())
+        self.assertIn("Re-open", body.get("message") or "")
         with db.get_db() as conn:
             n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
         self.assertEqual(n, 0)
@@ -344,6 +346,7 @@ class OrderHttpTests(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertFalse(body.get("ok"))
         self.assertIn("empty", body.get("error", "").lower())
+        self.assertIn("empty", (body.get("message") or "").lower())
         with db.get_db() as conn:
             n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
         self.assertEqual(n, 0)
@@ -355,6 +358,7 @@ class OrderHttpTests(unittest.TestCase):
         self.assertEqual(code, 409)
         self.assertFalse(body.get("ok"))
         self.assertIn("sold", body.get("error", "").lower())
+        self.assertIn("sold", (body.get("message") or "").lower())
         with db.get_db() as conn:
             n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
         self.assertEqual(n, 0)
@@ -365,6 +369,8 @@ class OrderHttpTests(unittest.TestCase):
         )
         self.assertEqual(code, 400)
         self.assertFalse(body.get("ok"))
+        self.assertEqual(body.get("error"), "bad payload")
+        self.assertIn("valid", (body.get("message") or "").lower())
 
     def test_extra_bot_token_initdata_ok(self) -> None:
         """UnicornMagicFactoryBot alias can sign checkout for the same shop."""

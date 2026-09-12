@@ -82,6 +82,7 @@ class OrderStatusTests(unittest.TestCase):
         self.assertNotIn("admin_note", body)
         self.assertNotIn("confirmed_by", body)
         self.assertNotIn("hidden_service_fee", body)
+        self.assertTrue(body.get("needs_payment"))
         self.assertTrue(body.get("payments"))
         self.assertTrue(any("Venmo" in p for p in body["payments"]))
         pms = body.get("payment_methods") or []
@@ -107,6 +108,24 @@ class OrderStatusTests(unittest.TestCase):
     def test_unknown_code(self) -> None:
         code, body = webpanel.api_order_status(self.sf_a, "🎁999999")
         self.assertEqual(code, 404, body)
+        self.assertIn("No order found", body.get("message") or "")
+
+    def test_paid_order_hides_pay_url(self) -> None:
+        db.mark_order_awaiting_confirmation(self.order["id"])
+        ok, msg, _ = db.confirm_order_payment(
+            self.order["id"], OWNER, tracking_number="-"
+        )
+        self.assertTrue(ok, msg)
+        code, body = webpanel.api_order_status(
+            self.sf_a, self.order["payment_code"]
+        )
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["status"], "paid")
+        self.assertFalse(body.get("needs_payment"))
+        pms = body.get("payment_methods") or []
+        self.assertTrue(pms)
+        self.assertEqual(pms[0].get("method_type"), "venmo")
+        self.assertFalse(pms[0].get("pay_url"))
 
     def test_http_get_cors(self) -> None:
         handler = object.__new__(spbc_notify.NotifyHTTPHandler)
