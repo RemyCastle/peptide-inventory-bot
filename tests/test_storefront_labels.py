@@ -1193,6 +1193,204 @@ class StorefrontGapTests(unittest.TestCase):
         self.assertNotIn("(vial)", alerts[0]["name"])
         self.assertNotIn("$15", alerts[0]["name"])
 
+    def test_customer_receipt_text_strips_item_ship_pay_junk(self) -> None:
+        pid = db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 3)
+        db.add_payment_method(
+            SHOP, "Venmo\ufffd", "@wineboos\u0000 send", method_type="venmo",
+            handle="@wineboos",
+        )
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer",
+            "Buyer",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "Aod 5mg (vial) $15.00",
+                    "unit_price": 15.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo"},
+            "Buyer",
+            "1 St",
+            "",
+        )
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET ship_name = ?, ship_address = ? WHERE id = ?",
+                ("Buyer\u0000\ufffd", "1 St\u0000\ufffd", int(order["id"])),
+            )
+            conn.execute(
+                "UPDATE order_items SET product_name = ? WHERE order_id = ?",
+                ("Aod 5mg (vial) $15.00\ufffd", int(order["id"])),
+            )
+            conn.execute(
+                "UPDATE payment_methods SET name = ?, instructions = ? "
+                "WHERE chat_id = ? AND method_type = ?",
+                ("Venmo\ufffd", "@wineboos\u0000 send", SHOP, "venmo"),
+            )
+        dirty = db.get_order(int(order["id"]))
+        text = vendor_stores.build_customer_order_received_text(
+            dirty, SHOP, markdown=False
+        )
+        self.assertIn("Aod 5mg", text)
+        self.assertNotIn("(vial)", text)
+        self.assertIn("Buyer", text)
+        self.assertIn("1 St", text)
+        self.assertIn("Venmo", text)
+        self.assertNotIn("\ufffd", text)
+        self.assertNotIn("\u0000", text)
+        md = vendor_stores.build_customer_order_received_text(
+            dirty, SHOP, markdown=True
+        )
+        self.assertIn("Aod 5mg", md)
+        self.assertNotIn("(vial)", md)
+        self.assertNotIn("\ufffd", md)
+
+    def test_payment_claim_notify_strips_buyer_junk(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        db.add_payment_method(SHOP, "Venmo", "@x")
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer",
+            "Buyer",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "SEMA 10MG",
+                    "unit_price": 10.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo"},
+            "Buyer",
+            "1 St",
+            "",
+        )
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET full_name = ?, username = ?, "
+                "payment_code = ? WHERE id = ?",
+                ("Buyer\ufffd", "buyer\u0000", "ABC123\ufffd", int(order["id"])),
+            )
+        dirty = db.get_order(int(order["id"]))
+        note = vendor_stores.build_payment_claim_notify_text(dirty)
+        self.assertIn("PAYMENT CLAIM", note)
+        self.assertIn("Buyer", note)
+        self.assertIn("@buyer", note)
+        self.assertIn("ABC123", note)
+        self.assertNotIn("\ufffd", note)
+        self.assertNotIn("\u0000", note)
+
+    def test_sale_admin_report_and_confirm_dm_strip_junk(self) -> None:
+        pid = db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 3)
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer",
+            "Buyer",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "Aod 5mg (vial) $15.00",
+                    "unit_price": 15.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo"},
+            "Buyer",
+            "1 St",
+            "Leave at door",
+        )
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE shops SET title = ? WHERE chat_id = ?",
+                ("Unicorn\u0000 Magic\ufffd", SHOP),
+            )
+            conn.execute(
+                "UPDATE orders SET full_name = ?, username = ?, "
+                "payment_method_name = ?, ship_name = ?, ship_address = ?, "
+                "ship_notes = ?, tracking_number = ?, tracking_carrier = ? "
+                "WHERE id = ?",
+                (
+                    "Buyer\ufffd",
+                    "buyer\u0000",
+                    "Venmo\ufffd",
+                    "Ship\u0000Name\ufffd",
+                    "1 St\u0000\ufffd",
+                    "Leave\u0000 at door\ufffd",
+                    "1Z\u0000999\ufffd",
+                    "UPS\u200b",
+                    int(order["id"]),
+                ),
+            )
+            conn.execute(
+                "UPDATE order_items SET product_name = ? WHERE order_id = ?",
+                ("Aod 5mg (vial) $15.00\ufffd", int(order["id"])),
+            )
+        dirty = db.get_order(int(order["id"]))
+        items = db.get_order_items(int(order["id"]))
+        report = db.format_sale_admin_report(dirty, items, headline="SALE")
+        self.assertIn("Unicorn Magic", report)
+        self.assertIn("Aod 5mg", report)
+        self.assertNotIn("(vial)", report)
+        self.assertIn("Buyer", report)
+        self.assertIn("Venmo", report)
+        self.assertIn("ShipName", report)
+        self.assertIn("1Z999", report)
+        self.assertIn("UPS", report)
+        self.assertNotIn("\ufffd", report)
+        self.assertNotIn("\u0000", report)
+        dm = db.format_payment_confirmed_customer(dirty)
+        self.assertIn("Payment confirmed", dm)
+        self.assertIn("ShipName", dm)
+        self.assertIn("1 St", dm)
+        self.assertIn("1Z999", dm)
+        self.assertIn("UPS", dm)
+        self.assertNotIn("(vial)", dm)
+        self.assertNotIn("\ufffd", dm)
+        self.assertNotIn("\u0000", dm)
+
+    def test_last_ship_details_strips_junk_and_drops_junk_only(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        db.add_payment_method(SHOP, "Venmo", "@x")
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer",
+            "Buyer",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "SEMA 10MG",
+                    "unit_price": 10.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo"},
+            "Buyer",
+            "1 St",
+            "",
+        )
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET ship_name = ?, ship_address = ? WHERE id = ?",
+                ("Buyer\u0000\ufffd", "1 St\u200b", int(order["id"])),
+            )
+        saved = db.last_ship_details(BUYER)
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved["ship_name"], "Buyer")
+        self.assertEqual(saved["ship_address"], "1 St")
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET ship_name = ?, ship_address = ? WHERE id = ?",
+                ("\u0000\ufffd", "\u200b", int(order["id"])),
+            )
+        self.assertIsNone(db.last_ship_details(BUYER))
+
 
 if __name__ == "__main__":
     unittest.main()

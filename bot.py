@@ -5289,22 +5289,7 @@ async def _finalize_confirm(
                 ),
             )
         # Push confirmation (+ tracking) to customer
-        cust = (
-            f"✅ *Payment confirmed* for order *#{oid}*\n"
-            f"Total: {money(order['total'])}\n"
-            f"Ship to:\n{order.get('ship_name') or '—'}\n"
-            f"{order.get('ship_address') or '—'}\n"
-        )
-        track = (order.get("tracking_number") or "").strip()
-        if track:
-            car = (order.get("tracking_carrier") or "").strip()
-            cust += f"\n📦 *Tracking:* `{track}`"
-            if car:
-                cust += f"\nCarrier: {car}"
-            cust += "\n"
-        else:
-            cust += "\nWe'll send tracking when your package ships.\n"
-        cust += "\nThank you!"
+        cust = db.format_payment_confirmed_customer(order, SYM)
         try:
             await context.bot.send_message(
                 order["user_id"], cust, parse_mode=ParseMode.MARKDOWN

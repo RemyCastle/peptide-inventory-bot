@@ -458,10 +458,36 @@ def build_customer_order_received_text(
     def _esc(s: str) -> str:
         return _md_escape(s) if markdown else s
 
+    try:
+        from catalog_cleanup import (
+            display_product_name,
+            sanitize_catalog_text,
+            storefront_label,
+        )
+    except Exception:
+        display_product_name = None  # type: ignore[assignment]
+        sanitize_catalog_text = None  # type: ignore[assignment]
+        storefront_label = None  # type: ignore[assignment]
+
+    def _item_name(raw: object) -> str:
+        if display_product_name is None:
+            return str(raw or "")
+        return display_product_name(str(raw or ""))
+
+    def _pay_name(raw: object) -> str:
+        if storefront_label is None:
+            return str(raw or "Payment")[:60] or "Payment"
+        return storefront_label(raw, 60) or "Payment"
+
+    def _pay_instr(raw: object) -> str:
+        if sanitize_catalog_text is None:
+            return str(raw or "")
+        return sanitize_catalog_text(str(raw or ""))
+
     lines: list[str] = []
     for ln in order_lines or []:
         lines.append(
-            f"  • {_esc(str(ln['product_name']))} × {ln['quantity']} — "
+            f"  • {_esc(_item_name(ln.get('product_name')))} × {ln['quantity']} — "
             f"{_fmt_money(ln['line_total'])}"
         )
     if order.get("shipping_fee"):
@@ -475,15 +501,19 @@ def build_customer_order_received_text(
 
     pays = usable_payment_methods(int(shop_chat_id))
     if pays:
-        pay_lines = [
-            f"  • {_esc(p['name'])}: {_esc(p['instructions'])}".rstrip(": ")
-            for p in pays
-        ]
+        pay_lines = []
+        for p in pays:
+            name = _esc(_pay_name(p.get("name")))
+            instr = _esc(_pay_instr(p.get("instructions")))
+            line = f"  • {name}: {instr}".rstrip(": ")
+            pay_lines.append(line)
         pay_txt = "\n".join(pay_lines)
     else:
         pay_txt = "  • " + NO_PAYMENTS_BUYER_LINE
 
     code = order.get("payment_code") or f"#{oid}"
+    if storefront_label is not None:
+        code = storefront_label(code, 32) or f"#{oid}"
     total_txt = _fmt_money(order.get("total", 0))
 
     if markdown:
@@ -563,8 +593,16 @@ def build_payment_claim_notify_text(order: dict) -> str:
         total = float(order.get("total") or 0)
     except (TypeError, ValueError):
         total = 0.0
-    uname = (order.get("username") or "").strip()
-    who = f"@{uname}" if uname else (order.get("full_name") or "buyer")
+    try:
+        from catalog_cleanup import storefront_label
+
+        code = storefront_label(code, 32) or (f"#{oid}" if oid else "")
+        uname = storefront_label(order.get("username"), 40)
+        full = storefront_label(order.get("full_name"), 80) or "buyer"
+    except Exception:
+        uname = (order.get("username") or "").strip()
+        full = (order.get("full_name") or "").strip() or "buyer"
+    who = f"@{uname}" if uname else full
     confirm_line = ""
     cancel_line = ""
     try:
@@ -1148,6 +1186,14 @@ def format_customer_ship_block(
     ship_name: str, ship_address: str, *, markdown: bool = True
 ) -> str:
     """Customer confirmation 'Shipping to' block, or empty if nothing to show."""
+    try:
+        from catalog_cleanup import sanitize_multiline, storefront_label
+
+        ship_name = storefront_label(ship_name, 80)
+        ship_address = sanitize_multiline(ship_address, 200)
+    except Exception:
+        ship_name = " ".join(str(ship_name or "").split())[:80]
+        ship_address = str(ship_address or "").strip()[:200]
     if not (ship_name or ship_address):
         return ""
     header = "📦 *Shipping to:*" if markdown else "📦 Shipping to:"

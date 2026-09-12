@@ -193,7 +193,8 @@ Menu Button URL in BotFather must match `UNICORN_STORE_URL` / vendor
 | P1 | Enabled method with no handle still counted as checkout_ready | **live `8829dfb`** (`usable` rails only; health `payments.usable`) |
 | P1 | PayPal / Apple Cash quick-add buttons did not start the prompt; enabled typed rails could save empty | **live `3663272`** (handler regex + 400 on empty enabled save) |
 | P1 | Empty-rail admin copy said "handle" for crypto / Cash App / Apple Cash; URL ZWJ/NBSP kept | **live `1555d79`** (type-specific empty-target copy; URL fail closed) |
-| P1 | Panel field label still said "Handle / email / phone"; Zelle said "contact"; 400 was generic; crypto missing network was silent | **this ship** (`PAYMENT_TARGET_COPY`; panel labels; type-specific 400; crypto `rail_warning`) |
+| P1 | Panel field label still said "Handle / email / phone"; Zelle said "contact"; 400 was generic; crypto missing network was silent | **live `b6eac25`** (`PAYMENT_TARGET_COPY`; panel labels; type-specific 400; crypto `rail_warning`) |
+| P1 | TEXT Order-received, sale report, payment-claim ping, confirm DM, saved-address preview still echoed dirty names | **this ship** (same sanitizers as HTML receipt / NEW ORDER notify) |
 | P2 | Native Telegram invoice (provider token unset) | Optional; Stars forbidden for physical goods |
 
 ---

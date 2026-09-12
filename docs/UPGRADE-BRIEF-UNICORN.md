@@ -1,18 +1,19 @@
-# SHIP BRIEF — MEGA-UNICORN v2 panel pay-target copy + leftover notify
+# SHIP BRIEF — MEGA-UNICORN v2 leftover receipt/report/claim names
 
 Product: peptide (unicorn)  
 Repo: `C:\Users\Remy\peptide_inventory_bot`  
 Prod: https://unicornfartzz-bot.onrender.com  
 Priority: P1  
 Ship agent: grok  
-AUTOPUSH: this ship (type-specific panel/API/Telegram pay-target
-copy; leftover vendor-notify + low-stock names; no stock change;
-never wipe inventory.db)
+AUTOPUSH: this ship (leftover customer TEXT receipt, sale admin
+report, payment-claim notify, payment-confirmed DM, saved-address
+preview; no stock change; never wipe inventory.db)
 
-Goal: Panel and API name the missing pay target the same way Telegram
-does (cashtag / wallet / Zelle email or phone, not a generic handle);
-crypto without a network note warns the admin; leftover vendor-notify
-and low-stock names come out clean; never wipe inventory.
+Goal: Leftover customer TEXT receipts, admin sale reports, Mini App
+I've-paid pings, payment-confirmed DMs, and saved-address previews
+strip dirty names the same way HTML receipts and NEW ORDER notify
+already do; empty pay copy still does not promise a DM; never wipe
+inventory.
 
 Context (already verified — do not rediscover):
 
@@ -23,10 +24,11 @@ Context (already verified — do not rediscover):
 - Empty-handle rails live on `8829dfb` (`payments.usable` = 2)
 - PayPal/Apple Cash quick-add + refuse empty typed saves live on `3663272`
 - Empty-rail copy + URL ZWJ/NBSP live on `1555d79`
+- Panel pay-target copy + leftover NEW ORDER/low-stock names live on `b6eac25`
+- Mini App DM fallback live on `984ea01`
 - Laptop `inventory.db` is not live; Render `/data/inventory.db` is never opened from tests
-- This ship: panel field labels/placeholders; type-specific 400;
-  Zelle "email or phone"; crypto network warning (still usable);
-  leftover NEW ORDER notify + low-stock names
+- This ship: TEXT receipt item/ship/pay names; sale admin report;
+  payment-claim buyer/code; payment-confirmed DM; last-ship preview
 
 ## Prior ships
 
@@ -39,39 +41,49 @@ Cash App / Apple Cash empty rails name wallet/cashtag/phone;
 `public_http_url` rejects `%E2%80%8D` / `%C2%A0`; pending-orders report
 sanitized.
 
+**Panel pay-target copy + leftover notify — live on `b6eac25`:**
+`PAYMENT_TARGET_COPY` is the source of truth; Zelle email or phone;
+crypto missing network warns but stays usable; NEW ORDER notify +
+low-stock names sanitized.
+
+**Mini App DM fallback — live on `984ea01`:** vendor token, then
+`TELEGRAM_BOT_TOKEN`, then poller (Unicorn included).
+
 ## This ship
 
-**Panel pay-target copy + leftover notify/low-stock names.** Payments P1
-is live (Venmo+PayPal usable). Leftover: panel still labeled every typed
-field "Handle / email / phone"; Zelle copy said "contact"; API 400 said
-"Payment handle / number required"; Telegram empty-typed re-prompt was a
-slash list; crypto with an address and no network note was silent;
-NEW ORDER vendor DM and low-stock alerts still echoed dirty names.
+**Leftover receipt/report/claim/confirm names.** Payments P1 is live
+(Venmo+PayPal usable). HTML customer receipts and NEW ORDER notify
+already clean names. Leftover: Telegram TEXT `Order received` still
+echoed dirty item/ship/pay strings; sale admin report and payment-
+confirmed DM echoed dirty ship/tracking; payment-claim ping echoed
+dirty buyer/code; saved-address preview could offer junk-only rows.
 
-- `PAYMENT_TARGET_COPY` is the source of truth (panel JS `PAY_TARGET_COPY`
-  stays in sync). Field labels, placeholders, 400, Telegram re-prompt,
-  and Zelle `pay_hint` all use it.
-- Crypto missing `network_note` stays **usable** and shows admin
-  `rail_warning` (wrong-chain is on the seller to prevent).
-- `build_new_order_notify_text` + `format_new_order_ship_section`
-  sanitize buyer / shop / item / ship. Low-stock alert names use
-  `display_product_name`.
+- `build_customer_order_received_text` sanitizes item names, ship,
+  payment names/instructions (same helpers as HTML).
+- `format_customer_ship_block` sanitizes before showing.
+- `build_payment_claim_notify_text` sanitizes buyer / username / code.
+- `format_sale_admin_report` sanitizes shop/buyer/item/ship/pay/track.
+- `format_payment_confirmed_customer` is the confirm DM (bot uses it).
+- `last_ship_details` sanitizes on read and returns None for junk-only.
+- Empty TEXT receipt still uses `NO_PAYMENTS_BUYER_LINE` (no "DM'd").
 - `STORE_URL_CACHE_BUST` stays `20260913`. No Pages JS. No DELETE.
 
 ## Acceptance (this ship)
 
-- [x] `python -m pytest -q -x` green on scratch DBs (695 passed)
-- [x] Docker COPY check still lists every imported module (26)
+- [x] `python -m pytest -q -x` green on scratch DBs
+- [x] Docker COPY check still lists every imported module
 - [x] No writes to laptop `inventory.db`; no DELETE of products
-- [x] Panel label for Cash App is cashtag, not handle
-- [x] Zelle empty copy / 400 / `pay_hint` say email or phone, not contact
-- [x] Enabled empty crypto 400 says wallet; missing network warns, still usable
-- [x] Dirty NEW ORDER notify and low-stock names come out clean
+- [x] Dirty TEXT receipt item/ship/pay names come out clean
+- [x] Dirty sale report + payment-confirmed DM come out clean
+- [x] Dirty payment-claim buyer/code come out clean
+- [x] Junk-only saved address is not offered
+- [x] Empty TEXT receipt still does not promise a DM
 - [x] No secrets / `.env` / scratch import files committed
 
-Prior `1555d79` / `3663272` / `8829dfb` checks stay true:
+Prior `b6eac25` / `1555d79` / `3663272` / `8829dfb` / `984ea01` checks stay true:
 PayPal/Apple Cash quick-add, usable rails only, Confirm + Cancel URL
-buttons, empty-rail type-specific Telegram list, URL ZWJ/NBSP fail closed.
+buttons, type-specific empty-rail copy, URL ZWJ/NBSP fail closed,
+panel cashtag/wallet/Zelle email-or-phone labels, Unicorn DM fallback.
 
 ## Out of scope
 

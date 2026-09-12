@@ -2591,7 +2591,22 @@ def last_ship_details(user_id: int) -> Optional[dict]:
             """,
             (user_id,),
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        out = dict(row)
+        try:
+            from catalog_cleanup import sanitize_multiline, storefront_label
+
+            name = storefront_label(out.get("ship_name"), 80)
+            addr = sanitize_multiline(out.get("ship_address"), 200)
+        except Exception:
+            name = " ".join(str(out.get("ship_name") or "").split())[:80]
+            addr = str(out.get("ship_address") or "").strip()[:200]
+        if not name or not addr:
+            return None
+        out["ship_name"] = name
+        out["ship_address"] = addr
+        return out
 
 
 def mark_order_shipped(order_id: int) -> tuple[bool, str]:
@@ -3249,30 +3264,52 @@ def format_sale_admin_report(
     items, address, payment type, order number, total, franchisee, buyer username.
     Uses plain-ish markdown safe for Telegram.
     """
+    try:
+        from catalog_cleanup import (
+            display_product_name,
+            sanitize_multiline,
+            storefront_label,
+        )
+
+        def _lab(value: object, cap: int) -> str:
+            return storefront_label(value, cap) or ""
+
+        def _item_name(raw: object) -> str:
+            return display_product_name(str(raw or ""))
+    except Exception:
+        def _lab(value: object, cap: int) -> str:
+            return " ".join(str(value or "").split())[:cap]
+
+        def _item_name(raw: object) -> str:
+            return str(raw or "")
+
+        def sanitize_multiline(value: object, cap: int = 200) -> str:  # type: ignore[misc]
+            return str(value or "").strip()[:cap]
+
     shop = get_shop(int(order["chat_id"])) or {}
-    shop_title = shop.get("title") or f"Shop {order['chat_id']}"
+    shop_title = _lab(shop.get("title"), 80) or f"Shop {order['chat_id']}"
 
-    uname = (order.get("username") or "").strip()
+    uname = _lab(order.get("username"), 40)
     uname_disp = f"@{uname}" if uname else "(no username)"
-    buyer_name = (order.get("full_name") or "").strip() or "—"
+    buyer_name = _lab(order.get("full_name"), 80) or "—"
 
-    # Franchise / clone / collab association
     franchise_bits: list[str] = []
     franchise_bits.append(f"Shop: {shop_title} (id {order['chat_id']})")
     master_id = shop.get("inventory_master_chat_id")
     clone_of = shop.get("clone_of_chat_id")
     if master_id is not None:
         mshop = get_shop(int(master_id))
-        mtitle = (mshop or {}).get("title") or master_id
-        franchise_bits.append(f"Franchisee of inventory master: {mtitle} ({master_id})")
+        mtitle = _lab((mshop or {}).get("title"), 80) or master_id
+        franchise_bits.append(
+            f"Franchisee of inventory master: {mtitle} ({master_id})"
+        )
     if clone_of is not None and (master_id is None or int(clone_of) != int(master_id)):
         cshop = get_shop(int(clone_of))
-        ctitle = (cshop or {}).get("title") or clone_of
+        ctitle = _lab((cshop or {}).get("title"), 80) or clone_of
         franchise_bits.append(f"Cloned from: {ctitle} ({clone_of})")
     if master_id is None and clone_of is None:
         franchise_bits.append("Franchisee: none (this is a primary/master shop)")
 
-    # Collab guest lines (other shops' inventory sold through host)
     guest_owners: dict[int, list[str]] = {}
     for it in items:
         owner = it.get("owner_chat_id")
@@ -3282,12 +3319,12 @@ def format_sale_admin_report(
         ):
             oid = int(owner)
             guest_owners.setdefault(oid, []).append(
-                f"{it.get('product_name')} x{it.get('quantity')}"
+                f"{_item_name(it.get('product_name'))} x{it.get('quantity')}"
             )
     if guest_owners:
         for oid, names in guest_owners.items():
             gshop = get_shop(oid)
-            gtitle = (gshop or {}).get("title") or oid
+            gtitle = _lab((gshop or {}).get("title"), 80) or oid
             franchise_bits.append(
                 f"Collab partner inventory: {gtitle} ({oid}) — {', '.join(names)}"
             )
@@ -3303,18 +3340,18 @@ def format_sale_admin_report(
         ):
             extra = f" [partner stock {it.get('owner_chat_id')}]"
         item_lines.append(
-            f"  - {it.get('product_name')} x{it.get('quantity')} "
+            f"  - {_item_name(it.get('product_name'))} x{it.get('quantity')} "
             f"@ {unit} = {line}{extra}"
         )
     if not item_lines:
         item_lines = ["  - (no line items)"]
 
-    ship_name = (order.get("ship_name") or "—").strip()
-    ship_addr = (order.get("ship_address") or "—").strip()
-    ship_notes = (order.get("ship_notes") or "").strip()
+    ship_name = _lab(order.get("ship_name"), 80) or "—"
+    ship_addr = sanitize_multiline(order.get("ship_address"), 200) or "—"
+    ship_notes = sanitize_multiline(order.get("ship_notes"), 200)
 
-    pay_name = (order.get("payment_method_name") or "—").strip()
-    code = (order.get("payment_code") or "—").strip()
+    pay_name = _lab(order.get("payment_method_name"), 60) or "—"
+    code = _lab(order.get("payment_code"), 32) or "—"
     status = order.get("status") or "—"
 
     lines = [
@@ -3347,11 +3384,12 @@ def format_sale_admin_report(
     for b in franchise_bits:
         lines.append(f"  - {b}")
 
-    # Master-only fee is still useful on admin report (admins of that shop)
     try:
         hidden = float(order.get("hidden_service_fee") or 0)
         if hidden > 0:
-            lines.append(f"  - Platform service fee (hidden in shipping): {money(hidden, symbol)}")
+            lines.append(
+                f"  - Platform service fee (hidden in shipping): {money(hidden, symbol)}"
+            )
     except Exception:
         pass
 
@@ -3359,9 +3397,43 @@ def format_sale_admin_report(
     lines.append(f"Created: {order.get('created_at') or '—'}")
     if order.get("paid_at"):
         lines.append(f"Paid at: {order['paid_at']}")
-    track = (order.get("tracking_number") or "").strip()
+    track = _lab(order.get("tracking_number"), 80)
     if track:
-        car = (order.get("tracking_carrier") or "").strip()
+        car = _lab(order.get("tracking_carrier"), 40)
         lines.append(f"Tracking: {track}" + (f" ({car})" if car else ""))
 
     return "\n".join(lines)
+
+
+def format_payment_confirmed_customer(
+    order: dict, symbol: str = CURRENCY_SYMBOL
+) -> str:
+    """Buyer Telegram DM after admin confirms payment (legacy Markdown)."""
+    oid = order.get("id")
+    try:
+        from catalog_cleanup import sanitize_multiline, storefront_label
+
+        ship_name = storefront_label(order.get("ship_name"), 80) or "—"
+        ship_addr = sanitize_multiline(order.get("ship_address"), 200) or "—"
+        track = storefront_label(order.get("tracking_number"), 80)
+        car = storefront_label(order.get("tracking_carrier"), 40)
+    except Exception:
+        ship_name = (order.get("ship_name") or "").strip() or "—"
+        ship_addr = (order.get("ship_address") or "").strip() or "—"
+        track = (order.get("tracking_number") or "").strip()
+        car = (order.get("tracking_carrier") or "").strip()
+    cust = (
+        f"✅ *Payment confirmed* for order *#{oid}*\n"
+        f"Total: {money(order.get('total') or 0, symbol)}\n"
+        f"Ship to:\n{ship_name}\n"
+        f"{ship_addr}\n"
+    )
+    if track:
+        cust += f"\n📦 *Tracking:* `{track}`"
+        if car:
+            cust += f"\nCarrier: {car}"
+        cust += "\n"
+    else:
+        cust += "\nWe'll send tracking when your package ships.\n"
+    cust += "\nThank you!"
+    return cust
