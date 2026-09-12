@@ -218,19 +218,20 @@ class OrderHttpTests(unittest.TestCase):
         )
         self.assertEqual(code, 401)
         self.assertFalse(body.get("ok"))
-        self.assertIn("initdata", body.get("error", "").lower())
+        self.assertEqual(body.get("error"), "bad_hash")
         with db.get_db() as conn:
             n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
         self.assertEqual(n, 0)
         self.assertEqual(self.sent, [])
 
     def test_wrong_token_signature_401(self) -> None:
-        # Signed with a different bot token → 401
+        # Signed with a different bot token → 401 bad_hash
         forged = build_valid_init_data(OTHER_TOKEN)
         code, body = spbc_notify.handle_http_order(
             self._payload(initData=forged)
         )
         self.assertEqual(code, 401)
+        self.assertEqual(body.get("error"), "bad_hash")
         with db.get_db() as conn:
             n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
         self.assertEqual(n, 0)
@@ -243,6 +244,57 @@ class OrderHttpTests(unittest.TestCase):
         )
         self.assertEqual(code, 401)
         self.assertFalse(body.get("ok"))
+        self.assertEqual(body.get("error"), "expired")
+        with db.get_db() as conn:
+            n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
+        self.assertEqual(n, 0)
+
+    def test_empty_initdata_401_bad_hash_logs_reason(self) -> None:
+        """Empty initData stays 401; JSON is bad_hash; InitDataError reason is logged."""
+        with mock.patch.object(spbc_notify.log, "info") as info:
+            code, body = spbc_notify.handle_http_order(self._payload(initData=""))
+        self.assertEqual(code, 401)
+        self.assertFalse(body.get("ok"))
+        self.assertEqual(body.get("error"), "bad_hash")
+        blobs = [" ".join(str(a) for a in (c.args or ())) for c in info.call_args_list]
+        joined = " ".join(blobs)
+        self.assertIn("reason=%s", joined)
+        self.assertIn("missing initData or bot token", joined)
+        with db.get_db() as conn:
+            n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
+        self.assertEqual(n, 0)
+        self.assertEqual(self.sent, [])
+
+    def test_expired_not_overwritten_by_later_bad_hash(self) -> None:
+        """Hash-matched expired initData stays 'expired' even with extra tokens."""
+        extra = "555555555:UnicornMagicFactoryBotToken"
+        old = int(time.time()) - (25 * 60 * 60)
+        expired = build_valid_init_data(VENDOR_TOKEN, auth_date=old)
+        with mock.patch.object(
+            vendor_stores,
+            "get_bot_tokens_for_shop",
+            return_value=[VENDOR_TOKEN, extra],
+        ):
+            code, body = spbc_notify.handle_http_order(
+                self._payload(initData=expired)
+            )
+        self.assertEqual(code, 401)
+        self.assertEqual(body.get("error"), "expired")
+        with db.get_db() as conn:
+            n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
+        self.assertEqual(n, 0)
+
+    def test_no_vendor_token_401(self) -> None:
+        """Shop with no vendor/main token bound → distinct no_vendor_token."""
+        with mock.patch.object(
+            vendor_stores, "get_bot_tokens_for_shop", return_value=[]
+        ), mock.patch.object(
+            vendor_stores, "get_bot_token_for_shop", return_value=None
+        ):
+            code, body = spbc_notify.handle_http_order(self._payload())
+        self.assertEqual(code, 401)
+        self.assertFalse(body.get("ok"))
+        self.assertEqual(body.get("error"), "no_vendor_token")
         with db.get_db() as conn:
             n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
         self.assertEqual(n, 0)

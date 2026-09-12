@@ -1051,17 +1051,21 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             log.warning(
                 "POST /order no vendor bot token for shop=%s", shop_chat_id
             )
-            return 401, {"ok": False, "error": "invalid initData"}
+            return 401, {"ok": False, "error": "no_vendor_token"}
         vendor_token = vendor_tokens[0]
         try:
             buyer = vendor_stores.validate_webapp_init_data_any(
                 init_data, vendor_tokens
             )
         except vendor_stores.InitDataError as exc:
+            err = vendor_stores.initdata_error_code(exc)
             log.info(
-                "POST /order initData rejected shop=%s: %s", shop_chat_id, exc
+                "POST /order initData rejected shop=%s reason=%s error=%s",
+                shop_chat_id,
+                getattr(exc, "reason", None) or exc,
+                err,
             )
-            return 401, {"ok": False, "error": "invalid initData"}
+            return 401, {"ok": False, "error": err}
 
         buyer_id = int(buyer["user_id"])
         username = buyer.get("username")

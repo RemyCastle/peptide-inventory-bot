@@ -121,7 +121,26 @@ def cache_bust_store_url(
 
 
 class InitDataError(Exception):
-    """Telegram WebApp initData failed validation (auth boundary)."""
+    """Telegram WebApp initData failed validation (auth boundary).
+
+    ``reason`` is the internal message (logged, never a secret). ``hash_ok``
+    is True after HMAC matched (expired / bad user) so
+    validate_webapp_init_data_any does not overwrite that with a later
+    token's bad_hash.
+    """
+
+    def __init__(self, reason: str = "bad hash", *, hash_ok: bool = False) -> None:
+        super().__init__(reason)
+        self.reason = str(reason or "bad hash")
+        self.hash_ok = bool(hash_ok)
+
+
+def initdata_error_code(exc: BaseException | None) -> str:
+    """Map InitDataError to POST /order JSON: bad_hash | expired."""
+    msg = str(getattr(exc, "reason", None) or exc or "").strip().lower()
+    if "expired" in msg:
+        return "expired"
+    return "bad_hash"
 
 
 def _coerce_cart_int(value) -> int:
@@ -291,34 +310,36 @@ def validate_webapp_init_data(
     if not ok:
         raise InitDataError("bad hash")
 
-    # Rebuild map for field lookup (first value wins; hash already checked)
+    # Rebuild map for field lookup (first value wins; hash already checked).
+    # Past this point the HMAC matched, so failures carry hash_ok=True: this
+    # token IS the signer; the payload is just stale/malformed.
     fields = {k: v for k, v in pairs if k != "hash"}
     try:
         auth_date = int(fields.get("auth_date") or 0)
     except (TypeError, ValueError):
-        raise InitDataError("bad auth_date") from None
+        raise InitDataError("bad auth_date", hash_ok=True) from None
     if auth_date <= 0:
-        raise InitDataError("bad auth_date")
+        raise InitDataError("bad auth_date", hash_ok=True)
     age = time.time() - auth_date
     if age > max_age_sec or age < -60:
         # allow 60s clock skew forward; reject old / far-future
-        raise InitDataError("expired auth_date")
+        raise InitDataError("expired auth_date", hash_ok=True)
 
     user_raw = fields.get("user") or ""
     if not user_raw:
-        raise InitDataError("missing user")
+        raise InitDataError("missing user", hash_ok=True)
     try:
         user = json.loads(user_raw)
     except Exception as exc:
-        raise InitDataError("bad user json") from exc
+        raise InitDataError("bad user json", hash_ok=True) from exc
     if not isinstance(user, dict):
-        raise InitDataError("bad user")
+        raise InitDataError("bad user", hash_ok=True)
     try:
         user_id = int(user.get("id"))
     except (TypeError, ValueError):
-        raise InitDataError("bad user id") from None
+        raise InitDataError("bad user id", hash_ok=True) from None
     if user_id <= 0:
-        raise InitDataError("bad user id")
+        raise InitDataError("bad user id", hash_ok=True)
 
     username = (user.get("username") or "") or None
     if username is not None:
@@ -1051,12 +1072,87 @@ def _tokens_from_vendor(v: dict) -> list[str]:
     return out
 
 
+def _split_token_csv(raw: str) -> list[str]:
+    out: list[str] = []
+    for part in (raw or "").split(","):
+        tok = part.strip()
+        if tok and tok not in out:
+            out.append(tok)
+    return out
+
+
+def _main_pool_tokens() -> list[str]:
+    """TELEGRAM_BOT_TOKEN plus every BOT_TOKENS pool entry (main-bot tokens).
+
+    resolve_bot_tokens() only appends TELEGRAM_BOT_TOKEN when BOT_TOKENS is
+    empty, so we add the single token explicitly to cover the case where a
+    non-empty pool omits it. Ordered, de-duped, empties dropped.
+    """
+    out: list[str] = []
+    try:
+        from config import TELEGRAM_BOT_TOKEN, resolve_bot_tokens
+
+        for tok in [TELEGRAM_BOT_TOKEN, *(resolve_bot_tokens() or [])]:
+            tok = (tok or "").strip()
+            if tok and tok not in out:
+                out.append(tok)
+    except Exception:
+        log.exception("_main_pool_tokens: could not load main-bot tokens")
+    # Env fallback: config values are import-time; BOT_TOKENS may omit the
+    # single TELEGRAM_BOT_TOKEN once the pool is non-empty.
+    for tok in [
+        (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip(),
+        *_split_token_csv(os.getenv("BOT_TOKENS") or ""),
+    ]:
+        if tok and tok not in out:
+            out.append(tok)
+    return out
+
+
+def _unicorn_env_hmac_tokens() -> list[str]:
+    """UNICORN_BOT_TOKEN + UNICORN_EXTRA_BOT_TOKENS (HMAC aliases, no poller).
+
+    Always merged for the Unicorn catalog shop even when UNICORN_SHOP_CHAT_ID
+    points at a different shop (stale pin) so MagicFactory2 extras still verify.
+    """
+    out: list[str] = []
+    primary = (os.getenv("UNICORN_BOT_TOKEN") or "").strip()
+    if primary:
+        out.append(primary)
+    for tok in _split_token_csv(os.getenv("UNICORN_EXTRA_BOT_TOKENS") or ""):
+        if tok not in out:
+            out.append(tok)
+    return out
+
+
+def _is_unicorn_catalog_shop(shop_chat_id: int) -> bool:
+    """True for a Unicorn-titled shop or the bound Pages catalog shop."""
+    try:
+        from unicorn_shop import find_catalog_shop, is_unicorn_shop
+
+        if is_unicorn_shop(int(shop_chat_id)):
+            return True
+        cat = find_catalog_shop()
+        if cat and int(cat.get("chat_id") or 0) == int(shop_chat_id):
+            return True
+    except Exception:
+        log.exception(
+            "unicorn catalog shop check failed shop=%s", shop_chat_id
+        )
+    return False
+
+
 def get_bot_tokens_for_shop(shop_chat_id: int) -> list[str]:
     """All vendor bot tokens that may sign initData for this shop.
 
     Includes every JSON entry that resolves to the shop (so two bots sharing
     inventory both verify) plus each entry's extra_tokens. Order: primary of
     the first matching vendor, then extras, then later vendors.
+
+    For the Unicorn catalog shop (@UnicornMagicFactory2Bot), also append:
+      - TELEGRAM_BOT_TOKEN + BOT_TOKENS (live MagicFactory2 / failover pool)
+      - UNICORN_BOT_TOKEN + UNICORN_EXTRA_BOT_TOKENS (even if shop_chat_id pin
+        is stale). HMAC only — does not start extra pollers.
     """
     try:
         target = int(db.resolve_shop_chat_id(int(shop_chat_id)))
@@ -1074,6 +1170,19 @@ def get_bot_tokens_for_shop(shop_chat_id: int) -> list[str]:
         for tok in _tokens_from_vendor(v):
             if tok not in found:
                 found.append(tok)
+
+    try:
+        if _is_unicorn_catalog_shop(target):
+            # Live sales bot first so DMs go to MagicFactory2 when vendor
+            # config did not resolve; extras still tried for HMAC.
+            for tok in _main_pool_tokens() + _unicorn_env_hmac_tokens():
+                if tok and tok not in found:
+                    found.append(tok)
+    except Exception:
+        log.exception(
+            "get_bot_tokens_for_shop: unicorn main-token merge failed shop=%s",
+            target,
+        )
     return found
 
 
@@ -1109,6 +1218,11 @@ def validate_webapp_init_data_any(
             )
         except InitDataError as exc:
             last_err = exc
+            # HMAC matched this token; remaining field errors (expired, missing
+            # user, …) are the real reason. Trying other tokens would overwrite
+            # that with "bad hash".
+            if getattr(exc, "hash_ok", False) or str(exc) != "bad hash":
+                raise
             continue
     if last_err is not None:
         raise last_err

@@ -52,12 +52,12 @@ Weekly rollup: paid orders with `hidden_service_fee > 0` →
 | `DB_PATH` | yes | `/data/inventory.db` on Render disk |
 | `PANEL_BASE_URL` | yes | Public service URL (e.g. `https://spbc-inventory-bot.onrender.com`) — panel links + handoff |
 | `VENDOR_STORES_JSON` | for mini-app vendors | JSON array of vendor receivers (see below) |
-| `UNICORN_BOT_TOKEN` | legacy | First vendor token if not in JSON |
+| `UNICORN_BOT_TOKEN` | legacy | First vendor token if not in JSON. On unicornfartzz-bot this should match live `@UnicornMagicFactory2Bot` (`TELEGRAM_BOT_TOKEN`). |
 | `UNICORN_CLAIM_TOKEN` | legacy | Invite body (or `vendor…` prefix) for Unicorn storefront bind |
 | `UNICORN_SHOP_CHAT_ID` | optional | Force Unicorn shop; else title/virtual match |
 | `UNICORN_STORE_URL` | optional | Default `https://remy-miniapp-demos.pages.dev/unicorn/` |
 | `UNICORN_NOTIFY_IDS` | optional | Extra DM targets (comma-separated chat ids) |
-| `UNICORN_EXTRA_BOT_TOKENS` | optional | Extra BotFather tokens that may sign Mini App `initData` for the Unicorn shop (comma-separated). Use this when customers open the store from `@UnicornMagicFactoryBot` but the polling receiver is `@MagicFactory2Bot`. HMAC only — does not start a second poller. |
+| `UNICORN_EXTRA_BOT_TOKENS` | optional | Extra BotFather tokens that may sign Mini App `initData` for the Unicorn shop (comma-separated). Use this when customers open the store from an older bot but the live poller is `@UnicornMagicFactory2Bot`. HMAC only — does not start a second poller. `TELEGRAM_BOT_TOKEN` + `BOT_TOKENS` are always HMAC aliases for the Unicorn catalog shop. |
 | `NOTIFY_SECRET` | SPBC site | Worker → bot notify auth |
 | `BACKUP_PASSPHRASE` | recommended | Encrypted vault |
 
