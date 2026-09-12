@@ -74,9 +74,22 @@ class NameCleanTests(unittest.TestCase):
     def test_kit_ratio(self) -> None:
         self.assertTrue(cc.should_merge_prices(15.0, 130.0))
         self.assertTrue(cc.should_merge_prices(10.0, 80.0))
+        self.assertTrue(cc.should_merge_prices(8.0, 75.0))  # Snap 8 vial+kit
+        self.assertFalse(cc.should_merge_prices(8.0, 50.0))  # Snap 8 250mg SKU
         self.assertFalse(cc.should_merge_prices(10.0, 15.0))  # sibling SKU
         self.assertFalse(cc.should_merge_prices(15.0, 15.0))
         self.assertFalse(cc.should_merge_prices(0, 80))
+
+    def test_generic_shop_title(self) -> None:
+        self.assertEqual(
+            cc.buyer_shop_title("Shop", unicorn=True),
+            cc.DEFAULT_UNICORN_TITLE,
+        )
+        self.assertEqual(
+            cc.buyer_shop_title("Unicorn Magic Factory", unicorn=True),
+            "Unicorn Magic Factory",
+        )
+        self.assertEqual(cc.buyer_shop_title("Shop", unicorn=False), "Shop")
 
 
 class GlyphRepairTests(unittest.TestCase):
@@ -237,9 +250,53 @@ class CleanupApplyTests(unittest.TestCase):
         self.assertEqual(int(db.get_product(lo)["active"]), 1)
         self.assertEqual(int(db.get_product(dup)["active"]), 0)
         self.assertEqual(int(db.get_product(hi)["active"]), 1)
-        self.assertEqual(db.get_product(lo)["name"], "Oxytocin")
-        self.assertNotIn(chr(36), db.get_product(hi)["name"])
+        self.assertEqual(db.get_product(lo)["name"], "Oxytocin ($10.00)")
+        self.assertEqual(db.get_product(hi)["name"], "Oxytocin ($30.00)")
         self.assertIsNone(db.get_product(lo)["kit_price"])
+
+    def test_snap8_250mg_vial_not_merged_into_kit(self) -> None:
+        lo = db.add_product(self.shop, "snap 8 (vial) $8.00", 8.0, 10, unit="vial")
+        mid = db.add_product(
+            self.shop,
+            "Snap 8 (vial) $50.00",
+            50.0,
+            10,
+            description="for 250mg",
+            unit="vial",
+        )
+        kit = db.add_product(self.shop, "snap 8 (kit) $75", 75.0, 10, unit="kit")
+        with mock.patch.object(db, "OWNER_IDS", {self.owner}):
+            ok, _, plan = cc.apply_cleanup(
+                self.shop, actor_id=self.owner, dry_run=False
+            )
+        self.assertTrue(ok)
+        self.assertEqual(plan.merge_count, 1)
+        self.assertEqual(int(db.get_product(lo)["active"]), 1)
+        self.assertEqual(int(db.get_product(mid)["active"]), 1)
+        self.assertEqual(int(db.get_product(kit)["active"]), 0)
+        self.assertEqual(float(db.get_product(lo)["kit_price"]), 75.0)
+        self.assertEqual(int(db.get_product(lo)["stock"]), 10)
+        names = {db.get_product(lo)["name"], db.get_product(mid)["name"]}
+        self.assertEqual(len(names), 2)
+        self.assertTrue(any("250mg" in n or "$50" in n for n in names))
+
+    def test_mt1_empty_desc_siblings_get_price_suffix(self) -> None:
+        a = db.add_product(self.shop, "MT1 (vial) $11.00", 11.0, 10, unit="vial")
+        b = db.add_product(self.shop, "MT1 (vial) $30.00", 30.0, 10, unit="vial")
+        with mock.patch.object(db, "OWNER_IDS", {self.owner}):
+            cc.apply_cleanup(self.shop, actor_id=self.owner, dry_run=False)
+        names = {db.get_product(a)["name"], db.get_product(b)["name"]}
+        self.assertEqual(names, {"MT1 ($11.00)", "MT1 ($30.00)"})
+        self.assertEqual(int(db.get_product(a)["active"]), 1)
+        self.assertEqual(int(db.get_product(b)["active"]), 1)
+
+    def test_persist_generic_unicorn_title(self) -> None:
+        db.update_shop(self.shop, title="Shop")
+        shop = db.get_shop(self.shop)
+        got = cc.maybe_persist_unicorn_title(shop)
+        self.assertEqual(got, cc.DEFAULT_UNICORN_TITLE)
+        self.assertEqual(db.get_shop(self.shop)["title"], cc.DEFAULT_UNICORN_TITLE)
+        self.assertIsNone(cc.maybe_persist_unicorn_title(db.get_shop(self.shop)))
 
     def test_never_deletes(self) -> None:
         lo = db.add_product(self.shop, "cag 5 (vial) $17.00", 17.0, 10)

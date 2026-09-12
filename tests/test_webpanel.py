@@ -575,6 +575,25 @@ class ApiTests(WebPanelBase):
         self.assertIsNone(lone_row["variant_label"])
         self.assertIsNone(body["shop"]["shipping_zones"])
 
+    def test_storefront_generic_unicorn_title(self) -> None:
+        db.update_shop(SHOP, title="Shop")
+        sf_key = webpanel._ensure_storefront_key(SHOP)
+        with mock.patch(
+            "unicorn_shop.is_unicorn_shop", return_value=True
+        ):
+            code, body = webpanel.api_storefront(sf_key)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["shop"]["title"], "Unicorn Magic Factory")
+
+    def test_admin_flags_stored_name_vs_buyer_name(self) -> None:
+        db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 4)
+        code, state = webpanel.api_state(self.tok)
+        self.assertEqual(code, 200)
+        row = next(p for p in state["products"] if "Aod" in p["name"])
+        self.assertEqual(row["display_name"], "Aod 5mg")
+        self.assertTrue(row["name_needs_clean"])
+        self.assertEqual(row["sku"], "")
+
     def test_storefront_strips_jammed_price_and_weird_glyphs(self) -> None:
         db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 4)
         db.add_product(SHOP, "Anav@r 25mg", 35.0, 2)
@@ -758,6 +777,24 @@ class HttpLayerTests(WebPanelBase):
         self.assertIn("Tap Save", html)
         self.assertIn("Stock (vials)", html)
         self.assertIn("use Stock and Save", html)
+
+    def test_panel_html_has_catalog_search_and_sku(self):
+        html = webpanel.PANEL_HTML
+        self.assertIn('id="cat-q"', html)
+        self.assertIn("Find in catalog", html)
+        self.assertIn('id="cat-hidden"', html)
+        self.assertIn("show hidden", html)
+        self.assertIn('class="f-sku"', html)
+        self.assertIn("duplicate name", html)
+
+    def test_state_json_declares_utf8(self):
+        raw = webpanel.issue_token(SHOP, USER)
+        code, ctype, body = webpanel.handle_panel_get(
+            "/panel/api/state", {"t": [raw]}
+        )
+        self.assertEqual(code, 200)
+        self.assertIn("charset=utf-8", ctype)
+        self.assertIn(b"Vendor Shop", body)
 
     def test_state_requires_token(self):
         code, _, _ = webpanel.handle_panel_get("/panel/api/state", {"t": ["bad"]})

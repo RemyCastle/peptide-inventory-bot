@@ -677,10 +677,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if all_shops:
-        buttons = [
-            [InlineKeyboardButton(s["title"] or str(s["chat_id"]), callback_data=f"pickshop:{s['chat_id']}")]
-            for s in all_shops
-        ]
+        buttons = []
+        for s in all_shops:
+            label = catalog_cleanup.display_shop_text(
+                str(s.get("title") or "")
+            ) or str(s["chat_id"])
+            if len(label) > 64:
+                label = label[:63] + "…"
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        label, callback_data=f"pickshop:{s['chat_id']}"
+                    )
+                ]
+            )
         await update.message.reply_text(
             f"*{BRAND_NAME}*\nSelect a shop:",
             parse_mode=ParseMode.MARKDOWN,
@@ -712,7 +722,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 [
                     [
                         InlineKeyboardButton(
-                            f"🛍 Open {main_shop['title']}",
+                            "🛍 Open "
+                            + (
+                                catalog_cleanup.display_shop_text(
+                                    str(main_shop.get("title") or "")
+                                )
+                                or "shop"
+                            )[:56],
                             callback_data=f"pickshop:{SPBC_SHOP_CHAT_ID}",
                         )
                     ]
@@ -749,14 +765,20 @@ def _shop_picker_view(user_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
             "Open the bot from a group with /start, or ask to be added as admin.",
             None,
         )
-    buttons = [
-        [
-            InlineKeyboardButton(
-                s["title"] or str(s["chat_id"]), callback_data=f"pickshop:{s['chat_id']}"
-            )
-        ]
-        for s in shops[:50]
-    ]
+    buttons = []
+    for s in shops[:50]:
+        label = catalog_cleanup.display_shop_text(
+            str(s.get("title") or "")
+        ) or str(s["chat_id"])
+        if len(label) > 64:
+            label = label[:63] + "…"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    label, callback_data=f"pickshop:{s['chat_id']}"
+                )
+            ]
+        )
     buttons.append([InlineKeyboardButton("« Main menu", callback_data="main")])
     return (
         "🏪 *Your shops* — pick one to shop or manage\n"
@@ -788,7 +810,17 @@ async def _show_main(
     user = update.effective_user
     assert user
     is_adm = db.is_admin(shop["chat_id"], user.id)
-    title = catalog_cleanup.display_shop_text(str(shop.get("title") or ""))
+    try:
+        import unicorn_shop
+
+        title = catalog_cleanup.buyer_shop_title(
+            str(shop.get("title") or ""),
+            unicorn=unicorn_shop.is_unicorn_shop(
+                shop.get("chat_id"), shop.get("title")
+            ),
+        )
+    except Exception:
+        title = catalog_cleanup.display_shop_text(str(shop.get("title") or ""))
     welcome = catalog_cleanup.display_shop_text(shop.get("welcome_text") or "") or (
         f"Welcome to *{title}*.\nBrowse the catalog, add items to your cart, and checkout."
     )
@@ -4124,11 +4156,16 @@ async def cb_adm_prods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     buttons = []
     for p in products:
         flag = "✅" if p["active"] else "⏸"
+        shown = catalog_cleanup.display_product_name(str(p.get("name") or ""))
         lines.append(
-            f"{flag} #{p['id']} *{p['name']}* — {money(p['price'])} · stock {p['stock']}"
+            f"{flag} #{p['id']} *{catalog_cleanup.md_escape(shown)}* — "
+            f"{money(p['price'])} · stock {p['stock']}"
         )
+        btn = f"#{p['id']} {shown}"
+        if len(btn) > 64:
+            btn = btn[:63] + "…"
         buttons.append(
-            [InlineKeyboardButton(f"#{p['id']} {p['name'][:24]}", callback_data=f"admp:{p['id']}")]
+            [InlineKeyboardButton(btn, callback_data=f"admp:{p['id']}")]
         )
     buttons.append(
         [

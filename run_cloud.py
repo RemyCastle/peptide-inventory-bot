@@ -86,6 +86,13 @@ def _cleanup_unicorn_catalog() -> None:
         return
     sid = int(shop["chat_id"])
     clean = catalog_cleanup.apply_bound_shop_cleanup(sid)
+    try:
+        titled = catalog_cleanup.maybe_persist_unicorn_title(shop)
+    except Exception:
+        log.exception("unicorn shop title persist failed")
+        titled = None
+    if titled:
+        clean["shop_title"] = titled
     spbc_notify.set_catalog_cleanup_result(clean)
     log.info("unicorn catalog cleanup: %s", clean)
     print(f"[run_cloud] unicorn catalog cleanup: {clean}", flush=True)

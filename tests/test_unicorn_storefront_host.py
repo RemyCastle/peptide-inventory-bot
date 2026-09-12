@@ -315,6 +315,24 @@ class HealthHostTests(unittest.TestCase):
         recorded = __import__("spbc_notify")._status_body().get("catalog_cleanup") or {}
         self.assertTrue(recorded.get("ok"))
 
+    def test_boot_cleanup_renames_generic_shop_title(self) -> None:
+        import run_cloud
+
+        db.update_shop(UNICORN, title="Shop")
+        with mock.patch("config.OWNER_IDS", set()), mock.patch.object(
+            db, "OWNER_IDS", set()
+        ), mock.patch.object(
+            unicorn_shop,
+            "find_catalog_shop",
+            return_value={"chat_id": UNICORN, "title": "Shop"},
+        ):
+            run_cloud._cleanup_unicorn_catalog()
+        self.assertEqual(
+            db.get_shop(UNICORN)["title"], "Unicorn Magic Factory"
+        )
+        recorded = __import__("spbc_notify")._status_body().get("catalog_cleanup") or {}
+        self.assertEqual(recorded.get("shop_title"), "Unicorn Magic Factory")
+
 
 if __name__ == "__main__":
     unittest.main()

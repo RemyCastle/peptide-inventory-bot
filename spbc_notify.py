@@ -968,6 +968,9 @@ def set_catalog_cleanup_result(result: dict | None) -> None:
     msg = result.get("msg")
     if msg:
         out["msg"] = str(msg)[:200]
+    shop_title = result.get("shop_title")
+    if shop_title:
+        out["shop_title"] = str(shop_title)[:80]
     _catalog_cleanup_last = out
 
 
@@ -1241,9 +1244,9 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def _json(self, code: int, body: dict, *, cors: bool = False) -> None:
-        raw = json.dumps(body).encode("utf-8")
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         if cors:
             self._cors_order_headers()
@@ -1357,9 +1360,9 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             invite = (query.get("invite") or [""])[0]
             code, body_obj = webpanel.api_storefront(invite)
-            raw = json.dumps(body_obj).encode("utf-8")
+            raw = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control", "no-store")
@@ -1375,9 +1378,9 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
             invite = (query.get("invite") or [""])[0]
             code = (query.get("code") or [""])[0]
             status, body_obj = webpanel.api_order_status(invite, code)
-            raw = json.dumps(body_obj).encode("utf-8")
+            raw = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control", "no-store")

@@ -24,9 +24,22 @@ from typing import Any, Literal
 import db
 
 # Kit-of-10 with a typical discount is ~7–10× vial. True different SKUs
-# (B12 $10 vs $15) sit well below this. Upper bound rejects wild outliers.
-MIN_KIT_RATIO = 6.0
+# (B12 $10 vs $15, Snap 8 $8 vs $50 / 6.25×) sit below this floor.
+# Upper bound rejects wild outliers. 7.0 keeps Aod $15/$130 (8.67×).
+MIN_KIT_RATIO = 7.0
 MAX_KIT_RATIO = 12.0
+
+DEFAULT_UNICORN_TITLE = "Unicorn Magic Factory"
+_GENERIC_SHOP_TITLES = frozenset(
+    {
+        "shop",
+        "store",
+        "new vendor",
+        "new shop",
+        "unicornfartzzbot",
+        "unicornfartzz",
+    }
+)
 
 _PRICE_TAIL = re.compile(
     r"""
@@ -115,6 +128,36 @@ def display_shop_text(text: str) -> str:
     """Repair mojibake in shop title / welcome while preserving line breaks."""
     s = repair_glyphs(str(text or ""))
     return s.replace("�", "").replace("­", "")
+
+
+def buyer_shop_title(title: str | None, *, unicorn: bool = False) -> str:
+    """Buyer-facing shop title. Generic Unicorn placeholders become the real name."""
+    s = display_shop_text(str(title or "")).strip()
+    s = " ".join(s.split())
+    if unicorn and (not s or s.casefold() in _GENERIC_SHOP_TITLES):
+        return DEFAULT_UNICORN_TITLE
+    return s
+
+
+def maybe_persist_unicorn_title(shop: dict | None) -> str | None:
+    """If the Unicorn catalog shop is still named Shop, persist the real title.
+
+    Shop-scoped UPDATE only. Never touches products or /data wipe paths.
+    """
+    if not shop:
+        return None
+    try:
+        sid = int(shop.get("chat_id") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not sid:
+        return None
+    current = str(shop.get("title") or "")
+    wanted = buyer_shop_title(current, unicorn=True)
+    if not wanted or wanted == " ".join(current.split()):
+        return None
+    db.update_shop(sid, title=wanted)
+    return wanted
 
 
 def sanitize_catalog_text(text: str) -> str:
@@ -228,6 +271,32 @@ def should_merge_prices(lo: float, hi: float) -> bool:
     return MIN_KIT_RATIO <= ratio <= MAX_KIT_RATIO
 
 
+def _desc_key(p: dict) -> str:
+    return " ".join(str(p.get("description") or "").split()).casefold()
+
+
+def descriptions_block_ratio_merge(keeper: dict, other: dict) -> bool:
+    """Different (or one-sided) descriptions mean distinct SKUs, not a kit pair."""
+    a = _desc_key(keeper)
+    b = _desc_key(other)
+    if not a and not b:
+        return False
+    return a != b
+
+
+def _disambiguate_name(cleaned: str, p: dict) -> str:
+    """Keep sibling SKUs distinguishable when they share a cleaned name."""
+    base = cleaned or display_product_name(str(p.get("name") or ""))
+    desc = " ".join(str(p.get("description") or "").split())
+    snippet = desc[:28].strip(" ,;/-") if desc else ""
+    if snippet and snippet.casefold() not in base.casefold():
+        return f"{base} ({snippet})"[:120]
+    price = _price(p)
+    if price > 0:
+        return f"{base} (${price:.2f})"[:120]
+    return base[:120]
+
+
 def _unit(p: dict) -> str:
     """Prefer the stored unit; (kit) jammed into the name still counts as kit."""
     u = (str(p.get("unit") or "vial")).strip().lower() or "vial"
@@ -321,7 +390,10 @@ def plan_cleanup(chat_id: int, products: list[dict] | None = None) -> CleanupPla
             if _same_price(price, keeper_price):
                 dup_ids.add(pid)
                 continue
-            if unit == "kit" or should_merge_prices(keeper_price, price):
+            ratio_ok = should_merge_prices(keeper_price, price) and not (
+                descriptions_block_ratio_merge(keeper, p)
+            )
+            if unit == "kit" or ratio_ok:
                 if price > keeper_price:
                     kit_price = max(kit_price or 0.0, price)
                     merge_ids.add(pid)
@@ -329,17 +401,6 @@ def plan_cleanup(chat_id: int, products: list[dict] | None = None) -> CleanupPla
                     dup_ids.add(pid)
             else:
                 stay.append(p)
-
-        if _needs_rename(keeper, cleaned):
-            plan.actions.append(
-                CleanupAction(
-                    kind="rename",
-                    product_id=keeper_id,
-                    name=str(keeper["name"]),
-                    detail="strip uniqueness tail / typo",
-                    new_name=cleaned,
-                )
-            )
 
         if merge_ids and kit_price and kit_price > keeper_price:
             plan.actions.append(
@@ -371,6 +432,24 @@ def plan_cleanup(chat_id: int, products: list[dict] | None = None) -> CleanupPla
             stay.extend(p for p in group if int(p["id"]) in merge_ids)
             merge_ids.clear()
 
+        keeper_name = cleaned
+        if stay:
+            keeper_name = _disambiguate_name(cleaned, keeper)
+        if _needs_rename(keeper, keeper_name):
+            plan.actions.append(
+                CleanupAction(
+                    kind="rename",
+                    product_id=keeper_id,
+                    name=str(keeper["name"]),
+                    detail=(
+                        "sibling SKU — not a kit pair"
+                        if stay
+                        else "strip uniqueness tail / typo"
+                    ),
+                    new_name=keeper_name,
+                )
+            )
+
         for p in group:
             pid = int(p["id"])
             if pid in dup_ids:
@@ -386,14 +465,9 @@ def plan_cleanup(chat_id: int, products: list[dict] | None = None) -> CleanupPla
 
         for p in stay:
             other_clean = clean_product_name(str(p.get("name") or ""))
-            # Sibling SKUs that share a cleaned name: strip $ but keep them
-            # distinguishable via description, not a second catalog card merge.
             new_name = other_clean
             if new_name and new_name.casefold() == cleaned.casefold():
-                desc = " ".join(str(p.get("description") or "").split())
-                snippet = desc[:28].strip(" ,;/-") if desc else ""
-                if snippet and snippet.casefold() not in new_name.casefold():
-                    new_name = f"{new_name} ({snippet})"[:120]
+                new_name = _disambiguate_name(cleaned, p)
             if _needs_rename(p, new_name):
                 plan.actions.append(
                     CleanupAction(

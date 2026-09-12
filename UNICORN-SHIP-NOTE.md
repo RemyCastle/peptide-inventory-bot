@@ -1,4 +1,25 @@
-# Unicorn catalog ship — 2026-09-11
+# Unicorn catalog ship — 2026-09-11 (extreme follow-up)
+
+**Bot:** @UnicornMagicFactory2Bot only  
+**Live:** https://unicornfartzz-bot.onrender.com  
+**Mini App:** https://remy-miniapp-demos.pages.dev/unicorn/  
+**Never:** wipe `/data/inventory.db` (Render disk). Laptop `inventory.db` was not touched.
+
+## This follow-up
+
+Purge remaining weird catalog names + UTF-8 menus + admin UX + Mini App parity notes.
+
+- Snap 8 `$8` / `$50` (250mg) no longer auto-merges (ratio floor 7.0 + distinct descriptions). `$8` + `$75` kit still merges.
+- MT1 / MT2 / Oxytocin sibling cards keep both rows and append `$price` when description is empty.
+- Generic shop title `Shop` persists as `Unicorn Magic Factory` on Unicorn boot only.
+- JSON `/storefront` `/health` `/order-status` and panel APIs declare `charset=utf-8` and dump Unicode (emoji) unescaped.
+- Telegram shop picker + admin product buttons run through glyph repair / 64-char cap.
+- Admin `/webpanel` catalog: find box, show-hidden, SKU field, duplicate-name flag, “buyers see: …”.
+- Notes: `UNICORN-MINIAPP-PARITY.md` (Pages mockup copy is out of this repo).
+
+---
+
+# Unicorn catalog ship — 2026-09-11 (prior)
 
 **Bot:** @UnicornMagicFactory2Bot only  
 **Live:** https://unicornfartzz-bot.onrender.com  

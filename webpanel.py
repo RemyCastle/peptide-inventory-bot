@@ -903,10 +903,20 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
     shop = db.get_shop(chat_id) or db.ensure_shop(chat_id)
     products = db.apply_available_stock(db.list_products(chat_id, active_only=True))
     payments = db.list_payment_methods(chat_id, active_only=True)
+    try:
+        from catalog_cleanup import buyer_shop_title
+        import unicorn_shop
+
+        shop_title = buyer_shop_title(
+            shop.get("title"),
+            unicorn=unicorn_shop.is_unicorn_shop(chat_id, shop.get("title")),
+        )
+    except Exception:
+        shop_title = shop["title"]
     return 200, {
         "ok": True,
         "shop": {
-            "title": shop["title"],
+            "title": shop_title,
             "shipping_enabled": int(shop.get("shipping_enabled") or 0),
             "shipping_fee": float(shop.get("shipping_fee") or 0),
             "free_shipping_above": float(shop.get("free_shipping_above") or 0),
@@ -1011,15 +1021,20 @@ def _product_public(p: dict) -> dict:
     cat = p.get("category")
     if cat is not None:
         cat = str(cat).strip() or None
+    sku = _optional_text(p.get("sku"), 40) or ""
+    shown = _buyer_product_name(p)
+    stored = str(p.get("name") or "")
     return {
         "id": p["id"],
         "name": p["name"],
+        "display_name": shown,
+        "name_needs_clean": bool(shown and stored and shown != stored),
         "price": p["price"],
         "kit_price": p.get("kit_price"),
         "stock": p.get("stock", 0),
-        "sku": _optional_text(p.get("sku"), 40),
-        "variant_group": _optional_text(p.get("variant_group"), 80),
-        "variant_label": _optional_text(p.get("variant_label"), 80),
+        "sku": sku,
+        "variant_group": _optional_text(p.get("variant_group"), 80) or "",
+        "variant_label": _optional_text(p.get("variant_label"), 80) or "",
         "unit": p.get("unit") or "vial",
         "active": int(p.get("active") or 0),
         "site_key": p.get("site_key"),
@@ -1029,9 +1044,6 @@ def _product_public(p: dict) -> dict:
         "coa_url": (p.get("coa_url") or "").strip(),
         "has_coa_file": bool((p.get("coa_file_id") or "").strip()),
         "category": cat,
-        "sku": (str(p.get("sku") or "").strip()),
-        "variant_group": (str(p.get("variant_group") or "").strip()),
-        "variant_label": (str(p.get("variant_label") or "").strip()),
         "sort_order": int(p.get("sort_order") or 0),
     }
 
@@ -2628,10 +2640,17 @@ def handle_panel_get(path: str, query: dict) -> tuple[int, str, bytes]:
     if path == "/panel/api/state":
         tok = resolve_token((query.get("t") or [""])[0])
         if not tok:
-            body = json.dumps({"ok": False, "error": "invalid_or_expired_link"})
-            return 401, "application/json", body.encode("utf-8")
+            body = json.dumps(
+                {"ok": False, "error": "invalid_or_expired_link"},
+                ensure_ascii=False,
+            )
+            return 401, "application/json; charset=utf-8", body.encode("utf-8")
         code, data = api_state(tok)
-        return code, "application/json", json.dumps(data).encode("utf-8")
+        return (
+            code,
+            "application/json; charset=utf-8",
+            json.dumps(data, ensure_ascii=False).encode("utf-8"),
+        )
     if path == "/panel/api/orders.txt":
         tok = resolve_token((query.get("t") or [""])[0])
         if not tok:
@@ -2655,14 +2674,21 @@ def handle_panel_post(path: str, payload: dict) -> tuple[int, str, bytes]:
         return 404, "application/json", b'{"error":"not_found"}'
     tok = resolve_token(str(payload.get("t") or ""))
     if not tok:
-        body = json.dumps({"ok": False, "error": "invalid_or_expired_link"})
-        return 401, "application/json", body.encode("utf-8")
+        body = json.dumps(
+            {"ok": False, "error": "invalid_or_expired_link"},
+            ensure_ascii=False,
+        )
+        return 401, "application/json; charset=utf-8", body.encode("utf-8")
     try:
         code, data = fn(tok, payload)
     except Exception as exc:
         log.error("panel api %s failed: %s", name, exc, exc_info=exc)
         code, data = 500, {"ok": False, "error": "server_error"}
-    return code, "application/json", json.dumps(data).encode("utf-8")
+    return (
+        code,
+        "application/json; charset=utf-8",
+        json.dumps(data, ensure_ascii=False).encode("utf-8"),
+    )
 
 
 # ── The page ─────────────────────────────────────────────────────────────────
@@ -2756,6 +2782,8 @@ const $=s=>document.querySelector(s);
 let S=null;
 let ORDERS=[];
 let TAB=(MODE==='restock')?'catalog':'orders';
+let CAT_Q='';
+let CAT_HIDDEN=false;
 function toast(t,bad){const m=$('#msg');m.textContent=t;
   m.style.background=bad?'#b4231f':'';m.classList.add('show');
   setTimeout(()=>m.classList.remove('show'),2600);}
@@ -2827,7 +2855,7 @@ function orderCard(o){
     </div>`:''}
     ${o.tracking_number&&!showTrack?`<div class="tag">Tracking: ${esc(o.tracking_carrier||'')} ${esc(o.tracking_number)}</div>`:''}
   </div>`;}
-function prodRow(p){
+function prodRow(p, dups){
   const low=p.active&&p.stock<=2?' low':'';
   const thumb=p.photo_url
     ? `<img class="thumb" src="${esc(p.photo_url)}" alt="">`
@@ -2837,7 +2865,14 @@ function prodRow(p){
     : (p.has_coa_file?'<span class="tag">COA file in Telegram</span>':'<span class="tag">no COA</span>');
   const cat=p.category==null?'':esc(p.category);
   const so=(p.sort_order==null||p.sort_order==='')?0:p.sort_order;
-  return `<div class="prod${p.active?'':' off'}" data-id="${p.id}">
+  const shown=String(p.display_name||p.name||'');
+  const dup=(dups[shown.toLowerCase()]||0)>1;
+  const hint=p.name_needs_clean
+    ? `<span class="tag">buyers see: ${esc(shown)}</span>` : '';
+  const dupBit=dup
+    ? '<span class="tag low">duplicate name — add a SKU or dose</span>' : '';
+  return `<div class="prod${p.active?'':' off'}" data-id="${p.id}"
+    data-active="${p.active?1:0}">
     <div class="row">
       <div class="name"><label>Product</label>
         <input class="f-name" value="${esc(p.name)}"></div>
@@ -2848,7 +2883,11 @@ function prodRow(p){
       <div class="num"><label>Stock (vials)</label>
         <input class="f-stock${low}" type="number" step="1" min="0" value="${p.stock}"></div>
     </div>
+    ${hint||dupBit?`<div class="tag" style="margin:0 0 8px">${hint} ${dupBit}</div>`:''}
     <div class="row">
+      <div class="cat"><label>SKU</label>
+        <input class="f-sku" value="${esc(p.sku||'')}" maxlength="40"
+          placeholder="optional"></div>
       <div class="cat"><label>Category</label>
         <input class="f-cat" list="cat-suggestions" value="${cat}"
           placeholder="e.g. Peptides" maxlength="40"></div>
@@ -2877,8 +2916,32 @@ function prodRow(p){
       <span class="tag grow">${p.site_key?'linked from your website':''}</span>
       <button class="sub b-save">Save</button>
     </div></div>`;}
+function catalogDups(){
+  const d={};
+  (S.products||[]).forEach(p=>{
+    if(!p.active)return;
+    const k=String(p.display_name||p.name||'').toLowerCase();
+    if(!k)return;
+    d[k]=(d[k]||0)+1;
+  });
+  return d;
+}
+function applyCatalogFilter(){
+  const q=CAT_Q.trim().toLowerCase();
+  const box=$('#plist');
+  if(!box)return;
+  box.querySelectorAll('.prod').forEach(el=>{
+    const name=(el.querySelector('.f-name')||{}).value||'';
+    const sku=(el.querySelector('.f-sku')||{}).value||'';
+    const cat=(el.querySelector('.f-cat')||{}).value||'';
+    const active=el.dataset.active==='1';
+    const hit=!q||[name,sku,cat].some(v=>String(v).toLowerCase().includes(q));
+    el.classList.toggle('hide', !(hit && (CAT_HIDDEN||active)));
+  });
+}
 function render(){
-  $('#title').textContent=S.shop.title;
+  $('#title').textContent=S.shop.title||'Shop Panel';
+  try{document.title=(S.shop.title||'Shop')+' · Panel';}catch(e){}
   const sh=S.shop;
   const range=defaultRange();
   const actionable=ORDERS.filter(o=>o.status==='pending_payment'||o.status==='awaiting_confirmation').length;
@@ -2927,6 +2990,13 @@ function render(){
       <option value="Blends"><option value="Peptides"><option value="Supplies">
       <option value="Other">
     </datalist>
+    <div class="row" style="margin-bottom:10px">
+      <div class="name"><label>Find in catalog</label>
+        <input id="cat-q" placeholder="name, SKU, or category" value="${esc(CAT_Q)}"></div>
+      <label class="flex" style="margin:0;padding-bottom:2px">
+        <input id="cat-hidden" type="checkbox" style="width:auto"
+          ${CAT_HIDDEN?'checked':''}> show hidden</label>
+    </div>
     <div class="flex" style="margin-bottom:10px">
       <button id="restock-on">📦 Received a shipment</button>
       <span class="tag grow">Adds to stock instead of replacing it</span>
@@ -2949,7 +3019,7 @@ function render(){
         <button id="restock-go">✅ Apply shipment</button>
       </div>
     </div>
-    <div id="plist">${S.products.map(prodRow).join('')}</div>
+    <div id="plist">${S.products.map(p=>prodRow(p,catalogDups())).join('')}</div>
     <div class="prod"><div class="row">
       <div class="name"><label>New product</label><input id="np-name" placeholder="BPC-157 10MG"></div>
       <div class="num"><label>Price / vial</label><input id="np-price" type="number" step="0.01" min="0"></div>
@@ -3121,6 +3191,14 @@ function wire(){
     // open attachment download (token in query; one-shot browser GET)
     window.location.href='panel/api/orders.txt?'+q.toString();
   };
+  const catQ=$('#cat-q'), catH=$('#cat-hidden');
+  if(catQ){
+    catQ.oninput=()=>{CAT_Q=catQ.value||'';applyCatalogFilter();};
+  }
+  if(catH){
+    catH.onchange=()=>{CAT_HIDDEN=!!catH.checked;applyCatalogFilter();};
+  }
+  applyCatalogFilter();
   const rs=$('#restock'),pl=$('#plist');
   if(rs&&pl){
   const openRestock=()=>{rs.style.display='';pl.style.display='none';
@@ -3176,6 +3254,7 @@ function wire(){
         price:el.querySelector('.f-price').value,
         kit_price:el.querySelector('.f-kit').value||null,
         stock:el.querySelector('.f-stock').value,
+        sku:(el.querySelector('.f-sku')||{}).value||'',
         category:el.querySelector('.f-cat').value,
         sort_order:Number.isFinite(sort_order)?sort_order:0,
         active:el.querySelector('.f-act').checked});
