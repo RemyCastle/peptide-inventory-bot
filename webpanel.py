@@ -889,6 +889,26 @@ def _buyer_product_name(p: dict) -> str:
         return raw
 
 
+def _buyer_field(value: Any, max_len: int) -> str | None:
+    """Optional storefront string: repaired, no junk, hard-capped, or None."""
+    if value is None:
+        return None
+    try:
+        from catalog_cleanup import storefront_label
+
+        s = storefront_label(value, max_len)
+    except Exception:
+        s = " ".join(str(value).split())
+        if s:
+            s = s[:max_len]
+    return s or None
+
+
+def _buyer_payment_name(m: dict) -> str:
+    raw = str(m.get("name") or "")
+    return _buyer_field(raw, 60) or "Payment"
+
+
 def api_storefront(raw_key: str) -> tuple[int, dict]:
     """Public, read-only catalog for a vendor's mini-app storefront.
 
@@ -929,24 +949,20 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
                 "price": float(p["price"]),
                 "kit_price": (float(p["kit_price"]) if p.get("kit_price") else None),
                 "stock": int(p.get("stock") or 0),
-                "sku": _optional_text(p.get("sku"), 40),
-                "variant_group": _optional_text(p.get("variant_group"), 80),
-                "variant_label": _optional_text(p.get("variant_label"), 80),
+                "sku": _buyer_field(p.get("sku"), 40),
+                "variant_group": _buyer_field(p.get("variant_group"), 80),
+                "variant_label": _buyer_field(p.get("variant_label"), 80),
                 "photo_url": ((p.get("photo_file_id") or "").strip()
                               if (p.get("photo_file_id") or "").startswith("http") else ""),
-                "category": (
-                    (str(p["category"]).strip() or None)
-                    if p.get("category") is not None
-                    else None
-                ),
+                "category": _buyer_field(p.get("category"), 40),
                 "sort_order": int(p.get("sort_order") or 0),
             }
             for p in products
         ],
-        "payments": [m["name"] for m in payments],
+        "payments": [_buyer_payment_name(m) for m in payments],
         "payment_methods": [
             {
-                "name": m["name"],
+                "name": _buyer_payment_name(m),
                 "method_type": (m.get("method_type") or "custom"),
             }
             for m in payments
@@ -987,7 +1003,7 @@ def api_order_status(raw_key: str, payment_code: str) -> tuple[int, dict]:
         "needs_payment": needs_payment,
         "items": [
             {
-                "name": it.get("product_name") or "",
+                "name": _buyer_product_name({"name": it.get("product_name") or ""}),
                 "quantity": int(it.get("quantity") or 0),
                 "unit_price": float(it.get("unit_price") or 0),
                 "line_total": float(it.get("line_total") or 0),
@@ -1031,12 +1047,8 @@ def _audit_stock(
 
 
 def _optional_text(value: Any, max_len: int) -> str | None:
-    if value is None:
-        return None
-    s = " ".join(str(value).split())
-    if not s:
-        return None
-    return s[:max_len]
+    """Admin write path: same sanitizer as the public storefront."""
+    return _buyer_field(value, max_len)
 
 
 def _product_public(p: dict) -> dict:
@@ -1111,6 +1123,12 @@ def api_state(tok: dict) -> tuple[int, dict]:
 def api_product(tok: dict, payload: dict) -> tuple[int, dict]:
     chat_id = tok["chat_id"]
     name = " ".join(str(payload.get("name") or "").split())[:120]
+    try:
+        from catalog_cleanup import sanitize_catalog_text
+
+        name = sanitize_catalog_text(name)[:120]
+    except Exception:
+        pass
     pid = payload.get("id")
 
     if pid is not None:
@@ -1163,8 +1181,7 @@ def api_product(tok: dict, payload: dict) -> tuple[int, dict]:
         if cat is None or (isinstance(cat, str) and not cat.strip()):
             fields["category"] = None
         else:
-            cat_s = " ".join(str(cat).split())[:40]
-            fields["category"] = cat_s or None
+            fields["category"] = _optional_text(cat, 40)
     if "sort_order" in payload and payload.get("sort_order") is not None:
         try:
             so = int(payload["sort_order"])
@@ -1350,7 +1367,7 @@ def _payment_payload_to_fields(payload: dict) -> dict[str, Any]:
     chain = str(payload.get("chain") or "").strip()
     network_note = str(payload.get("network_note") or "").strip()
     cashtag = str(payload.get("cashtag") or "").strip()
-    name = str(payload.get("name") or "").strip()[:60]
+    name = (_optional_text(payload.get("name"), 60) or "").strip()[:60]
     instructions = str(payload.get("instructions") or "").strip()[:1000]
 
     # Prefer structured type fields when present

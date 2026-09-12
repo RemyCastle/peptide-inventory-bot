@@ -679,11 +679,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if all_shops:
         buttons = []
         for s in all_shops:
-            label = catalog_cleanup.display_shop_text(
+            label = catalog_cleanup.tg_button_text(
                 str(s.get("title") or "")
             ) or str(s["chat_id"])
-            if len(label) > 64:
-                label = label[:63] + "…"
             buttons.append(
                 [
                     InlineKeyboardButton(
@@ -724,11 +722,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         InlineKeyboardButton(
                             "🛍 Open "
                             + (
-                                catalog_cleanup.display_shop_text(
-                                    str(main_shop.get("title") or "")
+                                catalog_cleanup.tg_button_text(
+                                    str(main_shop.get("title") or ""),
+                                    56,
                                 )
                                 or "shop"
-                            )[:56],
+                            ),
                             callback_data=f"pickshop:{SPBC_SHOP_CHAT_ID}",
                         )
                     ]
@@ -767,11 +766,9 @@ def _shop_picker_view(user_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
         )
     buttons = []
     for s in shops[:50]:
-        label = catalog_cleanup.display_shop_text(
+        label = catalog_cleanup.tg_button_text(
             str(s.get("title") or "")
         ) or str(s["chat_id"])
-        if len(label) > 64:
-            label = label[:63] + "…"
         buttons.append(
             [
                 InlineKeyboardButton(

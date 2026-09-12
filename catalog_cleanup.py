@@ -51,9 +51,12 @@ _PRICE_TAIL = re.compile(
 _UNIT_SUFFIX = re.compile(r"\s*\((?:vial|kit)s?\)\s*$", re.IGNORECASE)
 _ANAVAR_TYPO = re.compile(r"\banav@r\b", re.IGNORECASE)
 _MD_UNSAFE = re.compile(r"([_*`\[\]])")
-# Telegram InlineKeyboardButton.text is 1–64 characters. Over-long labels
-# are rejected or sliced mid-glyph (� / boxes) on the catalog.
+# Telegram InlineKeyboardButton.text is capped at 64 UTF-16 code units.
+# Python len() under-counts non-BMP emoji (🦄 is 1 char / 2 units), so a
+# naive s[:64] either overflows Telegram or slices a combining/ZWJ run.
 TG_BUTTON_MAX = 64
+# Format chars we must keep so emoji ZWJ sequences survive sanitizer.
+_KEEP_CF = frozenset("\u200d")
 
 
 ActionKind = Literal["rename", "merge", "deactivate"]
@@ -132,8 +135,7 @@ def display_shop_text(text: str) -> str:
 
 def buyer_shop_title(title: str | None, *, unicorn: bool = False) -> str:
     """Buyer-facing shop title. Generic Unicorn placeholders become the real name."""
-    s = display_shop_text(str(title or "")).strip()
-    s = " ".join(s.split())
+    s = sanitize_catalog_text(display_shop_text(str(title or "")))
     if unicorn and (not s or s.casefold() in _GENERIC_SHOP_TITLES):
         return DEFAULT_UNICORN_TITLE
     return s
@@ -160,8 +162,47 @@ def maybe_persist_unicorn_title(shop: dict | None) -> str | None:
     return wanted
 
 
+def utf16_len(text: str) -> int:
+    """UTF-16 code units — the unit Telegram uses for the 64-char button cap."""
+    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in str(text or ""))
+
+
+def clip_label(text: str, max_len: int, *, ellipsis: str = "…") -> str:
+    """Trim to max_len UTF-16 units without splitting a code point or ZWJ run."""
+    s = str(text or "")
+    max_len = int(max_len)
+    if max_len <= 0:
+        return ""
+    if utf16_len(s) <= max_len:
+        return s
+    ell = ellipsis if ellipsis and utf16_len(ellipsis) < max_len else ""
+    budget = max_len - utf16_len(ell)
+    out: list[str] = []
+    used = 0
+    for ch in s:
+        w = 2 if ord(ch) > 0xFFFF else 1
+        if used + w > budget:
+            break
+        out.append(ch)
+        used += w
+    while out and (
+        unicodedata.combining(out[-1])
+        or out[-1] in _KEEP_CF
+        or out[-1] == "\ufe0f"
+    ):
+        used -= 2 if ord(out[-1]) > 0xFFFF else 1
+        out.pop()
+    clipped = "".join(out).rstrip(" ·-/,")
+    return clipped + ell
+
+
 def sanitize_catalog_text(text: str) -> str:
-    """Drop control/format/replacement glyphs that render as boxes or �."""
+    """Drop control/format/replacement glyphs that render as boxes or �.
+
+    Keeps ZWJ (U+200D) so emoji sequences stay intact. Other Cf (ZWSP, BOM,
+    soft hyphen) still go. Whitespace collapses; line breaks are not preserved
+    — use display_shop_text for title/welcome.
+    """
     s = repair_glyphs(str(text or ""))
     if not s:
         return ""
@@ -172,10 +213,27 @@ def sanitize_catalog_text(text: str) -> str:
         pass
     out: list[str] = []
     for ch in s:
-        if unicodedata.category(ch)[0] == "C":
+        cat = unicodedata.category(ch)
+        if cat[0] == "C" and ch not in _KEEP_CF:
             continue
         out.append(ch)
     return " ".join("".join(out).split())
+
+
+def storefront_label(text: str | None, max_len: int | None = None) -> str:
+    """Buyer-facing catalog field (sku, category, variant, payment name)."""
+    s = sanitize_catalog_text(str(text or ""))
+    if max_len is not None and int(max_len) > 0:
+        s = clip_label(s, int(max_len), ellipsis="")
+    return s
+
+
+def tg_button_text(text: str, max_len: int = TG_BUTTON_MAX) -> str:
+    """Shop-picker / menu label: repair glyphs, collapse newlines, UTF-16 cap."""
+    s = sanitize_catalog_text(display_shop_text(str(text or "")).replace("\n", " "))
+    if not s:
+        return ""
+    return clip_label(s, max(1, int(max_len)))
 
 
 def md_escape(text: str) -> str:
@@ -199,7 +257,7 @@ def clean_product_name(name: str) -> str:
     n = _PRICE_TAIL.sub("", n).strip()
     n = _UNIT_SUFFIX.sub("", n).strip()
     n = re.sub(r"\s{2,}", " ", n).strip(" -–—")
-    return n[:120] if n else ""
+    return clip_label(n, 120, ellipsis="") if n else ""
 
 
 def display_product_name(name: str) -> str:
@@ -241,17 +299,21 @@ def catalog_button_label(
 
     max_len = max(8, int(max_len))
     tail = _tail(True)
-    if len(shown) + len(tail) > max_len:
+    if utf16_len(shown) + utf16_len(tail) > max_len:
         tail = _tail(False)
-    if len(shown) + len(tail) > max_len:
-        budget = max_len - len(tail) - 1
+    if utf16_len(shown) + utf16_len(tail) > max_len:
+        ell_w = utf16_len("…")
+        budget = max_len - utf16_len(tail) - ell_w
         if budget < 4:
             tail = guest_bit
-            budget = max_len - len(tail) - 1
+            budget = max_len - utf16_len(tail) - ell_w
         if budget < 1:
-            return (shown + tail)[:max_len]
-        shown = shown[:budget].rstrip(" ·-/,") + "…"
-    return (shown + tail)[:max_len]
+            return clip_label(shown + tail, max_len, ellipsis="")
+        shown = clip_label(shown.rstrip(" ·-/,"), budget + ell_w)
+    result = shown + tail
+    if utf16_len(result) > max_len:
+        return clip_label(result, max_len, ellipsis="")
+    return result
 
 
 def grouping_key(name: str) -> str:

@@ -130,6 +130,87 @@ class GlyphRepairTests(unittest.TestCase):
         self.assertNotIn("ð", label)  # no leftover mojibake glyph
         self.assertEqual(label.count("$15.00"), 1)
 
+    def test_double_encoded_mojibake(self) -> None:
+        original = "🦄 Unicorn Magic Factory"
+        once = self._mojibake(original, "cp1252")
+        twice = self._mojibake(once, "latin-1")
+        self.assertEqual(cc.repair_glyphs(twice), original)
+        self.assertEqual(cc.repair_glyphs(once), original)
+
+    def test_curly_quote_mojibake(self) -> None:
+        original = "Owner’s shop"
+        broken = self._mojibake(original, "cp1252")
+        self.assertIn("â", broken)
+        self.assertEqual(cc.repair_glyphs(broken), original)
+
+    def test_zwj_emoji_sequence_kept(self) -> None:
+        family = "👨\u200d👩\u200d👧\u200d👦"
+        self.assertEqual(cc.sanitize_catalog_text(family), family)
+        self.assertIn("\u200d", cc.sanitize_catalog_text("A" + family + "\u0000B"))
+
+    def test_zwsp_and_bom_stripped_zwj_kept(self) -> None:
+        raw = "AOD\u200b5mg\ufeff \u200d kit"
+        out = cc.sanitize_catalog_text(raw)
+        self.assertNotIn("\u200b", out)
+        self.assertNotIn("\ufeff", out)
+        self.assertIn("\u200d", out)
+
+    def test_utf16_len_counts_non_bmp(self) -> None:
+        self.assertEqual(cc.utf16_len("A"), 1)
+        self.assertEqual(cc.utf16_len("🦄"), 2)
+        self.assertEqual(cc.utf16_len("🦄A"), 3)
+
+    def test_clip_label_does_not_split_emoji(self) -> None:
+        s = "🦄" * 40
+        clipped = cc.clip_label(s, 64)
+        self.assertLessEqual(cc.utf16_len(clipped), 64)
+        self.assertNotIn("\ufffd", clipped)
+        self.assertTrue(clipped.endswith("…") or clipped.endswith("🦄"))
+        # Never a lone surrogate / broken emoji
+        clipped.encode("utf-16-le")  # would raise on unpaired surrogate
+
+    def test_clip_label_strips_trailing_zwj(self) -> None:
+        # 20 BMP chars + ZWJ would otherwise leave a dangling join.
+        raw = ("A" * 63) + "\u200d" + "B"
+        clipped = cc.clip_label(raw, 64)
+        self.assertLessEqual(cc.utf16_len(clipped), 64)
+        self.assertFalse(clipped.endswith("\u200d"))
+
+    def test_catalog_button_utf16_cap_with_emoji(self) -> None:
+        name = "🦄 " + ("Dermaheal HL anti-hair loss moisturizes scalp 5ml " * 3)
+        label = cc.catalog_button_label(name, 15.0, 10)
+        self.assertLessEqual(cc.utf16_len(label), cc.TG_BUTTON_MAX)
+        self.assertNotIn("\ufffd", label)
+        self.assertIn("$15.00", label)
+
+    def test_tg_button_text_repairs_and_caps(self) -> None:
+        original = "🦄 Unicorn Magic Factory"
+        broken = self._mojibake(original, "cp1252")
+        label = cc.tg_button_text(broken + "\n" + ("x" * 80))
+        self.assertLessEqual(cc.utf16_len(label), cc.TG_BUTTON_MAX)
+        self.assertTrue(label.startswith("🦄"))
+        self.assertNotIn("\n", label)
+
+    def test_storefront_label_caps_and_strips(self) -> None:
+        self.assertEqual(cc.storefront_label("UMF\u0000-TEE-PK", 40), "UMF-TEE-PK")
+        self.assertEqual(cc.storefront_label("X" * 50, 40), "X" * 40)
+        self.assertEqual(cc.storefront_label("  "), "")
+
+    def test_buyer_shop_title_strips_junk(self) -> None:
+        self.assertEqual(
+            cc.buyer_shop_title("Unicorn\u200b Magic Factory"),
+            "Unicorn Magic Factory",
+        )
+
+    def test_cleanup_source_never_deletes_products(self) -> None:
+        src = (ROOT / "catalog_cleanup.py").read_text(encoding="utf-8")
+        self.assertNotRegex(src, r"(?i)DELETE\s+FROM\s+products")
+        self.assertNotRegex(src, r"(?i)DROP\s+TABLE")
+        self.assertNotRegex(src, r"(?i)unlink\s*\(")
+        cloud = (ROOT / "run_cloud.py").read_text(encoding="utf-8")
+        self.assertNotRegex(cloud, r"(?i)os\.remove\(.*inventory")
+        self.assertNotRegex(cloud, r"(?i)unlink\(.*inventory")
+
 
 class CleanupApplyTests(unittest.TestCase):
     def setUp(self) -> None:

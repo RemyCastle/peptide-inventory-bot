@@ -506,6 +506,12 @@ def payment_method_public(
     """Buyer-facing payment object (Mini App + POST /order)."""
     mt, target = _method_kind_and_target(method)
     name = method.get("name") or "Payment"
+    try:
+        from catalog_cleanup import storefront_label
+
+        name = storefront_label(name, 60) or "Payment"
+    except Exception:
+        name = str(name or "Payment")[:60] or "Payment"
     instr = (method.get("instructions") or "").strip()
     line = f"{name}: {instr}".rstrip(": ")
     return {
