@@ -119,8 +119,8 @@ not send money.
 | Path | How |
 |---|---|
 | Boot seed | `run_cloud._seed_unicorn_payments` → `webpanel.ensure_unicorn_shop_payments`. Idempotent by `method_type` (paused rows count as present). **Pause, don't delete,** a seeded type you don't want. |
-| Telegram **💳 Payments** | `cb_adm_pays`. Quick-add templates + freeform. Pause / delete. This ship adds PayPal + Apple Cash + a Unicorn-only **Seed Venmo + PayPal** when the list is empty. |
-| Web panel Payments card | Typed fields, quick-add, Save/Delete. This ship warns when nothing is enabled and offers the same seed on the Unicorn shop. |
+| Telegram **💳 Payments** | `cb_adm_pays`. Quick-add templates + freeform. Pause / delete. PayPal + Apple Cash + a Unicorn-only **Seed Venmo + PayPal** when those types are missing (not only when the list is empty). Warns when **all methods are paused**. |
+| Web panel Payments card | Typed fields, quick-add, Save/Delete. Warns when nothing is enabled; same seed CTA when Venmo or PayPal types are missing. |
 | `POST /panel/api/payment` | Add / update / delete. This ship: `{seed_defaults: true}` (Unicorn shop only). |
 
 Seeded Unicorn defaults (buyer-facing handles, not secrets): Venmo `@wineboos`,
@@ -170,22 +170,22 @@ Menu Button URL in BotFather must match `UNICORN_STORE_URL` / vendor
 
 ---
 
-## 7. Ranked gaps (before this ship)
+## 7. Ranked gaps
 
-| Pri | Gap | Risk if ignored |
+| Pri | Gap | Status |
 |---|---|---|
-| P0 | Payment seed only ran when `UNICORN_CLAIM_TOKEN` was set | Empty Mini App pay screen; orders with no rail |
-| P0 | Mini App `POST /order` did not refuse empty methods | Buyer gets a code they cannot pay |
-| P0 | Admin empty-state was a quiet “_None configured._” | Owner doesn't notice checkout is dead |
-| P1 | Telegram quick-add missing PayPal / Apple Cash | Types exist in templates; UI hid them |
-| P1 | `payments` JSON is regex-parsed strings | Fragile Venmo/Cash App links in Pages |
-| P1 | `/health` hid whether rails exist | Had to guess or dump DB |
-| P1 | 401 `bad_hash` overloaded | Buyer alert can't say “re-open” vs “wrong bot” — **live `52a5e5a`** |
-| P1 | Remaining `POST /order` errors had no `message` | Mini App `alert(d.error)` showed codes for empty cart / no vendor token — **live `fef9326`** |
-| P1 | `GET /order-status` still offered `pay_url` after paid | “Check my order” could re-prompt a paid buyer — **live `fef9326`** |
-| P1 | Sold-out `error` was a long sentence; min-order looked like sold-out | Pages could not branch on `sold_out` / `min_order` |
-| P1 | All methods paused hid the Unicorn seed CTA | Owner had rows but checkout was still dead |
-| P2 | Pages mockup copy / SKU on cards | Out of this repo |
+| P0 | Payment seed only ran when `UNICORN_CLAIM_TOKEN` was set | **live `16c6547`** |
+| P0 | Mini App `POST /order` did not refuse empty methods | **live `16c6547`** |
+| P0 | Admin empty-state was a quiet “_None configured._” | **live `16c6547` / `c5bbf40`** (paused warning + seed CTA) |
+| P1 | Telegram quick-add missing PayPal / Apple Cash | **live `16c6547`** |
+| P1 | `payments` JSON is regex-parsed strings | Server returns `payment_methods` + `pay_url` (`52a5e5a`). Pages still regex-parses strings — **other repo** |
+| P1 | `/health` hid whether rails exist | **live `16c6547`** (`payments.active` / `total`) |
+| P1 | 401 `bad_hash` overloaded | **live `52a5e5a`** |
+| P1 | Remaining `POST /order` errors had no `message` | **live `fef9326`** |
+| P1 | `GET /order-status` still offered `pay_url` after paid | **live `fef9326` / `c5bbf40`** (cancelled/rejected too) |
+| P1 | Sold-out `error` was a long sentence; min-order looked like sold-out | **live `c5bbf40`** (`sold_out` / `min_order`) |
+| P1 | All methods paused hid the Unicorn seed CTA | **live `c5bbf40`** |
+| P2 | Pages mockup copy / SKU on cards / use `pay_url` client-side | Out of this repo (`miniapp-demos`) |
 | P2 | Native Telegram invoice (provider token unset) | Optional; Stars forbidden for physical goods |
 
 ---

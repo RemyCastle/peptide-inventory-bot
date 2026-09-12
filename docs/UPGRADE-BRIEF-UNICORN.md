@@ -5,7 +5,7 @@ Repo: `C:\Users\Remy\peptide_inventory_bot`
 Prod: https://unicornfartzz-bot.onrender.com  
 Priority: P0  
 Ship agent: grok  
-AUTOPUSH: yes (`deploy-map.json` autopush=true, autoCommit=false)
+AUTOPUSH: already live on `c5bbf40` — do not re-push / do not restart Render
 
 Goal: Buyers can always see at least one way to pay after Mini App checkout;
 owners have a seed/admin path when rails are empty; never wipe inventory.
@@ -17,6 +17,8 @@ Context (already verified — do not rediscover):
 - Catalog vs Pages: [`../UNICORN-MINIAPP-PARITY.md`](../UNICORN-MINIAPP-PARITY.md)
 - P0 seed/409/health live on `16c6547` (`payments.active` = 2)
 - Checkout JSON follow-up live on `52a5e5a` (order-status `pay_url`, 401 split, `invoices.enabled`)
+- Buyer `message` + paid-order rails live on `fef9326`
+- Sold-out/min-order codes + empty-rails UX live on `c5bbf40`
 - Laptop `inventory.db` is not live; Render `/data/inventory.db` is never opened from tests
 
 ## Prior ships
@@ -34,35 +36,37 @@ Context (already verified — do not rediscover):
 error has `message`; `GET /order-status` 404 has `message`; `needs_payment`
 plus null `pay_url` after paid.
 
-## This ship (stable sold-out/min-order codes + empty-rails UX)
+**Stable sold-out/min-order codes + empty-rails UX — live on `c5bbf40`:**
+`POST /order` `error: sold_out` / `min_order` + buyer `message`; success
+`needs_payment: true`. Cancelled/rejected `GET /order-status` keep method
+names, null `pay_url`, `needs_payment: false`; awaiting confirmation still
+has `pay_url`. `/storefront` `checkout_ready` (names+types only). Telegram
+warns when all methods are paused; Unicorn seed CTA shows when Venmo or
+PayPal types are missing (web panel same rule).
 
-1. **`POST /order` stock fail** uses short `error: sold_out` (not the long
-   sentence). Below-minimum carts use `error: min_order` + buyer `message`
-   instead of looking sold-out. Success JSON includes `needs_payment: true`.
-2. **`GET /order-status`** cancelled / rejected keep method names, null
-   `pay_url`, `needs_payment: false`. Awaiting confirmation still has `pay_url`.
-3. Public `/storefront` adds `checkout_ready` (true iff ≥1 active method).
-   Names + types only — no handles, no pay URLs. Unknown key 404 has `message`.
-4. Admin empty-rails: Telegram warns when **all methods are paused** (not only
-   when the list is empty). Unicorn seed button shows when Venmo or PayPal
-   types are missing. Web panel seed uses the same rule.
+## This ship
 
-## Acceptance
+**None in this repo.** `c5bbf40` is on `origin/master` and live
+(`/health` `git_sha` `c5bbf40…`, `payments.active` = 2, storefront
+`checkout_ready: true`, PayPal+Venmo names only). Do not re-dispatch this
+brief. Next work is Pages (other git remote) or Remy invoice token.
 
-- [ ] `python -m pytest -q -x` green on scratch DBs
-- [ ] Docker COPY check still lists every imported module
-- [ ] No writes to laptop `inventory.db`; no DELETE of products
-- [ ] Pending `GET /order-status` includes `needs_payment: true` and Venmo `pay_url`
-- [ ] Paid / cancelled / rejected `GET /order-status` include `needs_payment: false`
+## Acceptance (c5bbf40 — verified 2026-09-11)
+
+- [x] `python -m pytest -q -x` green on scratch DBs (591 passed)
+- [x] Docker COPY check still lists every imported module (26)
+- [x] No writes to laptop `inventory.db`; no DELETE of products
+- [x] Pending `GET /order-status` includes `needs_payment: true` and Venmo `pay_url`
+- [x] Paid / cancelled / rejected `GET /order-status` include `needs_payment: false`
       and null `pay_url`
-- [ ] Empty `initData` → 401 `empty_initdata` + `message`; zero new orders
-- [ ] Zero active methods → 409 `no_payment_methods` + `message`
-- [ ] Sold-out uses `error: sold_out` + `message`; min-order uses `error: min_order`
-- [ ] Empty cart / no vendor token / unknown storefront all have `message`
-- [ ] `/storefront` `checkout_ready` is boolean; no handles / pay URLs
-- [ ] Live `/health` `ok: true`, new `git_sha`, `payments.active` ≥ 1,
-      `invoices.enabled` is a boolean
-- [ ] No secrets / `.env` / scratch import files committed
+- [x] Empty `initData` → 401 `empty_initdata` + `message`; zero new orders
+- [x] Zero active methods → 409 `no_payment_methods` + `message`
+- [x] Sold-out uses `error: sold_out` + `message`; min-order uses `error: min_order`
+- [x] Empty cart / no vendor token / unknown storefront all have `message`
+- [x] `/storefront` `checkout_ready` is boolean; no handles / pay URLs
+- [x] Live `/health` `ok: true`, `git_sha` `c5bbf40…`, `payments.active` = 2,
+      `invoices.enabled` is boolean false
+- [x] No secrets / `.env` / scratch import files committed
 
 ## Out of scope
 
@@ -75,8 +79,9 @@ plus null `pay_url` after paid.
 
 ## Verify in 60s
 
-1. GET https://unicornfartzz-bot.onrender.com/health → `ok: true`, new `git_sha`,
-   `payments.active` ≥ 1, `invoices.enabled` present (false until Remy sets a
-   provider token).
-2. GET `/storefront?invite=` (Pages key) → `payments` non-empty names (no handles).
+1. GET https://unicornfartzz-bot.onrender.com/health → `ok: true`, `git_sha`
+   starts with `c5bbf40`, `payments.active` ≥ 1, `invoices.enabled` present
+   (false until Remy sets a provider token).
+2. GET `/storefront?invite=` (Pages key) → `checkout_ready: true`, `payments`
+   non-empty names (no handles / pay URLs).
 3. Place nothing. Do not run local `start.bat`. Do not wipe `/data`.
