@@ -185,7 +185,7 @@ Menu Button URL in BotFather must match `UNICORN_STORE_URL` / vendor
 | P1 | `GET /order-status` still offered `pay_url` after paid | **live `fef9326` / `c5bbf40`** (cancelled/rejected too) |
 | P1 | Sold-out `error` was a long sentence; min-order looked like sold-out | **live `c5bbf40`** (`sold_out` / `min_order`) |
 | P1 | All methods paused hid the Unicorn seed CTA | **live `c5bbf40`** |
-| P1 | Catalog / order-status had no buyer `message`; PayPal email had no copy hint | **this ship** (`message` + `pay_hint` + `invoices_enabled`) |
+| P1 | Catalog / order-status had no buyer `message`; PayPal email had no copy hint | **live `2054b95`** (`message` + `pay_hint` + `invoices_enabled`) |
 | P2 | Pages mockup copy / SKU on cards / use `pay_url` client-side | Out of this repo (`miniapp-demos`) |
 | P2 | Native Telegram invoice (provider token unset) | Optional; Stars forbidden for physical goods |
 

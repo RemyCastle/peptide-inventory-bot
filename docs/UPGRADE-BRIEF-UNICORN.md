@@ -5,7 +5,7 @@ Repo: `C:\Users\Remy\peptide_inventory_bot`
 Prod: https://unicornfartzz-bot.onrender.com  
 Priority: P0  
 Ship agent: grok  
-AUTOPUSH: yes (peptide_inventory_bot `autopush: true`)
+AUTOPUSH: live on `2054b95` — do not re-push / do not restart Render
 
 Goal: Buyers always get a `message` on catalog and order lookup, and each
 checkout rail has a `pay_hint` (copy-paste vs tap-to-pay); never wipe inventory.
@@ -36,6 +36,10 @@ Context (already verified — do not rediscover):
 error has `message`; `GET /order-status` 404 has `message`; `needs_payment`
 plus null `pay_url` after paid.
 
+**Buyer copy + `pay_hint` — live on `2054b95`:** `/storefront` `message` +
+`invoices_enabled`; `/order-status` status `message`; rails `pay_hint`
+(no handles on catalog; pay_hint/pay_url hidden after paid).
+
 **Stable sold-out/min-order codes + empty-rails UX — live on `c5bbf40`:**
 `POST /order` `error: sold_out` / `min_order` + buyer `message`; success
 `needs_payment: true`. Cancelled/rejected `GET /order-status` keep method
@@ -46,33 +50,32 @@ PayPal types are missing (web panel same rule).
 
 ## This ship
 
-Buyer copy on catalog + order lookup, plus `pay_hint` on checkout rails.
-Pages still regex-parses `payments` strings (other git remote). Invoices stay
-off until Remy sets a provider token.
+**None in this repo.** `2054b95` is on `origin/master` and live
+(`/health` `git_sha` `2054b95…`, `payments.active` = 2, storefront
+`checkout_ready: true`, `message` present, `invoices_enabled: false`,
+PayPal+Venmo names only). Do not re-dispatch this brief. Next work is Pages
+(other git remote: use `pay_url` / `pay_hint` / `message`, drop mockup copy)
+or Remy invoice token.
 
-Do this:
-1. `GET /storefront` always includes `message` (empty-rails vs pay-after-checkout)
-   and `invoices_enabled` (boolean, never the token). Still names+types only.
-2. `GET /order-status` includes `message` for pending / awaiting / paid /
-   cancelled / rejected, plus `invoices_enabled`. Null `pay_url` **and**
-   `pay_hint` after paid/cancelled/rejected.
-3. `POST /order` success `payment_methods[]` includes `pay_hint` (no handle
-   inside the hint — `target` stays the copy field). Also `invoices_enabled`.
-4. Tests on scratch DBs. Never open laptop `inventory.db`. AUTOPUSH after green.
+**Buyer copy + `pay_hint` — live on `2054b95`:** `/storefront` `message` +
+`invoices_enabled`; `/order-status` status `message` and null `pay_hint`
+after paid/cancelled/rejected; `POST /order` rails include `pay_hint`
+(PayPal email = copy Friends & Family; no handle inside the hint).
 
-## Acceptance
+## Acceptance (2054b95 — verified 2026-09-12)
 
-- [ ] `python -m pytest -q -x` green on scratch DBs
-- [ ] Docker COPY check still lists every imported module
-- [ ] No writes to laptop `inventory.db`; no DELETE of products
-- [ ] `/storefront` `checkout_ready: true` → `message` mentions pay after checkout;
+- [x] `python -m pytest -q -x` green on scratch DBs (591 passed)
+- [x] Docker COPY check still lists every imported module (26)
+- [x] No writes to laptop `inventory.db`; no DELETE of products
+- [x] `/storefront` `checkout_ready: true` → `message` mentions pay after checkout;
       paused methods → `message` tells the buyer to message the seller
-- [ ] `/storefront` has `invoices_enabled: false`; no handles / pay URLs / pay_hint
-- [ ] Pending `GET /order-status` has `message` + Venmo `pay_url` + `pay_hint`
-- [ ] Paid / cancelled / rejected `GET /order-status` have `needs_payment: false`
+- [x] `/storefront` has `invoices_enabled: false`; no handles / pay URLs / pay_hint
+- [x] Pending `GET /order-status` has `message` + Venmo `pay_url` + `pay_hint`
+- [x] Paid / cancelled / rejected `GET /order-status` have `needs_payment: false`
       and null `pay_url` / `pay_hint`
-- [ ] PayPal email `pay_hint` says copy + Friends & Family (no proton address)
-- [ ] No secrets / `.env` / scratch import files committed
+- [x] PayPal email `pay_hint` says copy + Friends & Family (no proton address)
+- [x] Live `/health` `ok: true`, `git_sha` `2054b95…`, `payments.active` = 2
+- [x] No secrets / `.env` / scratch import files committed
 
 ## Out of scope
 
@@ -86,8 +89,8 @@ Do this:
 ## Verify in 60s
 
 1. GET https://unicornfartzz-bot.onrender.com/health → `ok: true`, `git_sha`
-   is the new SHA (not `c5bbf40`), `payments.active` ≥ 1, `invoices.enabled`
-   present (false until Remy sets a provider token).
+   starts with `2054b95`, `payments.active` ≥ 1, `invoices.enabled` present
+   (false until Remy sets a provider token).
 2. GET `/storefront?invite=` (Pages key) → `checkout_ready: true`, `message`
    present, `invoices_enabled: false`, `payments` names only (no handles /
    pay URLs / pay_hint).
