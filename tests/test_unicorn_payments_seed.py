@@ -234,16 +234,18 @@ class UnicornPaymentSeedTests(unittest.TestCase):
                 msg=f"{mt} quick-add must match ConversationHandler",
             )
         self.assertIsNone(re.match(bot_mod.PAY_TPL_CALLBACK_RE, "paytpl:nope"))
-        self.assertIn("Need a real handle", src)
+        self.assertIn("Need a real", src)
+        self.assertIn("payment_target_kind_label", src)
+        self.assertNotIn("Need a real handle / cashtag", src)
         self.assertIn("_All methods paused._", src)
         self.assertIn("payment_empty_rails_admin_line", src)
         self.assertIn("_Buyers can checkout._", src)
         self.assertIn("add a pay target", src)
         self.assertIn("cashtag", src)
         self.assertIn("Wallet address", src)
-        self.assertIn("payment_target_kind_label", src)
         vs = (ROOT / "vendor_stores.py").read_text(encoding="utf-8")
         self.assertIn("_Enabled methods have no pay target._", vs)
+        self.assertIn("PAYMENT_TARGET_COPY", vs)
         panel = (ROOT / "webpanel.py").read_text(encoding="utf-8")
         self.assertIn("types.has('venmo')", panel)
         self.assertIn("checkout_ready", panel)
@@ -255,6 +257,16 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertIn("Add a wallet address so buyers can use this method", panel)
         self.assertIn("a Cash App cashtag", panel)
         self.assertIn("_reject_unusable_enabled_payment", panel)
+        self.assertIn("PAY_TARGET_COPY", panel)
+        self.assertIn("p-handle-lab", panel)
+        self.assertIn("target_kind_label", panel)
+        self.assertIn("Zelle email or phone", panel)
+        self.assertNotIn("Handle / email / phone", panel)
+        self.assertNotIn("Zelle contact", panel)
+        self.assertIn("edit pay targets anytime", panel)
+        for mt, copy in vendor_stores.PAYMENT_TARGET_COPY.items():
+            self.assertIn(copy["kind"], panel)
+            self.assertIn(copy["kind"], vs)
 
     def test_pay_url_venmo_prefill_paypal_username_not_email(self) -> None:
         venmo = payment_templates.render_venmo("@wineboos")
@@ -306,15 +318,41 @@ class UnicornPaymentSeedTests(unittest.TestCase):
             "handle": "",
             "instructions": "",
         }
+        zelle = {
+            "name": "Zelle",
+            "method_type": "zelle",
+            "handle": "",
+            "instructions": "",
+        }
         self.assertIn("Venmo handle", vendor_stores.payment_target_kind_label(venmo))
         self.assertIn("wallet address", vendor_stores.payment_target_kind_label(crypto))
         self.assertIn("cashtag", vendor_stores.payment_target_kind_label(cash))
         self.assertIn("Apple Cash number", vendor_stores.payment_target_kind_label(apple))
+        self.assertIn("email or phone", vendor_stores.payment_target_kind_label(zelle))
+        self.assertNotIn("contact", vendor_stores.payment_target_kind_label(zelle).lower())
+        self.assertEqual(
+            vendor_stores.payment_target_placeholder(cash), "$cashtag"
+        )
         self.assertIn("wallet address", vendor_stores.payment_empty_rail_hint(crypto))
         self.assertNotIn("handle", vendor_stores.payment_empty_rail_hint(crypto).lower())
+        self.assertIn(
+            "cashtag",
+            vendor_stores.payment_empty_rail_save_error(cash).lower(),
+        )
+        self.assertNotIn(
+            "handle",
+            vendor_stores.payment_empty_rail_save_error(cash).lower(),
+        )
+        self.assertIn(
+            "Venmo handle",
+            vendor_stores.payment_empty_rail_save_error(venmo),
+        )
         banner = vendor_stores.payment_empty_rails_admin_line()
         self.assertIn("pay target", banner)
         self.assertNotIn("no handle", banner.lower())
+        zelle_hint = vendor_stores.payment_pay_hint(zelle)
+        self.assertIn("email or phone", zelle_hint)
+        self.assertNotIn("contact", zelle_hint.lower())
 
     def test_payment_rail_usable_typed_vs_custom(self) -> None:
         venmo = payment_templates.render_venmo("@wineboos")
@@ -345,6 +383,57 @@ class UnicornPaymentSeedTests(unittest.TestCase):
             "instructions": "Send to @shop-venmo",
         }
         self.assertTrue(vendor_stores.payment_rail_usable(from_instr))
+
+    def test_crypto_missing_network_warns_but_stays_usable(self) -> None:
+        row = payment_templates.render_crypto("USDT", "Txyz123", "")
+        self.assertTrue(vendor_stores.payment_rail_usable(row))
+        warn = vendor_stores.payment_rail_warning(row)
+        self.assertIn("network", warn.lower())
+        noted = payment_templates.render_crypto("USDT", "Txyz123", "USDT TRC20")
+        self.assertTrue(vendor_stores.payment_rail_usable(noted))
+        self.assertEqual(vendor_stores.payment_rail_warning(noted), "")
+        empty = {
+            "name": "USDT",
+            "method_type": "crypto",
+            "address": "",
+            "instructions": "",
+        }
+        self.assertFalse(vendor_stores.payment_rail_usable(empty))
+        self.assertEqual(vendor_stores.payment_rail_warning(empty), "")
+
+    def test_panel_400_empty_typed_save_is_type_specific(self) -> None:
+        tok = {"chat_id": UNICORN, "user_id": 1}
+        code, data = webpanel.api_payment(
+            tok, {"method_type": "cashapp", "cashtag": "", "active": True}
+        )
+        self.assertEqual(code, 400, data)
+        err = (data.get("error") or "").lower()
+        self.assertIn("cashtag", err)
+        self.assertNotIn("handle", err)
+        code, data = webpanel.api_payment(
+            tok, {"method_type": "crypto", "address": "", "active": True}
+        )
+        self.assertEqual(code, 400, data)
+        self.assertIn("wallet", (data.get("error") or "").lower())
+        code, data = webpanel.api_payment(
+            tok, {"method_type": "zelle", "handle": "", "active": True}
+        )
+        self.assertEqual(code, 400, data)
+        zerr = (data.get("error") or "").lower()
+        self.assertIn("email or phone", zerr)
+        self.assertNotIn("contact", zerr)
+        code, state = webpanel.api_state(tok)
+        self.assertEqual(code, 200, state)
+        mid = db.add_payment_from_template(
+            UNICORN, payment_templates.render_crypto("USDT", "Txyz", "")
+        )
+        code, state = webpanel.api_state(tok)
+        self.assertEqual(code, 200)
+        row = next(p for p in state["payments"] if int(p["id"]) == mid)
+        self.assertTrue(row.get("rail_ready"))
+        self.assertIn("network", (row.get("rail_warning") or "").lower())
+        self.assertIn("wallet address", row.get("target_kind_label") or "")
+        self.assertIn("0x", row.get("target_placeholder") or "")
 
 
 if __name__ == "__main__":

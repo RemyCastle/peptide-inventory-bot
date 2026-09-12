@@ -120,7 +120,7 @@ not send money.
 |---|---|
 | Boot seed | `run_cloud._seed_unicorn_payments` → `webpanel.ensure_unicorn_shop_payments`. Idempotent by `method_type` (paused rows count as present). **Pause, don't delete,** a seeded type you don't want. |
 | Telegram **💳 Payments** | `cb_adm_pays`. Quick-add templates + freeform. Pause / delete. PayPal + Apple Cash + a Unicorn-only **Seed Venmo + PayPal** when those types are missing (not only when the list is empty). Warns when **all methods are paused**. `paytpl:*` entry regex is every `METHOD_TYPES` value (PayPal / Apple Cash used to be dead buttons). Empty typed answers re-prompt; they do not insert an unusable row. |
-| Web panel Payments card | Typed fields, quick-add, Save/Delete. Warns when nothing is enabled; same seed CTA when Venmo or PayPal types are missing. Save of an **enabled** typed method with no handle returns 400 (pause still allowed). |
+| Web panel Payments card | Typed fields, quick-add, Save/Delete. Field labels follow `PAYMENT_TARGET_COPY` (cashtag / wallet / Zelle email or phone). Warns when nothing is enabled; same seed CTA when Venmo or PayPal types are missing. Save of an **enabled** typed method with no target returns 400 (pause still allowed). Crypto missing a network note shows `rail_warning` but stays usable. |
 | `POST /panel/api/payment` | Add / update / delete. This ship: `{seed_defaults: true}` (Unicorn shop only). |
 
 Seeded Unicorn defaults (buyer-facing handles, not secrets): Venmo `@wineboos`,
@@ -192,7 +192,8 @@ Menu Button URL in BotFather must match `UNICORN_STORE_URL` / vendor
 | P1 | Claim ping cancel was text-only; confirm success had no tracking CTA | **live `991eb64`** (Cancel URL button + `/confirm` Add tracking) |
 | P1 | Enabled method with no handle still counted as checkout_ready | **live `8829dfb`** (`usable` rails only; health `payments.usable`) |
 | P1 | PayPal / Apple Cash quick-add buttons did not start the prompt; enabled typed rails could save empty | **live `3663272`** (handler regex + 400 on empty enabled save) |
-| P1 | Empty-rail admin copy said "handle" for crypto / Cash App / Apple Cash; URL ZWJ/NBSP kept | **this ship** (type-specific empty-target copy; URL fail closed) |
+| P1 | Empty-rail admin copy said "handle" for crypto / Cash App / Apple Cash; URL ZWJ/NBSP kept | **live `1555d79`** (type-specific empty-target copy; URL fail closed) |
+| P1 | Panel field label still said "Handle / email / phone"; Zelle said "contact"; 400 was generic; crypto missing network was silent | **this ship** (`PAYMENT_TARGET_COPY`; panel labels; type-specific 400; crypto `rail_warning`) |
 | P2 | Native Telegram invoice (provider token unset) | Optional; Stars forbidden for physical goods |
 
 ---

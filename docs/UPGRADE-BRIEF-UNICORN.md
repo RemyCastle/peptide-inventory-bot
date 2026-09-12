@@ -1,16 +1,18 @@
-# SHIP BRIEF — MEGA-UNICORN v2 empty-rail copy + URL leftover
+# SHIP BRIEF — MEGA-UNICORN v2 panel pay-target copy + leftover notify
 
 Product: peptide (unicorn)  
 Repo: `C:\Users\Remy\peptide_inventory_bot`  
 Prod: https://unicornfartzz-bot.onrender.com  
 Priority: P1  
 Ship agent: grok  
-AUTOPUSH: this ship (empty-target payment copy + leftover URL/report
-fields; no stock change; never wipe inventory.db)
+AUTOPUSH: this ship (type-specific panel/API/Telegram pay-target
+copy; leftover vendor-notify + low-stock names; no stock change;
+never wipe inventory.db)
 
-Goal: Empty payment rails name the missing target (cashtag / wallet /
-phone, not a generic "handle"); http URLs fail closed on ZWJ/NBSP;
-pending-order reports come out clean; never wipe inventory.
+Goal: Panel and API name the missing pay target the same way Telegram
+does (cashtag / wallet / Zelle email or phone, not a generic handle);
+crypto without a network note warns the admin; leftover vendor-notify
+and low-stock names come out clean; never wipe inventory.
 
 Context (already verified — do not rediscover):
 
@@ -18,19 +20,13 @@ Context (already verified — do not rediscover):
 - `POST /order` auth + HMAC: [`../UNICORN-INITDATA-RUNBOOK.md`](../UNICORN-INITDATA-RUNBOOK.md)
 - Catalog vs Pages: [`../UNICORN-MINIAPP-PARITY.md`](../UNICORN-MINIAPP-PARITY.md)
 - P0 seed/409/health live on `16c6547` (`payments.active` = 2)
-- Checkout JSON follow-up live on `52a5e5a`
-- Buyer `message` + paid-order rails live on `fef9326`
-- Sold-out/min-order codes + empty-rails UX live on `c5bbf40`
-- Laptop `inventory.db` is not live; Render `/data/inventory.db` is never opened from tests
-- Confirm URL + buyer DM live on `6c3d68b` (`payments.active` = 2, cache bust `20260913`)
-- Claim cancel URL + confirm-success tracking live on `991eb64`
-- Sanitizer harden live on `2340351` (live `/health` sha `2340351`, `payments.active` = 2)
 - Empty-handle rails live on `8829dfb` (`payments.usable` = 2)
 - PayPal/Apple Cash quick-add + refuse empty typed saves live on `3663272`
-- Sanitizer audit live on `4acf273` (invisible fillers, percent-decoded
-  URL C0/Cf, leftover branding/order/report fields)
-- This ship: type-specific empty-rail copy; URL ZWJ/NBSP fail closed;
-  pending-orders report leftover
+- Empty-rail copy + URL ZWJ/NBSP live on `1555d79`
+- Laptop `inventory.db` is not live; Render `/data/inventory.db` is never opened from tests
+- This ship: panel field labels/placeholders; type-specific 400;
+  Zelle "email or phone"; crypto network warning (still usable);
+  leftover NEW ORDER notify + low-stock names
 
 ## Prior ships
 
@@ -38,85 +34,44 @@ Context (already verified — do not rediscover):
 `no_payment_methods`, buyer `payment_methods`, PayPal/Apple Cash quick-add,
 `/health` payment counts, 401 `detail`, honest empty copy.
 
-**Checkout JSON follow-up — live on `52a5e5a`:** `GET /order-status` pay rails,
-401/409 `message` on initData + empty methods, 401 `error` split
-(`empty_initdata` / `bad_payload` / `bad_hash` / `expired`),
-`/health` `invoices.enabled`.
-
-**Buyer `message` + paid-order rails — live on `fef9326`:** every `POST /order`
-error has `message`; `GET /order-status` 404 has `message`; `needs_payment`
-plus null `pay_url` after paid.
-
-**Buyer copy + `pay_hint` — live on `2054b95`:** `/storefront` `message` +
-`invoices_enabled`; `/order-status` status `message`; rails `pay_hint`
-(no handles on catalog; pay_hint/pay_url hidden after paid).
-
-**Stable sold-out/min-order codes + empty-rails UX — live on `c5bbf40`:**
-`POST /order` `error: sold_out` / `min_order` + buyer `message`; success
-`needs_payment: true`. Cancelled/rejected `GET /order-status` keep method
-names, null `pay_url`, `needs_payment: false`; awaiting confirmation still
-has `pay_url`. `/storefront` `checkout_ready` (names+types only). Telegram
-warns when all methods are paused; Unicorn seed CTA shows when Venmo or
-PayPal types are missing (web panel same rule).
-
-**Pages checkout JS + cache bust — live on `fe857ec`:** Mini App uses
-`pay_url` / `pay_hint` / `checkout_message`; submit disabled when
-`checkout_ready` is false; mockup chrome gone. `STORE_URL_CACHE_BUST`
-was `20260912`.
-
-**Mini App I've paid + admin rails preview — live on `bef4d5f`:**
-`POST /order-paid` pending → awaiting (no stock change); `can_mark_paid`;
-health `checkout_ready` + cache bust `20260913`; Pages I've paid + Copy
-target.
-
-**Mini App payment-claim confirm URL — live on `6c3d68b`:** vendor ping
-includes `/confirm?ct=` URL button + cancel text line; buyer DM on first
-claim; second tap 200 idempotent; no stock change.
-
-**Mini App claim cancel URL + confirm-success tracking — live on `991eb64`:**
-PAYMENT CLAIM is Confirm + Cancel URL buttons; `/confirm` success offers
-Add tracking. Claim still no stock change.
-
-**Empty-handle rails are not checkout-ready — live on `8829dfb`:**
-typed methods with no handle do not count as a pay rail; `POST /order`
-409; health `payments.usable`; admin/panel warn.
-
-**Sanitizer audit — live on `4acf273`:** invisible fillers, percent-decoded
-C0/Cf/line-sep, leftover `shop_display` / order summary / payment HTML /
-inventory report / shipping label / tracking URL / site-sync.
+**Empty-rail copy + leftover URL/report — live on `1555d79`:** crypto /
+Cash App / Apple Cash empty rails name wallet/cashtag/phone;
+`public_http_url` rejects `%E2%80%8D` / `%C2%A0`; pending-orders report
+sanitized.
 
 ## This ship
 
-**Empty-rail copy + leftover URL/report fields.** Payments P1 is live
-(Venmo+PayPal usable). Leftover: admin/panel still said "handle" for
-crypto wallets / Cash App cashtags / Apple Cash numbers; `public_http_url`
-kept ZWJ (catalog KEEP_CF) and NBSP so `exam%E2%80%8Dple.com` /
-`%C2%A0` could spoof; pending-orders report still echoed dirty names.
+**Panel pay-target copy + leftover notify/low-stock names.** Payments P1
+is live (Venmo+PayPal usable). Leftover: panel still labeled every typed
+field "Handle / email / phone"; Zelle copy said "contact"; API 400 said
+"Payment handle / number required"; Telegram empty-typed re-prompt was a
+slash list; crypto with an address and no network note was silent;
+NEW ORDER vendor DM and low-stock alerts still echoed dirty names.
 
-- Type-specific empty-target copy: `payment_target_kind_label` /
-  `payment_empty_rail_hint` / `payment_empty_rails_admin_line`. Panel
-  per-row + save toast; Telegram payments list + checkout-blocked.
-- `public_http_url` fails closed on all Cf (incl. ZWJ/tags), Zs other
-  than SPACE, and combining marks. Pirate flag / profession ZWJ stay
-  on catalog labels. `%20` and emoji percents stay.
-- Pending-orders report sanitizes buyer / method / item names. Telegram
-  shipping label uses `shop_display`.
+- `PAYMENT_TARGET_COPY` is the source of truth (panel JS `PAY_TARGET_COPY`
+  stays in sync). Field labels, placeholders, 400, Telegram re-prompt,
+  and Zelle `pay_hint` all use it.
+- Crypto missing `network_note` stays **usable** and shows admin
+  `rail_warning` (wrong-chain is on the seller to prevent).
+- `build_new_order_notify_text` + `format_new_order_ship_section`
+  sanitize buyer / shop / item / ship. Low-stock alert names use
+  `display_product_name`.
 - `STORE_URL_CACHE_BUST` stays `20260913`. No Pages JS. No DELETE.
 
 ## Acceptance (this ship)
 
-- [x] `python -m pytest -q -x` green on scratch DBs (691 passed)
+- [x] `python -m pytest -q -x` green on scratch DBs (695 passed)
 - [x] Docker COPY check still lists every imported module (26)
 - [x] No writes to laptop `inventory.db`; no DELETE of products
-- [x] Crypto empty rail says wallet address, not handle
-- [x] `public_http_url` rejects `%E2%80%8D` / `%C2%A0` / `%CC%81`;
-      keeps `%20` and emoji percents; pirate ZWJ kept in names
-- [x] Dirty pending-orders report comes out clean
+- [x] Panel label for Cash App is cashtag, not handle
+- [x] Zelle empty copy / 400 / `pay_hint` say email or phone, not contact
+- [x] Enabled empty crypto 400 says wallet; missing network warns, still usable
+- [x] Dirty NEW ORDER notify and low-stock names come out clean
 - [x] No secrets / `.env` / scratch import files committed
 
-Prior `4acf273` / `3663272` / `8829dfb` / `991eb64` checks stay true:
+Prior `1555d79` / `3663272` / `8829dfb` checks stay true:
 PayPal/Apple Cash quick-add, usable rails only, Confirm + Cancel URL
-buttons, invisible fillers, `can_mark_paid`.
+buttons, empty-rail type-specific Telegram list, URL ZWJ/NBSP fail closed.
 
 ## Out of scope
 
@@ -124,6 +79,7 @@ buttons, invisible fillers, `can_mark_paid`.
 - Hard-delete / DB wipe / importer against live stock
 - Telegram Stars
 - PayPal.me for email handles (seeded PayPal is an email — copy/paste only)
+- Requiring network_note for crypto checkout_ready
 - SPBC back-room; other vendor shops' default handles
 - Force-push; committing untracked scratch
 - Pages JS (no cache-bust bump)

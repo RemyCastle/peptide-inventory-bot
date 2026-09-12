@@ -2897,10 +2897,17 @@ def confirm_order_payment(
                 order_id=order_id,
             )
             if after <= threshold:
+                shown = root["name"]
+                try:
+                    from catalog_cleanup import display_product_name
+
+                    shown = display_product_name(str(shown or ""))
+                except Exception:
+                    shown = str(shown or "")
                 low_stock_alerts.append(
                     {
                         "product_id": int(root["id"]),
-                        "name": root["name"],
+                        "name": shown,
                         "stock": after,
                         "threshold": threshold,
                         "chat_id": int(root["chat_id"]),

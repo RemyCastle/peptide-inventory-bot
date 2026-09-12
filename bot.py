@@ -5657,10 +5657,10 @@ async def pay_tpl_details(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         answers.pop()
         context.user_data["pay_tpl_answers"] = answers
         set_awaiting(context, f"pay_tpl_{mt}")
+        kind = vendor_stores.payment_target_kind_label(payload)
         await update.message.reply_text(
-            "Need a real handle / cashtag / email / phone / wallet so "
-            "buyers can pay.\n\n"
-            + (prompts[-1] if prompts else "Enter the handle:")
+            f"Need a real {kind} so buyers can pay.\n\n"
+            + (prompts[-1] if prompts else f"Enter the {kind}:")
             + "\n\n/cancel",
             reply_markup=force_reply(
                 PAY_TPL_PLACEHOLDERS.get(mt, "Type your answer...")
@@ -6227,8 +6227,10 @@ async def _notify_low_stock(
         return
     lines = ["⚠️ *Low stock alert*\n"]
     for a in alerts:
+        shown = catalog_cleanup.display_product_name(str(a.get("name") or ""))
+        shown = catalog_cleanup.md_escape(shown)
         lines.append(
-            f"• *{a['name']}* — {a['stock']} left (threshold ≤ {a['threshold']})"
+            f"• *{shown}* — {a['stock']} left (threshold ≤ {a['threshold']})"
         )
     text = "\n".join(lines)
     recipients: set[int] = set(OWNER_IDS)

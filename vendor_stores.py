@@ -688,7 +688,7 @@ def payment_pay_hint(method: dict, total: float = 0.0, code: str = "") -> str:
         )
     if mt == "zelle":
         return (
-            "Copy the Zelle contact and send the total. "
+            "Copy the Zelle email or phone and send the total. "
             "Put the order code in the note."
         )
     if mt == "apple_cash":
@@ -823,20 +823,93 @@ def payment_pay_link(method: dict, total: float, code: str) -> str | None:
     except Exception:
         return built
 
-def payment_target_kind_label(method: dict | None = None) -> str:
-    """What to ask the admin for when this rail has no copyable target."""
+# Admin/panel copy for the pay target of each typed rail. Keep in sync with
+# PAY_TARGET_COPY in webpanel.PANEL_HTML (tests assert both).
+PAYMENT_TARGET_COPY: dict[str, dict[str, str]] = {
+    "venmo": {
+        "kind": "Venmo handle",
+        "placeholder": "@handle",
+        "need": "a Venmo handle",
+    },
+    "paypal": {
+        "kind": "PayPal email or username",
+        "placeholder": "email or @username",
+        "need": "a PayPal email or username",
+    },
+    "cashapp": {
+        "kind": "Cash App cashtag",
+        "placeholder": "$cashtag",
+        "need": "a Cash App cashtag",
+    },
+    "zelle": {
+        "kind": "Zelle email or phone",
+        "placeholder": "email or phone",
+        "need": "a Zelle email or phone",
+    },
+    "apple_cash": {
+        "kind": "Apple Cash number",
+        "placeholder": "phone number",
+        "need": "an Apple Cash number",
+    },
+    "crypto": {
+        "kind": "wallet address",
+        "placeholder": "0x… or bc1…",
+        "need": "a wallet address",
+    },
+    "custom": {
+        "kind": "payment instructions",
+        "placeholder": "how buyers pay",
+        "need": "payment instructions",
+    },
+}
+
+
+def _payment_copy_for(method: dict | None = None) -> dict[str, str]:
     mt = ""
     if method:
         mt, _target = _method_kind_and_target(method)
-    return {
-        "venmo": "Venmo handle",
-        "paypal": "PayPal email or username",
-        "cashapp": "Cash App cashtag",
-        "zelle": "Zelle contact",
-        "apple_cash": "Apple Cash number",
-        "crypto": "wallet address",
-        "custom": "payment instructions",
-    }.get(mt, "pay target")
+    return PAYMENT_TARGET_COPY.get(mt) or {
+        "kind": "pay target",
+        "placeholder": "",
+        "need": "a pay target",
+    }
+
+
+def payment_target_kind_label(method: dict | None = None) -> str:
+    """What to ask the admin for when this rail has no copyable target."""
+    return _payment_copy_for(method)["kind"]
+
+
+def payment_target_placeholder(method: dict | None = None) -> str:
+    """Input placeholder for the typed pay-target field."""
+    return _payment_copy_for(method)["placeholder"]
+
+
+def payment_empty_rail_save_error(method: dict) -> str:
+    """400 body when an enabled typed rail is saved with no pay target."""
+    mt, _target = _method_kind_and_target(method)
+    if mt == "crypto":
+        return "Crypto wallet address required"
+    if mt in PAYMENT_TARGET_COPY and mt != "custom":
+        return f"{PAYMENT_TARGET_COPY[mt]['kind']} required"
+    return "Add payment instructions so buyers know how to pay"
+
+
+def payment_rail_warning(method: dict) -> str:
+    """Admin-only warning; does not block checkout_ready.
+
+    Crypto with an address but no network note is still usable (buyers can
+    copy the wallet) — wrong-chain sends are on the seller to prevent.
+    """
+    mt, target = _method_kind_and_target(method)
+    if mt == "crypto" and target:
+        note = " ".join(str(method.get("network_note") or "").split())
+        if not note:
+            return (
+                "Add a network note (e.g. USDT TRC20) so buyers do not "
+                "send on the wrong chain."
+            )
+    return ""
 
 
 def payment_empty_rail_hint(method: dict) -> str:
@@ -1088,6 +1161,14 @@ def format_customer_ship_block(
 
 def format_new_order_ship_section(ship_name: str, ship_address: str) -> str:
     """NEW ORDER notify shipping section (plain text)."""
+    try:
+        from catalog_cleanup import sanitize_multiline, storefront_label
+
+        ship_name = storefront_label(ship_name, 80)
+        ship_address = sanitize_multiline(ship_address, 200)
+    except Exception:
+        ship_name = " ".join(str(ship_name or "").split())[:80]
+        ship_address = str(ship_address or "").strip()[:200]
     if ship_address:
         lines = ["Ship to:"]
         if ship_name:
@@ -1111,15 +1192,31 @@ def build_new_order_notify_text(
     """
     oid = int(order["id"])
     code = order.get("payment_code") or f"#{oid}"
-    full_name = (order.get("full_name") or "").strip() or "Customer"
-    username = (order.get("username") or "").strip() or "—"
+    try:
+        from catalog_cleanup import display_product_name, storefront_label
+
+        full_name = storefront_label(order.get("full_name"), 80) or "Customer"
+        username = storefront_label(order.get("username"), 40) or "—"
+        shop_label = storefront_label(shop_name, 80) or "the shop"
+        code = storefront_label(code, 32) or f"#{oid}"
+    except Exception:
+        display_product_name = None  # type: ignore[assignment]
+        full_name = (order.get("full_name") or "").strip() or "Customer"
+        username = (order.get("username") or "").strip() or "—"
+        shop_label = (shop_name or "").strip() or "the shop"
+
+    def _item_name(raw: object) -> str:
+        if display_product_name is None:
+            return str(raw or "")
+        return display_product_name(str(raw or ""))
+
     user_id = order.get("user_id") or "—"
-    shop_label = (shop_name or "").strip() or "the shop"
 
     if order_lines is None:
         order_lines = db.get_order_items(oid)
     plain_lines = [
-        f"  • {ln['product_name']} × {ln['quantity']} — {_fmt_money(ln['line_total'])}"
+        f"  • {_item_name(ln.get('product_name'))} × {ln['quantity']} — "
+        f"{_fmt_money(ln['line_total'])}"
         for ln in (order_lines or [])
     ]
     if order.get("shipping_fee"):

@@ -1213,6 +1213,9 @@ def api_state(tok: dict) -> tuple[int, dict]:
                 "rail_ready": vendor_stores.payment_rail_usable(m),
                 "buyer_hint": vendor_stores.payment_pay_hint(m),
                 "empty_rail_hint": vendor_stores.payment_empty_rail_hint(m),
+                "target_kind_label": vendor_stores.payment_target_kind_label(m),
+                "target_placeholder": vendor_stores.payment_target_placeholder(m),
+                "rail_warning": vendor_stores.payment_rail_warning(m),
             }
             for m in payments
         ],
@@ -1523,6 +1526,7 @@ def _reject_unusable_enabled_payment(row: dict) -> tuple[int, dict] | None:
 
         if vendor_stores.payment_rail_usable(row):
             return None
+        return _err(400, vendor_stores.payment_empty_rail_save_error(row))
     except Exception:
         target = (
             row.get("cashtag") or row.get("handle") or row.get("address") or ""
@@ -1533,12 +1537,11 @@ def _reject_unusable_enabled_payment(row: dict) -> tuple[int, dict] | None:
             "venmo", "paypal", "cashapp", "zelle", "apple_cash", "crypto"
         ) and len(instr) >= 8):
             return None
-    mt = (row.get("method_type") or "custom").lower()
-    if mt == "crypto":
-        return _err(400, "Crypto wallet address required")
-    if mt in ("venmo", "paypal", "zelle", "apple_cash", "cashapp"):
-        return _err(400, "Payment handle / number required")
-    return _err(400, "Add payment instructions so buyers know how to pay")
+        if mt == "crypto":
+            return _err(400, "Crypto wallet address required")
+        if mt in ("venmo", "paypal", "zelle", "apple_cash", "cashapp"):
+            return _err(400, "Pay target required")
+        return _err(400, "Add payment instructions so buyers know how to pay")
 
 
 def api_payment(tok: dict, payload: dict) -> tuple[int, dict]:
@@ -3043,6 +3046,18 @@ try{
   else{T=sessionStorage.getItem('spbc_panel_t')||'';}
 }catch(e){/* private mode: token simply stays in the URL */}
 const $=s=>document.querySelector(s);
+const PAY_TARGET_COPY={
+  venmo:{kind:'Venmo handle',placeholder:'@handle',need:'a Venmo handle'},
+  paypal:{kind:'PayPal email or username',placeholder:'email or @username',need:'a PayPal email or username'},
+  cashapp:{kind:'Cash App cashtag',placeholder:'$cashtag',need:'a Cash App cashtag'},
+  zelle:{kind:'Zelle email or phone',placeholder:'email or phone',need:'a Zelle email or phone'},
+  apple_cash:{kind:'Apple Cash number',placeholder:'phone number',need:'an Apple Cash number'},
+  crypto:{kind:'wallet address',placeholder:'0x… or bc1…',need:'a wallet address'},
+  custom:{kind:'payment instructions',placeholder:'how buyers pay',need:'payment instructions'}
+};
+function payTargetCopy(t){
+  return PAY_TARGET_COPY[t]||{kind:'pay target',placeholder:'',need:'a pay target'};
+}
 let S=null;
 let ORDERS=[];
 let TAB=(MODE==='restock')?'catalog':'orders';
@@ -3308,13 +3323,16 @@ function render(){
       return '';})()}
     ${(()=>{const types=new Set((S.payments||[]).map(m=>String(m.method_type||'').toLowerCase()));
       return (S.shop&&S.shop.is_unicorn&&(!types.has('venmo')||!types.has('paypal')))
-        ?'<div class="flex" style="margin-bottom:10px"><button type="button" id="pm-seed">✨ Seed Venmo + PayPal</button><span class="tag grow">Edit handles after — boot will not overwrite them</span></div>':'';})()}
+        ?'<div class="flex" style="margin-bottom:10px"><button type="button" id="pm-seed">✨ Seed Venmo + PayPal</button><span class="tag grow">Edit Venmo and PayPal after — boot will not overwrite them</span></div>':'';})()}
     <div id="paylist">${S.payments.map(m=>{
       const t=m.method_type||'custom';
+      const tc=payTargetCopy(t);
       const handle=esc(m.handle||m.cashtag||'');
       const addr=esc(m.address||'');
       const chain=esc(m.chain||'');
       const note=esc(m.network_note||'');
+      const kind=esc(m.target_kind_label||tc.kind);
+      const ph=esc(m.target_placeholder||tc.placeholder);
       return `<div class="prod${m.active?'':' off'}" data-mid="${m.id}" data-type="${esc(t)}">
         <div class="row">
           <div class="name"><label>Type</label>
@@ -3330,8 +3348,8 @@ function render(){
           <div class="name"><label>Label</label>
             <input class="p-name" value="${esc(m.name)}"></div></div>
         <div class="row p-fields">
-          <div class="name p-f-handle"><label>Handle / email / phone</label>
-            <input class="p-handle" value="${handle}" placeholder="@handle, email, or phone"></div>
+          <div class="name p-f-handle"><label class="p-handle-lab">${kind}</label>
+            <input class="p-handle" value="${handle}" placeholder="${ph}"></div>
           <div class="name p-f-chain" style="${t==='crypto'?'':'display:none'}"><label>Coin</label>
             <input class="p-chain" value="${chain}" placeholder="BTC / ETH / USDT"></div>
           <div class="name p-f-addr" style="${t==='crypto'?'':'display:none'}"><label>Wallet address</label>
@@ -3342,6 +3360,7 @@ function render(){
         <label>Instructions shown to buyers (auto-filled from the fields above — editable)</label>
         <textarea class="p-instr" style="min-height:60px">${esc(m.instructions)}</textarea>
         ${m.active&&m.rail_ready===false?`<p class="howto" style="margin:6px 0 0">${esc(m.empty_rail_hint||'No pay target — buyers cannot use this method until you add one.')}</p>`:''}
+        ${m.rail_warning?`<p class="howto" style="margin:6px 0 0">${esc(m.rail_warning)}</p>`:''}
         ${m.buyer_hint?`<p class="tag" style="margin:6px 0 0">Buyers see: ${esc(m.buyer_hint)}</p>`:''}
         <div class="flex" style="margin-top:8px">
           <label class="flex" style="margin:0"><input type="checkbox" class="p-act"
@@ -3566,9 +3585,14 @@ function wire(){
     const typeSel=el.querySelector('.p-type');
     const syncFields=()=>{
       const t=typeSel.value;
+      const tc=payTargetCopy(t);
       el.querySelectorAll('.p-f-chain,.p-f-addr').forEach(n=>n.style.display=t==='crypto'?'':'none');
       el.querySelectorAll('.p-f-note').forEach(n=>n.style.display=(t==='crypto'||t==='paypal')?'':'none');
       el.querySelectorAll('.p-f-handle').forEach(n=>n.style.display=t==='crypto'?'none':'');
+      const lab=el.querySelector('.p-handle-lab');
+      if(lab) lab.textContent=tc.kind;
+      const inp=el.querySelector('.p-handle');
+      if(inp) inp.placeholder=tc.placeholder;
     };
     if(typeSel){typeSel.onchange=syncFields;syncFields();}
     el.querySelector('.p-save').onclick=async()=>{
@@ -3581,10 +3605,7 @@ function wire(){
         return;
       }
       if(active && t!=='custom' && t!=='crypto' && !String(handle).trim()){
-        const need={venmo:'a Venmo handle',paypal:'a PayPal email or username',
-          cashapp:'a Cash App cashtag',zelle:'a Zelle contact',
-          apple_cash:'an Apple Cash number'}[t]||'a pay target';
-        toast('Add '+need+' so buyers can use this method (or uncheck enabled)',true);
+        toast('Add '+payTargetCopy(t).need+' so buyers can use this method (or uncheck enabled)',true);
         return;
       }
       const d=await api('payment',{
@@ -3605,29 +3626,22 @@ function wire(){
   const seedBtn=document.getElementById('pm-seed');
   if(seedBtn) seedBtn.onclick=async()=>{
     const d=await api('payment',{seed_defaults:true});
-    if(d.ok){toast('Seeded — edit handles anytime');load();}
+    if(d.ok){toast('Seeded — edit pay targets anytime');load();}
     else toast(d.error||'Could not seed',true);
   };
   document.querySelectorAll('.pm-quick').forEach(btn=>{
     btn.onclick=async()=>{
       const t=btn.dataset.type;
-      const placeholders={
-        venmo:'@yourhandle',
-        paypal:'you@email.com',
-        zelle:'email or phone',
-        apple_cash:'phone number',
-        cashapp:'$cashtag',
-        crypto:''
-      };
+      const tc=payTargetCopy(t);
       let handle='', address='', chain='', network_note='';
       if(t==='crypto'){
         chain=prompt('Coin (BTC / ETH / USDT / Other)','USDT')||'';
         address=prompt('Wallet address','')||'';
         if(!address.trim()){toast('Address required',true);return;}
-        network_note=prompt('Network note (optional)','')||'';
+        network_note=prompt('Network note (e.g. USDT TRC20)','')||'';
       } else {
-        handle=prompt('Enter your '+(t.replace('_',' '))+ ' details', placeholders[t]||'')||'';
-        if(!handle.trim()){toast('Value required',true);return;}
+        handle=prompt('Enter '+tc.need, tc.placeholder)||'';
+        if(!handle.trim()){toast(tc.kind+' required',true);return;}
         if(t==='paypal') network_note='friends_family';
       }
       const d=await api('payment',{method_type:t,handle,address,chain,network_note});

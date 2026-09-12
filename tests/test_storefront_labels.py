@@ -1121,6 +1121,77 @@ class StorefrontGapTests(unittest.TestCase):
         self.assertFalse(row.get("rail_ready"))
         self.assertIn("wallet address", row.get("empty_rail_hint") or "")
         self.assertNotIn("handle", (row.get("empty_rail_hint") or "").lower())
+        self.assertEqual(row.get("target_kind_label"), "wallet address")
+        self.assertIn("0x", row.get("target_placeholder") or "")
+
+    def test_new_order_notify_strips_buyer_item_ship_junk(self) -> None:
+        pid = db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, 3)
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer",
+            "Buyer",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "Aod 5mg (vial) $15.00",
+                    "unit_price": 15.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo"},
+            "Buyer",
+            "1 St",
+            "",
+        )
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET full_name = ?, username = ?, "
+                "ship_name = ?, ship_address = ? WHERE id = ?",
+                (
+                    "Buyer\ufffd",
+                    "buyer\u0000",
+                    "Ship\u0000Name\ufffd",
+                    "1 St\u0000\ufffd",
+                    int(order["id"]),
+                ),
+            )
+            conn.execute(
+                "UPDATE order_items SET product_name = ? WHERE order_id = ?",
+                ("Aod 5mg (vial) $15.00\ufffd", int(order["id"])),
+            )
+        dirty = db.get_order(int(order["id"]))
+        note = vendor_stores.build_new_order_notify_text(
+            dirty, shop_name="Unicorn\u0000 Magic\ufffd"
+        )
+        self.assertIn("Buyer", note)
+        self.assertIn("Aod 5mg", note)
+        self.assertIn("Unicorn Magic", note)
+        self.assertIn("ShipName", note)
+        self.assertNotIn("(vial)", note)
+        self.assertNotIn("\ufffd", note)
+        self.assertNotIn("\u0000", note)
+
+    def test_low_stock_alert_name_is_cleaned(self) -> None:
+        pid = db.add_product(SHOP, "Aod 5mg (vial) $15.00", 15.0, stock=1)
+        db.update_shop(SHOP, low_stock_threshold=5)
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer",
+            "Buyer",
+            [{"product_id": pid, "quantity": 1}],
+            {"id": None, "name": "Venmo"},
+            "Buyer",
+            "1 St",
+            "",
+        )
+        ok, _msg, alerts = db.confirm_order_payment(int(order["id"]), USER)
+        self.assertTrue(ok)
+        self.assertTrue(alerts)
+        self.assertIn("Aod 5mg", alerts[0]["name"])
+        self.assertNotIn("(vial)", alerts[0]["name"])
+        self.assertNotIn("$15", alerts[0]["name"])
 
 
 if __name__ == "__main__":
