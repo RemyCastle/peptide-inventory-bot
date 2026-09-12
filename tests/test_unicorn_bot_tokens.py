@@ -142,8 +142,16 @@ class UnicornBotTokenTests(unittest.TestCase):
             "seller",
             vendor_stores.checkout_buyer_message("no_vendor_token").lower(),
         )
-        sold = vendor_stores.checkout_buyer_message(spbc_notify.ORDER_STOCK_ERROR)
+        sold = vendor_stores.checkout_buyer_message("sold_out")
         self.assertIn("sold", sold.lower())
+        self.assertIn(
+            "sold",
+            vendor_stores.checkout_buyer_message(spbc_notify.ORDER_STOCK_ERROR).lower(),
+        )
+        self.assertIn(
+            "minimum",
+            vendor_stores.checkout_buyer_message("min_order").lower(),
+        )
         err = vendor_stores.checkout_error_body("no_vendor_token")
         self.assertFalse(err["ok"])
         self.assertEqual(err["error"], "no_vendor_token")

@@ -99,16 +99,29 @@ class OrderStatusTests(unittest.TestCase):
         )
         self.assertEqual(code, 404, body)
         self.assertFalse(body.get("ok"))
+        self.assertEqual(body.get("error"), "order not found")
+        self.assertIn("No order found", body.get("message") or "")
 
     def test_claim_token_rejected(self) -> None:
         claim = webpanel.create_vendor_invite(OWNER, "nope")
         code, body = webpanel.api_order_status(claim, self.order["payment_code"])
         self.assertEqual(code, 404, body)
+        self.assertEqual(body.get("error"), "unknown storefront")
+        self.assertIn("Re-open", body.get("message") or "")
 
     def test_unknown_code(self) -> None:
         code, body = webpanel.api_order_status(self.sf_a, "🎁999999")
         self.assertEqual(code, 404, body)
+        self.assertEqual(body.get("error"), "order not found")
         self.assertIn("No order found", body.get("message") or "")
+
+    def test_unknown_storefront_404_has_message(self) -> None:
+        code, body = webpanel.api_order_status(
+            "deadbeefdeadbeefdeadbeef", self.order["payment_code"]
+        )
+        self.assertEqual(code, 404, body)
+        self.assertEqual(body.get("error"), "unknown storefront")
+        self.assertTrue(body.get("message"))
 
     def test_paid_order_hides_pay_url(self) -> None:
         db.mark_order_awaiting_confirmation(self.order["id"])
@@ -125,6 +138,59 @@ class OrderStatusTests(unittest.TestCase):
         pms = body.get("payment_methods") or []
         self.assertTrue(pms)
         self.assertEqual(pms[0].get("method_type"), "venmo")
+        self.assertFalse(pms[0].get("pay_url"))
+
+    def test_awaiting_confirmation_keeps_pay_url(self) -> None:
+        db.mark_order_awaiting_confirmation(self.order["id"])
+        code, body = webpanel.api_order_status(
+            self.sf_a, self.order["payment_code"]
+        )
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["status"], "awaiting_confirmation")
+        self.assertTrue(body.get("needs_payment"))
+        pms = body.get("payment_methods") or []
+        self.assertTrue(pms[0].get("pay_url"))
+
+    def test_cancelled_and_rejected_hide_pay_url(self) -> None:
+        ok, msg = db.cancel_order(self.order["id"], BUYER)
+        self.assertTrue(ok, msg)
+        code, body = webpanel.api_order_status(
+            self.sf_a, self.order["payment_code"]
+        )
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["status"], "cancelled")
+        self.assertFalse(body.get("needs_payment"))
+        pms = body.get("payment_methods") or []
+        self.assertEqual(pms[0].get("method_type"), "venmo")
+        self.assertFalse(pms[0].get("pay_url"))
+
+        other = db.create_order(
+            SHOP_A,
+            BUYER,
+            "buyer",
+            "Buyer Bee",
+            [
+                {
+                    "product_id": self.pid,
+                    "product_name": "BPC-157",
+                    "unit_price": 40.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo"},
+            "Buyer Bee",
+            "1 Test St, Austin TX",
+        )
+        ok, msg = db.reject_order(other["id"], OWNER, note="test")
+        self.assertTrue(ok, msg)
+        code, body = webpanel.api_order_status(
+            self.sf_a, other["payment_code"]
+        )
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["status"], "rejected")
+        self.assertFalse(body.get("needs_payment"))
+        pms = body.get("payment_methods") or []
+        self.assertEqual(pms[0].get("name"), "Venmo")
         self.assertFalse(pms[0].get("pay_url"))
 
     def test_http_get_cors(self) -> None:

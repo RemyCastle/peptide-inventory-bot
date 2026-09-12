@@ -184,6 +184,10 @@ def checkout_buyer_message(code: str) -> str:
         return "This shop isn't available. Re-open the store from the bot."
     if key in ("order not found", "order_not_found"):
         return "No order found for that code in this shop."
+    if key in ("min_order", "below_minimum"):
+        return (
+            "This order is below the shop minimum. Add more items and try again."
+        )
     if key == "sold_out" or "sold" in low:
         return (
             "Couldn't place that order — something in your cart just sold "

@@ -1112,6 +1112,14 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             log.info("POST /order no payment methods shop=%s", shop_chat_id)
             return 409, vendor_stores.checkout_error_body("no_payment_methods")
 
+        shop_row = db.get_shop(shop_chat_id) or db.ensure_shop(shop_chat_id)
+        ok_min, _min_msg = db.check_min_order(
+            shop_row, db.cart_quantity_total(items)
+        )
+        if not ok_min:
+            log.info("POST /order below min_order shop=%s", shop_chat_id)
+            return 409, vendor_stores.checkout_error_body("min_order")
+
         ship_name, ship_address, ship_notes = vendor_stores.parse_ship_fields(
             payload
         )
@@ -1134,7 +1142,7 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
                 shop_chat_id,
                 buyer_id,
             )
-            return 409, vendor_stores.checkout_error_body(ORDER_STOCK_ERROR)
+            return 409, vendor_stores.checkout_error_body("sold_out")
 
         order_id = int(order["id"])
         code = order.get("payment_code") or f"#{order_id}"
@@ -1256,6 +1264,7 @@ def handle_http_order(payload: dict) -> tuple[int, dict]:
             "ok": True,
             "code": code,
             "total": total,
+            "needs_payment": True,
             "payments": payments,
             "payment_methods": pay_objs,
             "message": message,

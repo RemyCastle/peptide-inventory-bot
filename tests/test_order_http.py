@@ -175,6 +175,7 @@ class OrderHttpTests(unittest.TestCase):
         self.assertEqual(pm0.get("name"), "Venmo")
         self.assertIn(pm0.get("method_type"), ("venmo", "custom"))
         self.assertTrue(pm0.get("line"))
+        self.assertTrue(body.get("needs_payment"))
         self.assertIn("Order received", body["message"])
         self.assertIn(body["code"], body["message"])
         self.assertIn("1 Test St", body["message"])
@@ -357,8 +358,21 @@ class OrderHttpTests(unittest.TestCase):
         )
         self.assertEqual(code, 409)
         self.assertFalse(body.get("ok"))
-        self.assertIn("sold", body.get("error", "").lower())
+        self.assertEqual(body.get("error"), "sold_out")
         self.assertIn("sold", (body.get("message") or "").lower())
+        with db.get_db() as conn:
+            n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
+        self.assertEqual(n, 0)
+
+    def test_min_order_409_does_not_create_order(self) -> None:
+        db.set_min_order(SHOP, 5, label="vial")
+        code, body = spbc_notify.handle_http_order(
+            self._payload(items=[{"id": self.pid, "vials": 1, "kits": 0}])
+        )
+        self.assertEqual(code, 409, body)
+        self.assertFalse(body.get("ok"))
+        self.assertEqual(body.get("error"), "min_order")
+        self.assertIn("minimum", (body.get("message") or "").lower())
         with db.get_db() as conn:
             n = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
         self.assertEqual(n, 0)

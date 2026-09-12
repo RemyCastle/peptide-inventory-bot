@@ -5438,24 +5438,33 @@ async def cb_adm_pays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 InlineKeyboardButton("🗑", callback_data=f"delm:{m['id']}"),
             ]
         )
+    active = [m for m in methods if m.get("active")]
     if not methods:
         lines.append(
             "_None configured._ Buyers cannot checkout until you add one."
         )
-        try:
-            import unicorn_shop
+    elif not active:
+        lines.append(
+            "_All methods paused._ Buyers cannot checkout until you "
+            "unpause one or add another."
+        )
+    try:
+        import unicorn_shop
 
-            if unicorn_shop.is_unicorn_shop(sid):
-                buttons.append(
-                    [
-                        InlineKeyboardButton(
-                            "✨ Seed Venmo + PayPal",
-                            callback_data="adm_seedpays",
-                        )
-                    ]
-                )
-        except Exception:
-            pass
+        have = {(m.get("method_type") or "").lower() for m in methods}
+        if unicorn_shop.is_unicorn_shop(sid) and (
+            "venmo" not in have or "paypal" not in have
+        ):
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        "✨ Seed Venmo + PayPal",
+                        callback_data="adm_seedpays",
+                    )
+                ]
+            )
+    except Exception:
+        pass
     lines.append("\n_Quick add:_")
     buttons.append(
         [

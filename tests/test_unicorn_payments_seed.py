@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -104,14 +105,31 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         webpanel.ensure_storefront_key_plain(UNICORN, PAGES_KEY)
         code, body = webpanel.api_storefront(PAGES_KEY)
         self.assertEqual(code, 200, body)
+        self.assertTrue(body.get("checkout_ready"))
         self.assertIn("Venmo", body["payments"])
         self.assertIn("PayPal", body["payments"])
         kinds = {m["method_type"] for m in body["payment_methods"]}
         self.assertEqual(kinds, {"venmo", "paypal"})
+        blob = json.dumps(body)
+        self.assertNotIn("wineboos", blob)
+        self.assertNotIn("proton", blob)
+        self.assertNotIn("pay_url", blob)
         for m in body["payment_methods"]:
             self.assertNotIn("handle", m)
             self.assertNotIn("instructions", m)
             self.assertNotIn("target", m)
+            self.assertNotIn("pay_url", m)
+
+    def test_storefront_checkout_ready_false_when_paused(self) -> None:
+        webpanel.ensure_unicorn_shop_payments(UNICORN)
+        webpanel.ensure_storefront_key_plain(UNICORN, PAGES_KEY)
+        for m in db.list_payment_methods(UNICORN, active_only=False):
+            db.update_payment_method(m["id"], active=0)
+        code, body = webpanel.api_storefront(PAGES_KEY)
+        self.assertEqual(code, 200, body)
+        self.assertFalse(body.get("checkout_ready"))
+        self.assertEqual(body.get("payments"), [])
+        self.assertEqual(body.get("payment_methods"), [])
 
     def test_empty_buyer_copy_does_not_promise_a_dm(self) -> None:
         text = vendor_stores.build_customer_order_received_text(
@@ -135,6 +153,10 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         self.assertIn('callback_data="paytpl:paypal"', src)
         self.assertIn('callback_data="paytpl:apple_cash"', src)
         self.assertIn("cb_adm_seedpays", src)
+        self.assertIn("_All methods paused._", src)
+        panel = (ROOT / "webpanel.py").read_text(encoding="utf-8")
+        self.assertIn("types.has('venmo')", panel)
+        self.assertIn("checkout_ready", panel)
 
     def test_pay_url_venmo_prefill_paypal_username_not_email(self) -> None:
         venmo = payment_templates.render_venmo("@wineboos")

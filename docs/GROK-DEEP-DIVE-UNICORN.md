@@ -181,8 +181,10 @@ Menu Button URL in BotFather must match `UNICORN_STORE_URL` / vendor
 | P1 | `payments` JSON is regex-parsed strings | Fragile Venmo/Cash App links in Pages |
 | P1 | `/health` hid whether rails exist | Had to guess or dump DB |
 | P1 | 401 `bad_hash` overloaded | Buyer alert can't say “re-open” vs “wrong bot” — **live `52a5e5a`** |
-| P1 | Remaining `POST /order` errors had no `message` | Mini App `alert(d.error)` showed codes for empty cart / no vendor token |
-| P1 | `GET /order-status` still offered `pay_url` after paid | “Check my order” could re-prompt a paid buyer |
+| P1 | Remaining `POST /order` errors had no `message` | Mini App `alert(d.error)` showed codes for empty cart / no vendor token — **live `fef9326`** |
+| P1 | `GET /order-status` still offered `pay_url` after paid | “Check my order” could re-prompt a paid buyer — **live `fef9326`** |
+| P1 | Sold-out `error` was a long sentence; min-order looked like sold-out | Pages could not branch on `sold_out` / `min_order` |
+| P1 | All methods paused hid the Unicorn seed CTA | Owner had rows but checkout was still dead |
 | P2 | Pages mockup copy / SKU on cards | Out of this repo |
 | P2 | Native Telegram invoice (provider token unset) | Optional; Stars forbidden for physical goods |
 

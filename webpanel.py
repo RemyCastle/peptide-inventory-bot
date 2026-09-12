@@ -919,7 +919,9 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
     """
     chat_id = resolve_storefront_key(raw_key)
     if chat_id is None:
-        return _err(404, "unknown storefront")
+        import vendor_stores
+
+        return 404, vendor_stores.checkout_error_body("unknown storefront")
     shop = db.get_shop(chat_id) or db.ensure_shop(chat_id)
     products = db.apply_available_stock(db.list_products(chat_id, active_only=True))
     payments = db.list_payment_methods(chat_id, active_only=True)
@@ -959,6 +961,7 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
             }
             for p in products
         ],
+        "checkout_ready": bool(payments),
         "payments": [_buyer_payment_name(m) for m in payments],
         "payment_methods": [
             {
@@ -3102,7 +3105,9 @@ function render(){
   <div class="card"><h2>Payment methods</h2>
     <p class="tag" style="margin:0 0 10px">Buyers see these at checkout. Edit anytime and hit Save — changes apply immediately.</p>
     ${(S.payments||[]).filter(m=>m.active).length?'':'<p class="howto"><b>Buyers cannot pay.</b> Add at least one enabled method. Pause a seeded Venmo/PayPal row instead of deleting it.</p>'}
-    ${(S.shop&&S.shop.is_unicorn&&!(S.payments||[]).length)?'<div class="flex" style="margin-bottom:10px"><button type="button" id="pm-seed">✨ Seed Venmo + PayPal</button><span class="tag grow">Edit handles after — boot will not overwrite them</span></div>':''}
+    ${(()=>{const types=new Set((S.payments||[]).map(m=>String(m.method_type||'').toLowerCase()));
+      return (S.shop&&S.shop.is_unicorn&&(!types.has('venmo')||!types.has('paypal')))
+        ?'<div class="flex" style="margin-bottom:10px"><button type="button" id="pm-seed">✨ Seed Venmo + PayPal</button><span class="tag grow">Edit handles after — boot will not overwrite them</span></div>':'';})()}
     <div id="paylist">${S.payments.map(m=>{
       const t=m.method_type||'custom';
       const handle=esc(m.handle||m.cashtag||'');

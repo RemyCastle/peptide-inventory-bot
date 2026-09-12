@@ -30,17 +30,22 @@ Context (already verified — do not rediscover):
 (`empty_initdata` / `bad_payload` / `bad_hash` / `expired`),
 `/health` `invoices.enabled`.
 
-## This ship (checkout error `message` + paid-order rails)
+**Buyer `message` + paid-order rails — live on `fef9326`:** every `POST /order`
+error has `message`; `GET /order-status` 404 has `message`; `needs_payment`
+plus null `pay_url` after paid.
 
-1. **Every `POST /order` error** includes buyer `message` (never a secret):
-   `no_vendor_token`, `unknown storefront`, `empty cart`, `bad payload`,
-   sold-out. Short `error` codes stay stable so Pages can keep branching.
-2. **`GET /order-status` 404** includes the same `message` (`order not found` /
-   `unknown storefront`).
-3. **`needs_payment`** on `GET /order-status`. `pay_url` is present only while
-   status is `pending_payment` or `awaiting_confirmation`; paid / cancelled /
-   rejected keep method names but `pay_url` is null.
-4. Public `/storefront` stays names + types only (no handles, no pay URLs).
+## This ship (stable sold-out/min-order codes + empty-rails UX)
+
+1. **`POST /order` stock fail** uses short `error: sold_out` (not the long
+   sentence). Below-minimum carts use `error: min_order` + buyer `message`
+   instead of looking sold-out. Success JSON includes `needs_payment: true`.
+2. **`GET /order-status`** cancelled / rejected keep method names, null
+   `pay_url`, `needs_payment: false`. Awaiting confirmation still has `pay_url`.
+3. Public `/storefront` adds `checkout_ready` (true iff ≥1 active method).
+   Names + types only — no handles, no pay URLs. Unknown key 404 has `message`.
+4. Admin empty-rails: Telegram warns when **all methods are paused** (not only
+   when the list is empty). Unicorn seed button shows when Venmo or PayPal
+   types are missing. Web panel seed uses the same rule.
 
 ## Acceptance
 
@@ -48,10 +53,13 @@ Context (already verified — do not rediscover):
 - [ ] Docker COPY check still lists every imported module
 - [ ] No writes to laptop `inventory.db`; no DELETE of products
 - [ ] Pending `GET /order-status` includes `needs_payment: true` and Venmo `pay_url`
-- [ ] Paid `GET /order-status` includes `needs_payment: false` and null `pay_url`
+- [ ] Paid / cancelled / rejected `GET /order-status` include `needs_payment: false`
+      and null `pay_url`
 - [ ] Empty `initData` → 401 `empty_initdata` + `message`; zero new orders
 - [ ] Zero active methods → 409 `no_payment_methods` + `message`
-- [ ] Sold-out / empty cart / no vendor token / unknown storefront all have `message`
+- [ ] Sold-out uses `error: sold_out` + `message`; min-order uses `error: min_order`
+- [ ] Empty cart / no vendor token / unknown storefront all have `message`
+- [ ] `/storefront` `checkout_ready` is boolean; no handles / pay URLs
 - [ ] Live `/health` `ok: true`, new `git_sha`, `payments.active` ≥ 1,
       `invoices.enabled` is a boolean
 - [ ] No secrets / `.env` / scratch import files committed

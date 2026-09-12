@@ -171,6 +171,7 @@ class StorefrontBindTests(unittest.TestCase):
         code, body = webpanel.api_storefront("ffffffffffffffffffffffff")
         self.assertEqual(code, 404)
         self.assertEqual(body.get("error"), "unknown storefront")
+        self.assertIn("Re-open", body.get("message") or "")
 
     def test_ensure_plain_then_boot_bind(self) -> None:
         webpanel.ensure_storefront_key_plain(UNICORN, PAGES_KEY)
