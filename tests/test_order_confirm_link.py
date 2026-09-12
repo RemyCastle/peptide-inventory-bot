@@ -151,12 +151,17 @@ class ConfirmGetPostTests(OrderConfirmLinkBase):
         ok, msg, _ = db.confirm_order_payment(int(o["id"]), USER)
         self.assertTrue(ok, msg)
         raw = webpanel.mint_order_confirm_token(int(o["id"]), SHOP)
-        code, ctype, body = webpanel.handle_confirm_get({"ct": [raw]})
+        with mock.patch.object(
+            webpanel, "PANEL_BASE_URL", "https://bot.example.com"
+        ):
+            code, ctype, body = webpanel.handle_confirm_get({"ct": [raw]})
         self.assertEqual(code, 200)
         text = body.decode("utf-8")
         self.assertIn("Already confirmed", text)
         self.assertNotIn("Confirm payment received", text)
         self.assertNotIn("method=POST", text.lower())
+        self.assertIn("https://bot.example.com/track?ot=", text)
+        self.assertIn("Add tracking", text)
 
     def test_get_expired_for_bad_token(self):
         code, ctype, body = webpanel.handle_confirm_get({"ct": ["notarealtoken"]})
@@ -170,6 +175,8 @@ class ConfirmGetPostTests(OrderConfirmLinkBase):
         stock_before = db.get_product(self.pid)["stock"]
         raw = webpanel.mint_order_confirm_token(int(o["id"]), SHOP)
         with mock.patch.object(
+            webpanel, "PANEL_BASE_URL", "https://bot.example.com"
+        ), mock.patch.object(
             webpanel, "notify_order_customer", return_value=True
         ) as dm:
             code, ctype, body = webpanel.handle_confirm_post(
@@ -182,6 +189,7 @@ class ConfirmGetPostTests(OrderConfirmLinkBase):
         self.assertFalse(data.get("already_confirmed"))
         self.assertEqual(data["status"], "paid")
         self.assertTrue(data["customer_notified"])
+        self.assertIn("https://bot.example.com/track?ot=", data.get("track_url") or "")
         got = db.get_order(int(o["id"]))
         self.assertEqual(got["status"], "paid")
         stock_after = db.get_product(self.pid)["stock"]
@@ -196,7 +204,9 @@ class ConfirmGetPostTests(OrderConfirmLinkBase):
     def test_post_html_success_page(self):
         o = self._order()
         raw = webpanel.mint_order_confirm_token(int(o["id"]), SHOP)
-        with mock.patch.object(webpanel, "notify_order_customer", return_value=True):
+        with mock.patch.object(
+            webpanel, "PANEL_BASE_URL", "https://bot.example.com"
+        ), mock.patch.object(webpanel, "notify_order_customer", return_value=True):
             code, ctype, body = webpanel.handle_confirm_post(
                 {"ct": raw},
                 wants_json=False,
@@ -206,6 +216,48 @@ class ConfirmGetPostTests(OrderConfirmLinkBase):
         text = body.decode("utf-8")
         self.assertIn("Payment confirmed", text)
         self.assertIn(o["payment_code"], text)
+        self.assertIn("https://bot.example.com/track?ot=", text)
+        self.assertIn("Add tracking", text)
+
+    def test_post_success_omits_track_url_without_panel_base(self):
+        o = self._order()
+        raw = webpanel.mint_order_confirm_token(int(o["id"]), SHOP)
+        with mock.patch.object(webpanel, "PANEL_BASE_URL", ""), mock.patch.object(
+            webpanel, "notify_order_customer", return_value=True
+        ):
+            code, _, body = webpanel.handle_confirm_post(
+                {"ct": raw}, wants_json=True
+            )
+        self.assertEqual(code, 200, body)
+        data = json.loads(body.decode("utf-8"))
+        self.assertTrue(data["ok"])
+        self.assertFalse(data.get("track_url"))
+        o2 = self._order()
+        raw2 = webpanel.mint_order_confirm_token(int(o2["id"]), SHOP)
+        with mock.patch.object(webpanel, "PANEL_BASE_URL", ""), mock.patch.object(
+            webpanel, "notify_order_customer", return_value=True
+        ):
+            html_code, _, html_body = webpanel.handle_confirm_post(
+                {"ct": raw2}, wants_json=False
+            )
+        self.assertEqual(html_code, 200)
+        text = html_body.decode("utf-8")
+        self.assertIn("Payment confirmed", text)
+        self.assertNotIn("/track?ot=", text)
+        self.assertNotIn("Add tracking", text)
+
+    def test_get_pending_confirm_has_no_tracking_cta(self):
+        o = self._order()
+        raw = webpanel.mint_order_confirm_token(int(o["id"]), SHOP)
+        with mock.patch.object(
+            webpanel, "PANEL_BASE_URL", "https://bot.example.com"
+        ):
+            code, _, body = webpanel.handle_confirm_get({"ct": [raw]})
+        self.assertEqual(code, 200)
+        text = body.decode("utf-8")
+        self.assertIn("Confirm payment received", text)
+        self.assertNotIn("/track?ot=", text)
+        self.assertNotIn("Add tracking", text)
 
     def test_second_post_does_not_double_decrement(self):
         o = self._order()
@@ -315,9 +367,14 @@ class NewOrderDmLinkTests(OrderConfirmLinkBase):
         self.assertIn("PAYMENT CLAIM", note)
         self.assertIn("https://bot.example.com/confirm?ct=", note)
         self.assertIn("/cancel?xt=", note)
-        btn = ((markup or {}).get("inline_keyboard") or [[]])[0][0]
-        self.assertEqual(btn["text"], "✅ Confirm payment")
-        self.assertIn("https://bot.example.com/confirm?ct=", btn["url"])
+        rows = (markup or {}).get("inline_keyboard") or []
+        self.assertEqual(len(rows), 2)
+        confirm_btn = rows[0][0]
+        cancel_btn = rows[1][0]
+        self.assertEqual(confirm_btn["text"], "✅ Confirm payment")
+        self.assertIn("https://bot.example.com/confirm?ct=", confirm_btn["url"])
+        self.assertEqual(cancel_btn["text"], "❌ Cancel order")
+        self.assertIn("https://bot.example.com/cancel?xt=", cancel_btn["url"])
         self.assertIn(
             "I've paid",
             vendor_stores.build_payment_claim_buyer_text(o),

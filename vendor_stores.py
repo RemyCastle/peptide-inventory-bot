@@ -600,7 +600,7 @@ def build_payment_claim_notify_text(order: dict) -> str:
 
 
 def payment_claim_reply_markup(order: dict) -> dict | None:
-    """Inline URL button for /confirm — works on the vendor bot (no callback)."""
+    """Inline URL buttons for /confirm and /cancel — vendor bot has no callbacks."""
     try:
         import webpanel as _webpanel
 
@@ -608,17 +608,21 @@ def payment_claim_reply_markup(order: dict) -> dict | None:
         shop_chat_id = int(order.get("chat_id") or 0)
         if not oid or not shop_chat_id:
             return None
-        url = _webpanel.confirm_payment_url(oid, shop_chat_id)
+        confirm_url = _webpanel.confirm_payment_url(oid, shop_chat_id)
+        cancel_url = _webpanel.cancel_order_url(oid, shop_chat_id)
     except Exception:
         log.exception(
-            "payment-claim confirm URL failed for order %s", order.get("id")
+            "payment-claim action URLs failed for order %s", order.get("id")
         )
         return None
-    if not url:
+    rows: list[list[dict]] = []
+    if confirm_url:
+        rows.append([{"text": "✅ Confirm payment", "url": confirm_url}])
+    if cancel_url:
+        rows.append([{"text": "❌ Cancel order", "url": cancel_url}])
+    if not rows:
         return None
-    return {
-        "inline_keyboard": [[{"text": "✅ Confirm payment", "url": url}]]
-    }
+    return {"inline_keyboard": rows}
 
 
 def build_payment_claim_buyer_text(order: dict) -> str:

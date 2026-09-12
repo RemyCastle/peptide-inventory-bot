@@ -539,9 +539,14 @@ class OrderHttpTests(unittest.TestCase):
         self.assertIn("https://bot.example.com/confirm?ct=", note)
         self.assertIn("Stock only moves on confirm", note)
         markup = (claim_sends[0][4] or {}).get("reply_markup") or {}
-        btn = ((markup.get("inline_keyboard") or [[]])[0] or [{}])[0]
+        rows = markup.get("inline_keyboard") or []
+        self.assertEqual(len(rows), 2)
+        btn = (rows[0] or [{}])[0]
         self.assertEqual(btn.get("text"), "✅ Confirm payment")
         self.assertIn("https://bot.example.com/confirm?ct=", btn.get("url") or "")
+        cancel_btn = (rows[1] or [{}])[0]
+        self.assertEqual(cancel_btn.get("text"), "❌ Cancel order")
+        self.assertIn("https://bot.example.com/cancel?xt=", cancel_btn.get("url") or "")
         buyer_sends = [s for s in vendor_sends if s[2] == BUYER]
         self.assertTrue(
             any("payment claim" in (s[3] or "").lower() for s in buyer_sends)

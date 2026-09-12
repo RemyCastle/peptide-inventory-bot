@@ -325,8 +325,8 @@ def resolve_order_tracking_token(raw: str) -> Optional[dict]:
     }
 
 
-def format_add_tracking_dm_line(order_id: int, shop_chat_id: int) -> str:
-    """Line for NEW ORDER vendor DM, or '' if PANEL_BASE_URL is unset."""
+def add_tracking_url(order_id: int, shop_chat_id: int) -> str:
+    """https://host/track?ot=… or '' if PANEL_BASE_URL is unset."""
     base = (PANEL_BASE_URL or "").strip().rstrip("/")
     if not base:
         log.info(
@@ -334,7 +334,15 @@ def format_add_tracking_dm_line(order_id: int, shop_chat_id: int) -> str:
         )
         return ""
     raw = mint_order_tracking_token(int(order_id), int(shop_chat_id))
-    return f"➕ Add tracking: {base}/track?ot={raw}"
+    return f"{base}/track?ot={raw}"
+
+
+def format_add_tracking_dm_line(order_id: int, shop_chat_id: int) -> str:
+    """Line for NEW ORDER vendor DM, or '' if PANEL_BASE_URL is unset."""
+    url = add_tracking_url(order_id, shop_chat_id)
+    if not url:
+        return ""
+    return f"➕ Add tracking: {url}"
 
 
 def mint_order_confirm_token(order_id: int, shop_chat_id: int) -> str:
@@ -486,8 +494,8 @@ def resolve_order_cancel_token(raw: str) -> Optional[dict]:
     }
 
 
-def format_cancel_order_dm_line(order_id: int, shop_chat_id: int) -> str:
-    """Line for NEW ORDER vendor DM, or '' if PANEL_BASE_URL is unset."""
+def cancel_order_url(order_id: int, shop_chat_id: int) -> str:
+    """https://host/cancel?xt=… or '' if PANEL_BASE_URL is unset."""
     base = (PANEL_BASE_URL or "").strip().rstrip("/")
     if not base:
         log.info(
@@ -496,7 +504,15 @@ def format_cancel_order_dm_line(order_id: int, shop_chat_id: int) -> str:
         )
         return ""
     raw = mint_order_cancel_token(int(order_id), int(shop_chat_id))
-    return f"❌ Cancel order: {base}/cancel?xt={raw}"
+    return f"{base}/cancel?xt={raw}"
+
+
+def format_cancel_order_dm_line(order_id: int, shop_chat_id: int) -> str:
+    """Line for NEW ORDER vendor DM, or '' if PANEL_BASE_URL is unset."""
+    url = cancel_order_url(order_id, shop_chat_id)
+    if not url:
+        return ""
+    return f"❌ Cancel order: {url}"
 
 
 def panel_url(base_url: str, raw_token: str, mode: str = "") -> str:
@@ -2350,14 +2366,28 @@ def _confirm_expired_html() -> bytes:
     ).encode("utf-8")
 
 
-def _confirm_success_html(code: str, *, already: bool = False) -> bytes:
+def _confirm_track_block(track_url: str) -> str:
+    """Add-tracking CTA for confirm success / already-confirmed pages."""
+    url = (track_url or "").strip()
+    if not url:
+        return ""
+    url_e = html.escape(url, quote=True)
+    return (
+        f'<p><a class="track" href="{url_e}">➕ Add tracking</a></p>'
+        '<p class="muted">Opens the tracking form for this order only.</p>'
+    )
+
+
+def _confirm_success_html(
+    code: str, *, already: bool = False, track_url: str = ""
+) -> bytes:
     code_e = html.escape(code)
     if already:
         title = "Already confirmed"
         heading = "Already confirmed"
         detail = (
             f"<p>Order <strong>{code_e}</strong> was already marked paid. "
-            "No further action was taken.</p>"
+            "Stock was not changed again.</p>"
         )
     else:
         title = "Payment confirmed"
@@ -2367,13 +2397,17 @@ def _confirm_success_html(code: str, *, already: bool = False) -> bytes:
             "Stock was decremented and the customer was notified if their "
             "chat is open with your store bot.</p>"
         )
+    track_block = _confirm_track_block(track_url)
     return (
         "<!doctype html><html lang=en><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
         f"<title>{title}</title>"
         "<style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;"
-        "padding:0 1rem;color:#222}h1{font-size:1.25rem;color:#0a7}</style></head>"
-        f"<body><h1>{heading}</h1>{detail}</body></html>"
+        "padding:0 1rem;color:#222}h1{font-size:1.25rem;color:#0a7}"
+        "a.track{display:block;margin-top:1rem;padding:.7rem;text-align:center;"
+        "text-decoration:none;font-weight:600;border-radius:8px;background:#1a73e8;color:#fff}"
+        ".muted{color:#666;font-size:.9rem}</style></head>"
+        f"<body><h1>{heading}</h1>{detail}{track_block}</body></html>"
     ).encode("utf-8")
 
 
@@ -2392,7 +2426,12 @@ def _confirm_error_html(message: str) -> bytes:
 
 
 def _confirm_form_html(
-    order: dict, items: list[dict], raw_ct: str, *, already: bool = False
+    order: dict,
+    items: list[dict],
+    raw_ct: str,
+    *,
+    already: bool = False,
+    track_url: str = "",
 ) -> bytes:
     code = html.escape(
         (order.get("payment_code") or str(order.get("id") or "")).strip()
@@ -2405,9 +2444,11 @@ def _confirm_form_html(
     total_e = html.escape(f"${total:.2f}")
     ct_e = html.escape(raw_ct)
     if already:
+        track_block = _confirm_track_block(track_url)
         action_block = (
             "<p class=ok><strong>Already confirmed</strong> — this order is "
-            f"<code>{status}</code>. No further action is needed.</p>"
+            f"<code>{status}</code>. Stock was not changed again.</p>"
+            f"{track_block}"
         )
     else:
         action_block = f"""
@@ -2427,6 +2468,7 @@ h1{{font-size:1.2rem;margin:0 0 .75rem}}
 .card{{background:#f6f7f9;border-radius:10px;padding:1rem;margin-bottom:1.25rem}}
 .card p{{margin:.35rem 0}}
 button{{margin-top:.5rem;width:100%;padding:.7rem;font-size:1rem;font-weight:600;border:0;border-radius:8px;background:#0a7;color:#fff}}
+a.track{{display:block;margin-top:1rem;padding:.7rem;text-align:center;text-decoration:none;font-weight:600;border-radius:8px;background:#1a73e8;color:#fff}}
 .ok{{color:#0a7}}
 .muted{{color:#666;font-size:.9rem}}
 </style></head><body>
@@ -2455,10 +2497,17 @@ def handle_confirm_get(query: dict) -> tuple[int, str, bytes]:
     items = db.get_order_items(int(order["id"]))
     status = str(order.get("status") or "")
     already = status in _ALREADY_CONFIRMED_STATUSES
+    track_url = add_tracking_url(int(tok["order_id"]), int(tok["shop_chat_id"])) if already else ""
     return (
         200,
         "text/html; charset=utf-8",
-        _confirm_form_html(order, items, str(raw).strip(), already=already),
+        _confirm_form_html(
+            order,
+            items,
+            str(raw).strip(),
+            already=already,
+            track_url=track_url,
+        ),
     )
 
 
@@ -2491,6 +2540,7 @@ def handle_confirm_post(
 
     code = (order.get("payment_code") or str(order_id)).strip()
     status = str(order.get("status") or "")
+    track_url = add_tracking_url(order_id, shop_chat_id)
     if status in _ALREADY_CONFIRMED_STATUSES:
         if wants_json:
             body = {
@@ -2499,12 +2549,13 @@ def handle_confirm_post(
                 "order_id": order_id,
                 "status": status,
                 "message": "Already confirmed",
+                "track_url": track_url or None,
             }
             return 200, "application/json", json.dumps(body).encode("utf-8")
         return (
             200,
             "text/html; charset=utf-8",
-            _confirm_success_html(code, already=True),
+            _confirm_success_html(code, already=True, track_url=track_url),
         )
 
     ok, msg, _alerts = db.confirm_order_payment(order_id, 0)
@@ -2535,9 +2586,14 @@ def handle_confirm_post(
             "status": order.get("status") or "paid",
             "message": msg,
             "customer_notified": bool(notified),
+            "track_url": track_url or None,
         }
         return 200, "application/json", json.dumps(body).encode("utf-8")
-    return 200, "text/html; charset=utf-8", _confirm_success_html(code, already=False)
+    return (
+        200,
+        "text/html; charset=utf-8",
+        _confirm_success_html(code, already=False, track_url=track_url),
+    )
 
 
 # ── Standalone cancel-order page (/cancel) ──────────────────────────────────

@@ -107,7 +107,7 @@ Buyers only see `active=1`, `ORDER BY sort_order, name`.
 |---|---|
 | Telegram cart checkout | Inline method picker. **Blocked** if none active. |
 | Vendor-bot DM after Mini App order | HTML receipt: tap-to-copy code, handle, Friends & Family warning, pay URL, QR (`segno`). |
-| Mini App success sheet | `payment_methods` with `pay_url` + `pay_hint` (string `payments` regex is fallback only). **I've paid** → `POST /order-paid` while `can_mark_paid`. Vendor ping includes `/confirm?ct=` URL button (vendor bot has no `admconfirm` callbacks). |
+| Mini App success sheet | `payment_methods` with `pay_url` + `pay_hint` (string `payments` regex is fallback only). **I've paid** → `POST /order-paid` while `can_mark_paid`. Vendor ping includes `/confirm?ct=` + `/cancel?xt=` URL buttons (vendor bot has no confirm/cancel callbacks). `/confirm` success offers `/track?ot=`. |
 | `GET /storefront` | **Names only** (`payment_methods` name+type, `message`, `invoices_enabled`). Handles / `pay_url` / `pay_hint` stay off the public catalog. |
 
 Empty-copy used to say “Payment details will be DM'd to you.” That is a lie
@@ -188,7 +188,8 @@ Menu Button URL in BotFather must match `UNICORN_STORE_URL` / vendor
 | P1 | Catalog / order-status had no buyer `message`; PayPal email had no copy hint | **live `2054b95`** (`message` + `pay_hint` + `invoices_enabled`) |
 | P2 | Pages mockup copy / SKU on cards / use `pay_url` client-side | **live `fe857ec`** (`miniapp-demos` + cache bust `20260912`) |
 | P1 | Mini App had no I've paid (Telegram cart does) | **live `bef4d5f`** (`POST /order-paid` + `can_mark_paid`) |
-| P1 | Mini App claim ping had no confirm URL (vendor bot can't take `admconfirm`) | **this ship** (`/confirm?ct=` URL button + buyer DM) |
+| P1 | Mini App claim ping had no confirm URL (vendor bot can't take `admconfirm`) | **live `6c3d68b`** (`/confirm?ct=` URL button + buyer DM) |
+| P1 | Claim ping cancel was text-only; confirm success had no tracking CTA | **this ship** (Cancel URL button + `/confirm` Add tracking) |
 | P2 | Native Telegram invoice (provider token unset) | Optional; Stars forbidden for physical goods |
 
 ---
