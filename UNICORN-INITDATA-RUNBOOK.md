@@ -216,6 +216,7 @@ Map from `initdata_error_code` (`vendor_stores.py:138`) and `api_order`:
 | 401 | `bad_hash` | HMAC failed for **every** candidate token | Buyer's bot token isn't in the shop's token set → add it to `extra_tokens`; **or** `initData` was empty (trailing-slash gotcha above) |
 | 401 | `expired` | HMAC matched but `auth_date` > 24 h old | Buyer sat on the checkout page > 24 h — tell them to re-open the store; not a config bug |
 | 400 | `bad payload` / `empty cart` | Cart failed to parse or was empty | Client bug; check the Pages checkout JS |
+| 409 | `no_payment_methods` | Shop has zero *active* payment rows | Seed/unpause a method (Admin → Payments or panel). Order is **not** created. |
 | 409 | stock error | `create_order` rejected (sold out / stock race) | Expected when stock ran out mid-checkout; server re-checks authoritatively |
 
 **Why `bad_hash` vs `expired` is trustworthy:** once the HMAC matches a token,
@@ -282,8 +283,11 @@ There are **three** ways to add methods — all write the same table.
 
 ### A. Boot seed (Unicorn only, idempotent)
 
-On Unicorn boot, `run_cloud.py:153` calls
-`webpanel.ensure_shop_payments` with defaults:
+On Unicorn boot, `run_cloud._seed_unicorn_payments` runs from
+`_bind_unicorn_pages_storefront` (the Pages catalog shop) **even when
+`UNICORN_CLAIM_TOKEN` is unset**, and again from the claim-bind path if that
+env is set. Both call `webpanel.ensure_unicorn_shop_payments` with
+`unicorn_shop.DEFAULT_PAYMENT_METHODS`:
 
 ```python
 [
@@ -294,18 +298,18 @@ On Unicorn boot, `run_cloud.py:153` calls
 ```
 
 - **Idempotent by `method_type`**: `ensure_shop_payments`
-  (`webpanel.py:1429`) only inserts a type that isn't already present. It reads
-  the shop's rows with `active_only=False` (`webpanel.py:1437`), so a row of that
+  only inserts a type that isn't already present. It reads
+  the shop's rows with `active_only=False`, so a row of that
   type blocks a re-seed **even when it is paused/inactive**. An existing
   Venmo/PayPal row (edited or paused by the vendor) is **left alone**.
 - **The delete-then-reboot trap.** Because the seed keys off "type present at
   all," **deleting** a seeded Venmo/PayPal row (`🗑` in the wizard, or a panel
   delete) means it is **absent** on the next boot and gets **re-created** with
-  the `run_cloud.py:155` default handle. To make a default go away and *stay*
+  the default handle. To make a default go away and *stay*
   gone, **pause it** (`⏸`, sets `active=0`) instead of deleting — the paused row
   still counts as present and is never shown to buyers. Deleting only sticks if
-  you also drop it from the `run_cloud.py:155` list (a redeploy).
-- To change the seeded defaults, edit the list at `run_cloud.py:155`. To add a
+  you also drop it from `unicorn_shop.DEFAULT_PAYMENT_METHODS` (a redeploy).
+- To change the seeded defaults, edit `unicorn_shop.DEFAULT_PAYMENT_METHODS`. To add a
   brand-new rail permanently, prefer the Telegram/panel path below so you don't
   redeploy for a handle change.
 
@@ -330,6 +334,14 @@ Owner/admin of the shop, in the bot:
 5. In the Payments list, `⏸/▶️` toggles active (`togglem:`), `🗑` deletes
    (`delm:`). **Only active rows appear in `/storefront` and on the pay
    screen** (`list_payment_methods(..., active_only=True)`).
+
+**The wizard always seeds PayPal as Friends & Family.** `render_from_answers`
+(`payment_templates.py:213`) hard-codes `friends_and_family=True` for the
+`paypal` quick-add — there is **no wizard prompt** for G&S. If the vendor needs
+**Goods & Services** (buyer protection, but a fee), you must use the panel/API
+path below with `network_note=goods_services`, or edit the row's stored
+`network_note` there. The wizard also can't set `sort_order`; it appends to the
+end. Both are panel/API-only knobs.
 
 ### C. Web panel / API (structured, no redeploy)
 
@@ -474,6 +486,49 @@ Setup takeaways:
   **custom/free-text** rows with no detectable target print their `instructions`
   verbatim instead (`vendor_stores.py:527`).
 
+### Reconcile a payment to an order (read-only, no DB edits)
+
+Once the buyer pays a **manual** rail, you match their payment to the order by
+the `code` (`UMF-…`) — Venmo carries it in the note automatically; other rails
+rely on the buyer pasting it. To check an order's state without opening the DB
+or the admin bot, hit the public buyer lookup:
+
+```bash
+curl -sS "https://unicornfartzz-bot.onrender.com/order-status?invite=YOUR_HEX&code=UMF-AB12CD"
+```
+
+`api_order_status` (`webpanel.py:957`) is **read-only and shop-scoped**: it
+resolves the `invite` through `storefront_keys` only (a claim/vendor-invite token
+never resolves), and a `code` that belongs to another shop returns
+`404 order not found` — so a leaked storefront key can never read a different
+shop's orders. It returns `status`, line items, `subtotal`/`shipping_fee`/`total`,
+`created_at`, and any `tracking_number`/`tracking_carrier`/`ship_*` set later.
+
+- Use it to confirm a `POST /order` actually created the code you expect, and to
+  watch the status move (`pending_payment` → `awaiting_confirmation` once you
+  confirm, → tracking fields once shipped).
+- It **cannot** confirm, cancel, or mark paid — those are admin-only actions in
+  the bot/panel. This endpoint is purely a mirror.
+
+### Confirm what the boot seed actually did
+
+`_seed_unicorn_payments` (`run_cloud.py:22`) logs its result on every Unicorn
+boot — grep the deploy log for `unicorn payments seed:`:
+
+```
+unicorn payments seed: {'ok': True, 'created': ['venmo', 'paypal'], 'total': 2}
+```
+
+- `created` lists **only the types newly inserted this boot**. On a fresh shop
+  it's `['venmo', 'paypal']`; on every boot after, it's `[]` because both types
+  already exist (the idempotency in [Section A](#a-boot-seed-unicorn-only-idempotent)).
+- `total` is the count of distinct `method_type`s the shop has **after** seeding
+  (`ensure_shop_payments`, `webpanel.py:1483`), active or paused. `total` climbing
+  without `created` growing means the vendor added rails by hand — expected.
+- `created` non-empty on a shop that *should* already be seeded → a seeded row was
+  **deleted** (not paused) and just got re-created with the default handle. That's
+  the delete-then-reboot trap in Section A; pause instead.
+
 ### D. Native Telegram card checkout (`TELEGRAM_PAYMENT_PROVIDER_TOKEN`)
 
 Everything above is **manual rails** — the buyer copies a handle and pays out of
@@ -513,10 +568,24 @@ right after `POST /order` succeeds.
   (`tg_payments.py:155`) is **server-authoritative** — it re-checks currency and
   that `total_amount` equals the order's stored cents, and rejects an order that
   is `cancelled`/`rejected`/already `paid`. Amount/currency mismatch → declined.
-- On success, `apply_successful_payment` (`tg_payments.py:184`) records the
-  Telegram charge id against the order. **It does not deduct stock or mark the
-  order fulfilled** — the admin's normal confirm step still deducts stock, same
-  as a manual-rail order. Card capture ≠ shipment.
+- On success, `apply_successful_payment` (`tg_payments.py:184`) →
+  `db.record_telegram_payment_charge` (`db.py:2481`) stores
+  `tg_payment_charge_id` (truncated to 128 chars) and advances the order status
+  **only** `pending_payment → awaiting_confirmation` — any other status (e.g.
+  already `awaiting_confirmation`, `paid`) is left untouched, and a
+  `cancelled`/`rejected` order refuses the charge. **It does not deduct stock or
+  mark the order fulfilled** — the admin's normal confirm step still deducts
+  stock, same as a manual-rail order. Card capture ≠ shipment.
+- **Telling a card-paid order apart:** a non-empty `tg_payment_charge_id` on the
+  order row is the marker that a Telegram card charge landed. A manual-rail order
+  never has one; it sits in `awaiting_confirmation` purely on the buyer's word
+  that they sent the handle. So a card order in `awaiting_confirmation` is
+  money-in-hand; a manual one is a claim to verify against your Venmo/PayPal feed.
+- **No auto re-issue and no refund automation.** If the invoice DM fails
+  (`sendInvoice HTTP 4xx`), nothing retries — re-trigger by having the buyer
+  re-open checkout, or fall back to the manual rails they already got in the same
+  order response. There is no in-app refund path; refunds are done in the card
+  provider's own dashboard (Stripe, etc.), and the order status is unaffected.
 
 **Diagnosing:**
 
@@ -557,6 +626,10 @@ right after `POST /order` succeeds.
   it — a deleted seeded type is re-created on the next boot.
 - Read the `POST /order` log line before changing config — trust the `reason`,
   not the overloaded `bad_hash` buyer code.
+- Use `GET /order-status?invite=&code=` (read-only) to check an order's state or
+  confirm a code exists — never open the live DB to look up an order.
+- Set PayPal **Goods & Services** via the panel/API (`network_note=goods_services`);
+  the Telegram wizard only ever produces Friends & Family.
 
 **Don't**
 - Wipe or reset `/data/inventory.db` to "fix" checkout or empty payments.
@@ -584,12 +657,16 @@ right after `POST /order` succeeds.
 | Cache-bust store URL | `vendor_stores.py:104` |
 | Payment templates | `payment_templates.py` |
 | Field → template routing | `payment_templates.py:228` |
-| Idempotent payment seed | `webpanel.py:1429` |
-| Unicorn boot payment seed | `run_cloud.py:153` |
-| Panel payment write API (add/update/delete) | `webpanel.py:1363` |
+| Idempotent payment seed | `webpanel.ensure_shop_payments` |
+| Unicorn boot payment seed | `run_cloud._seed_unicorn_payments` |
+| Default Unicorn rails | `unicorn_shop.DEFAULT_PAYMENT_METHODS` |
+| Panel payment write API (add/update/delete/seed) | `webpanel.api_payment` |
 | Tap-to-pay deep-link builder | `vendor_stores.py:476` |
 | Payment method HTML render (receipt) | `vendor_stores.py:511` |
 | Buyer-visible list (active-only, sorted) | `db.py:2025` |
+| Read-only buyer order lookup (`GET /order-status`) | `webpanel.py:957` |
+| Idempotent seed (dedup by `method_type`) | `webpanel.ensure_shop_payments` (`webpanel.py:1451`) |
+| Wizard field render (PayPal → forced F&F) | `payment_templates.py:205` |
 | Telegram payments menu | `bot.py:5418` |
 | `payments` in storefront/order JSON | `vendor_stores.py:433` |
 | Native card checkout (optional) | `tg_payments.py` |
@@ -597,3 +674,4 @@ right after `POST /order` succeeds.
 | Invoice send after order | `spbc_notify.py:1217` |
 | Server-authoritative pre-checkout | `tg_payments.py:155` |
 | Record card charge (no stock deduct) | `tg_payments.py:184` |
+| Charge → `awaiting_confirmation` transition | `db.record_telegram_payment_charge` (`db.py:2481`) |
