@@ -299,6 +299,19 @@ class PrettyNameTests(unittest.TestCase):
         self.assertEqual(uc.pretty_name("MT1 ($11.00)"), "MT1")
         self.assertEqual(uc.pretty_name("Aod 5mg (vial) $15.00"), "AOD 5mg")
 
+    def test_hyphen_compounds_stay_tight(self) -> None:
+        self.assertEqual(uc.pretty_name("snap 8"), "Snap-8")
+        self.assertEqual(uc.pretty_name("Snap-8"), "Snap-8")
+        self.assertEqual(uc.pretty_name("Snap- 8"), "Snap-8")
+        self.assertEqual(uc.pretty_name("GHK-Cu 100mg"), "GHK-Cu 100mg")
+        self.assertEqual(uc.pretty_name("ss- 31 10mg"), "SS-31 10mg")
+        self.assertEqual(uc.pretty_name("MOTS-c 10mg"), "MOTS-c 10mg")
+        self.assertEqual(uc.pretty_name("MOTS-c- C 10mg"), "MOTS-c 10mg")
+        self.assertEqual(uc.pretty_name("TB-500 (TB4) 10mg"), "TB-500 (TB4) 10mg")
+        self.assertNotIn("- ", uc.pretty_name("FOXO4-DRI 10"))
+        self.assertNotIn("- ", uc.pretty_name("PT-141"))
+        self.assertNotIn("- ", uc.pretty_name("5-Amino-1MQ 100mg"))
+
     def test_no_replacement_junk(self) -> None:
         self.assertNotIn("\ufffd", uc.pretty_name("AOD\ufffd 5mg"))
         self.assertTrue(uc.pretty_name("AOD 5mg")[0].isupper())

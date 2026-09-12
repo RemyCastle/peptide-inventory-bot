@@ -274,6 +274,35 @@ _NAME_ALIASES: dict[str, str] = {
     "tret.025": "Tret 0.025",
     "tret .05": "Tret 0.05",
     "snap 8": "Snap-8",
+    "snap-8": "Snap-8",
+    "snap- 8": "Snap-8",
+    "ghk- cu": "GHK-Cu",
+    "ghk-cu": "GHK-Cu",
+    "ahk- cu": "AHK-Cu",
+    "ss- 31 10mg": "SS-31 10mg",
+    "ss- 31 25mg": "SS-31 25mg",
+    "ss- 31 30mg": "SS-31 30mg",
+    "pt- 141": "PT-141",
+    "pt- 141 10mg": "PT-141 10mg",
+    "tb- 500 (tb4) 10mg": "TB-500 (TB4) 10mg",
+    "foxo4- dri 10": "FOXO4-DRI 10",
+    "atp- s inj": "ATP-S Inj",
+    "ll- 37 5mg": "LL-37 5mg",
+    "pe 22- 28": "PE 22-28",
+    "pe 22- 28 8mg": "PE 22-28 8mg",
+    "igf- 1 lr3 1mg": "IGF-1 LR3 1mg",
+    "5- amino- 1mq 100mg": "5-Amino-1MQ 100mg",
+    "5- amino- 1mq 50mg": "5-Amino-1MQ 50mg",
+    "5- amino- 1mq tabs": "5-Amino-1MQ Tabs",
+    "5- amino- 1mq 100mg / ml 10ml": "5-Amino-1MQ 100mg/ml 10ml",
+    "mots-c- c 10mg": "MOTS-c 10mg",
+    "mots-c- c 20mg": "MOTS-c 20mg",
+    "mots-c- c 30mg": "MOTS-c 30mg",
+    "mots-c- c 40mg": "MOTS-c 40mg",
+    "mots-c 10mg": "MOTS-c 10mg",
+    "mots-c 20mg": "MOTS-c 20mg",
+    "mots-c 30mg": "MOTS-c 30mg",
+    "mots-c 40mg": "MOTS-c 40mg",
     "plan b": "Plan B",
     "5a1 tabs": "5-Amino-1MQ Tabs",
     "5a1 100mg": "5-Amino-1MQ 100mg",
@@ -384,8 +413,21 @@ _ABBREV = {
     "pbs": "PBS",
     "ta1": "TA1",
     "ll37": "LL-37",
-    "mots": "MOTS-c",
+    "mots": "MOTS",
     "motsc": "MOTS-c",
+    "mots-c": "MOTS-c",
+    "ghk-cu": "GHK-Cu",
+    "ahk-cu": "AHK-Cu",
+    "ss-31": "SS-31",
+    "tb-500": "TB-500",
+    "pt-141": "PT-141",
+    "atp-s": "ATP-S",
+    "ll-37": "LL-37",
+    "snap-8": "Snap-8",
+    "foxo4-dri": "FOXO4-DRI",
+    "5-amino-1mq": "5-Amino-1MQ",
+    "igf-1": "IGF-1",
+    "igf-1lr3": "IGF-1 LR3",
     "foxo4": "FOXO4",
     "p21": "P21",
     "b12": "B12",
@@ -418,8 +460,10 @@ _UNITISH = re.compile(
     r"^\d+(?:\.\d+)?(?:mg|ml|mcg|iu|g|oz|ct|mg/ml)?$", re.I
 )
 _RATIO = re.compile(r"^\d+/\d+$")
-_TOKEN = re.compile(r"[^\s/·,;()+\-]+|[()/·,;+\-]")
+# Do not split on hyphen: Snap-8, GHK-Cu, MOTS-c, TB-500 stay one token.
+_TOKEN = re.compile(r"[^\s/·,;()+]+|[()/·,;+]")
 _DISAMBIG_PRICE = re.compile(r"\s*(?:·\s*)?\(\s*\$\s*\d+(?:\.\d+)?\s*\)\s*$")
+_KEEP_LOWER = frozenset({"mg", "ml", "mcg", "iu", "g", "oz", "ct"})
 
 _FLAIR: dict[str, tuple[str, ...]] = {
     "GLP-1": (
@@ -526,6 +570,10 @@ def _title_token(tok: str, index: int, total: int) -> str:
     low = tok.casefold()
     if low in _ABBREV:
         return _ABBREV[low]
+    if low in _KEEP_LOWER:
+        return low
+    if "-" in tok and not tok.startswith("-") and not tok.endswith("-"):
+        return "-".join(_title_token(part, index, total) for part in tok.split("-") if part)
     if _UNITISH.match(tok) or _RATIO.match(tok):
         return tok.lower() if re.search(r"[a-zA-Z]", tok) else tok
     if index not in (0, total - 1) and low in _SMALL:
