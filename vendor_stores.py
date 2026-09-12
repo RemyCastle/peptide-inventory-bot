@@ -698,8 +698,18 @@ def _method_kind_and_target(method: dict) -> tuple[str, str]:
     target = (
         method.get("cashtag") or method.get("handle") or method.get("address") or ""
     ).strip()
+    instr = method.get("instructions") or ""
+    try:
+        from catalog_cleanup import storefront_label, sanitize_catalog_text
+
+        mt = (storefront_label(mt, 20) or mt).lower()
+        target = storefront_label(target, 80)
+        instr = sanitize_catalog_text(instr)
+    except Exception:
+        target = " ".join(target.split())
+        instr = " ".join(str(instr).split())
     if not target and mt:
-        m = _PAY_TARGET_RE.search(method.get("instructions") or "")
+        m = _PAY_TARGET_RE.search(instr)
         if m:
             target = m.group(1)
     return mt, target

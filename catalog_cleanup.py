@@ -97,17 +97,40 @@ class CleanupPlan:
 _MOJIBAKE_MARKERS = ("Ã", "Â", "â€", "ð", "Å", "Ÿ", "€", "š", "œ", "ž")
 
 
-def repair_glyphs(text: str) -> str:
-    """Best-effort repair of UTF-8 text mis-decoded as cp1252/latin-1 (mojibake).
+def _is_regional_indicator(ch: str) -> bool:
+    o = ord(ch)
+    return 0x1F1E6 <= o <= 0x1F1FF
 
-    Conservative on purpose: only touches strings that still carry classic
-    mojibake markers, and only accepts a re-decode that is clean UTF-8 (no
-    U+FFFD). Text already stored correctly (real emoji, plain ASCII, accented
-    Latin) is returned unchanged — real emoji cannot round-trip through a
-    single-byte codec, so the encode step raises and we bail. Loops a few
-    times to undo double-encoding.
-    """
-    s = str(text or "").replace("\ufffd", "")
+
+def _drop_controls(text: str, *, keep_newlines: bool = False) -> str:
+    """Drop Cc/Cf/Cs except ZWJ (and newlines when keep_newlines)."""
+    out: list[str] = []
+    for ch in text:
+        if keep_newlines and ch in "\r\n":
+            out.append(ch)
+            continue
+        cat = unicodedata.category(ch)
+        if cat[0] == "C" and ch not in _KEEP_CF:
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _maybe_mojibake_char(ch: str) -> bool:
+    """True for latin-1 / cp1252 code points that can carry UTF-8 mojibake."""
+    if ord(ch) < 256:
+        return True
+    try:
+        ch.encode("cp1252")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _repair_loop(s: str) -> str:
+    """Undo cp1252/latin-1 mojibake on a run that can round-trip those codecs."""
+    if not s:
+        return s
     for _ in range(3):
         if not any(m in s for m in _MOJIBAKE_MARKERS):
             break
@@ -117,7 +140,7 @@ def repair_glyphs(text: str) -> str:
                 cand = s.encode(codec, "strict").decode("utf-8", "strict")
             except (UnicodeEncodeError, UnicodeDecodeError):
                 continue
-            if "�" in cand or cand == s:
+            if "\ufffd" in cand or cand == s:
                 continue
             fixed = cand
             break
@@ -127,10 +150,41 @@ def repair_glyphs(text: str) -> str:
     return s
 
 
+def repair_glyphs(text: str) -> str:
+    """Best-effort repair of UTF-8 text mis-decoded as cp1252/latin-1 (mojibake).
+
+    Conservative on purpose: only touches runs that still carry classic
+    mojibake markers, and only accepts a re-decode that is clean UTF-8 (no
+    U+FFFD). Already-correct emoji cannot round-trip a single-byte codec, so
+    a mixed string (real 🧬 next to leftover ðŸ) is split: the latin run is
+    repaired and the real emoji is kept. Loops a few times to undo
+    double-encoding.
+    """
+    # BOM / replacement must go first or they block a cp1252 re-encode.
+    s = str(text or "").replace("\ufeff", "").replace("\ufffd", "")
+    whole = _repair_loop(s)
+    if whole != s or not any(m in s for m in _MOJIBAKE_MARKERS):
+        return whole.replace("\ufffd", "")
+    out: list[str] = []
+    buf: list[str] = []
+    for ch in s:
+        if _maybe_mojibake_char(ch):
+            buf.append(ch)
+            continue
+        if buf:
+            out.append(_repair_loop("".join(buf)))
+            buf.clear()
+        out.append(ch)
+    if buf:
+        out.append(_repair_loop("".join(buf)))
+    return "".join(out).replace("\ufffd", "")
+
+
 def display_shop_text(text: str) -> str:
     """Repair mojibake in shop title / welcome while preserving line breaks."""
-    s = repair_glyphs(str(text or ""))
-    return s.replace("�", "").replace("­", "")
+    s = repair_glyphs(str(text or "")).replace("\u00ad", "")
+    s = _drop_controls(s, keep_newlines=True)
+    return s.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def buyer_shop_title(title: str | None, *, unicorn: bool = False) -> str:
@@ -185,13 +239,21 @@ def clip_label(text: str, max_len: int, *, ellipsis: str = "…") -> str:
             break
         out.append(ch)
         used += w
-    while out and (
-        unicodedata.combining(out[-1])
-        or out[-1] in _KEEP_CF
-        or out[-1] == "\ufe0f"
-    ):
+    # ZWJ joins to the *next* code point — a trailing one is always dangling.
+    # Do not pop VS-16 / combining marks: those bind to the previous character
+    # and are complete if we already kept the base (☂️, café).
+    while out and out[-1] in _KEEP_CF:
         used -= 2 if ord(out[-1]) > 0xFFFF else 1
         out.pop()
+    if out and _is_regional_indicator(out[-1]):
+        run = 0
+        for ch in reversed(out):
+            if _is_regional_indicator(ch):
+                run += 1
+            else:
+                break
+        if run % 2 == 1:
+            out.pop()
     clipped = "".join(out).rstrip(" ·-/,")
     return clipped + ell
 
@@ -206,18 +268,12 @@ def sanitize_catalog_text(text: str) -> str:
     s = repair_glyphs(str(text or ""))
     if not s:
         return ""
-    s = s.replace("\ufffd", "").replace("\u00ad", "")
+    s = s.replace("\u00ad", "")
     try:
         s = unicodedata.normalize("NFKC", s)
     except Exception:
         pass
-    out: list[str] = []
-    for ch in s:
-        cat = unicodedata.category(ch)
-        if cat[0] == "C" and ch not in _KEEP_CF:
-            continue
-        out.append(ch)
-    return " ".join("".join(out).split())
+    return " ".join(_drop_controls(s).split())
 
 
 def storefront_label(text: str | None, max_len: int | None = None) -> str:
@@ -244,8 +300,8 @@ def sanitize_multiline(text: str | None, max_len: int | None = None) -> str:
         out.append(ch)
     lines = [" ".join(part.split()) for part in "".join(out).split("\n")]
     s = "\n".join(lines).strip()
-    if max_len is not None and int(max_len) > 0 and len(s) > int(max_len):
-        s = s[: int(max_len)].rstrip()
+    if max_len is not None and int(max_len) > 0 and utf16_len(s) > int(max_len):
+        s = clip_label(s, int(max_len), ellipsis="")
     return s
 
 
@@ -255,8 +311,7 @@ def public_shipping_zones(zones: list[dict] | None) -> list[dict] | None:
         return None
     out: list[dict] = []
     for z in zones:
-        zid_raw = str(z.get("id") or "")
-        zid = storefront_label(zid_raw, 40) or zid_raw.strip()[:40]
+        zid = storefront_label(z.get("id"), 40)
         if not zid:
             continue
         label = storefront_label(z.get("label"), 80) or zid

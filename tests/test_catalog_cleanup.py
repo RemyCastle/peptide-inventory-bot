@@ -265,6 +265,77 @@ class GlyphRepairTests(unittest.TestCase):
         self.assertNotRegex(cloud, r"(?i)os\.remove\(.*inventory")
         self.assertNotRegex(cloud, r"(?i)unlink\(.*inventory")
 
+    def test_bom_does_not_block_mojibake_repair(self) -> None:
+        original = "🦄 Unicorn Magic Factory"
+        broken = "\ufeff" + self._mojibake(original, "cp1252")
+        self.assertEqual(cc.repair_glyphs(broken), original)
+        self.assertEqual(cc.sanitize_catalog_text(broken), original)
+
+    def test_triple_encoded_mojibake(self) -> None:
+        original = "🦄"
+        once = self._mojibake(original, "cp1252")
+        twice = self._mojibake(once, "latin-1")
+        thrice = self._mojibake(twice, "latin-1")
+        self.assertEqual(cc.repair_glyphs(thrice), original)
+
+    def test_replacement_only_becomes_empty(self) -> None:
+        self.assertEqual(cc.repair_glyphs("\ufffd\ufffd"), "")
+        self.assertEqual(cc.sanitize_catalog_text("\ufffd"), "")
+        self.assertEqual(cc.storefront_label("\u0000\ufffd", 40), "")
+
+    def test_keycap_and_vs16_kept(self) -> None:
+        keycap = "1\ufe0f\u20e3"
+        umbrella = "\u2602\ufe0f"
+        self.assertEqual(cc.sanitize_catalog_text(keycap), keycap)
+        self.assertEqual(cc.sanitize_catalog_text(umbrella), umbrella)
+        clipped = cc.clip_label(umbrella + " extra", 2, ellipsis="")
+        self.assertEqual(clipped, umbrella)
+        self.assertIn("\ufe0f", clipped)
+
+    def test_clip_label_drops_lone_regional_indicator(self) -> None:
+        flag = "🇺🇸"
+        # 10 flags = 40 units. Budget 7 with ellipsis → 6 units = 1 flag + 1 RI.
+        clipped = cc.clip_label(flag * 10, 7)
+        self.assertLessEqual(cc.utf16_len(clipped), 7)
+        ris = [ch for ch in clipped if cc._is_regional_indicator(ch)]
+        self.assertEqual(len(ris) % 2, 0)
+        clipped.encode("utf-16-le")
+
+    def test_clip_label_strips_zwj_when_it_fits(self) -> None:
+        raw = ("A" * 63) + "\u200d" + "B"
+        clipped = cc.clip_label(raw, 64, ellipsis="")
+        self.assertFalse(clipped.endswith("\u200d"))
+        self.assertLessEqual(cc.utf16_len(clipped), 64)
+
+    def test_display_shop_text_strips_nul_keeps_newline(self) -> None:
+        raw = "Hello\u0000\nWorld\ufffd"
+        out = cc.display_shop_text(raw)
+        self.assertEqual(out, "Hello\nWorld")
+        self.assertNotIn("\u0000", out)
+
+    def test_public_shipping_zones_skips_junk_only_id(self) -> None:
+        self.assertIsNone(
+            cc.public_shipping_zones(
+                [{"id": "\u0000\ufffd", "label": "Nope", "fee": 1, "free_above": 0}]
+            )
+        )
+        zones = cc.public_shipping_zones(
+            [
+                {"id": "\u0000", "label": "Bad", "fee": 1, "free_above": 0},
+                {"id": "US-W\u200b", "label": "West\ufffd", "fee": 8, "free_above": 0},
+            ]
+        )
+        self.assertEqual(len(zones), 1)
+        self.assertEqual(zones[0]["id"], "US-W")
+        self.assertEqual(zones[0]["label"], "West")
+
+    def test_sanitize_multiline_clips_without_splitting_emoji(self) -> None:
+        raw = "🦄" * 40
+        out = cc.sanitize_multiline(raw, 10)
+        self.assertLessEqual(cc.utf16_len(out), 10)
+        out.encode("utf-16-le")
+        self.assertNotIn("\ufffd", out)
+
 
 class CleanupApplyTests(unittest.TestCase):
     def setUp(self) -> None:

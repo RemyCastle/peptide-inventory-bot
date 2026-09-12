@@ -786,6 +786,27 @@ def update_shop(chat_id: int, **fields: Any) -> None:
     vals: list[Any] = []
     for k, v in fields.items():
         if k in allowed:
+            if k == "title" and isinstance(v, str):
+                try:
+                    from catalog_cleanup import storefront_label
+
+                    v = storefront_label(v, 80) or "Shop"
+                except Exception:
+                    v = " ".join(v.split())[:80] or "Shop"
+            elif k == "welcome_text" and isinstance(v, str):
+                try:
+                    from catalog_cleanup import sanitize_multiline
+
+                    v = sanitize_multiline(v, 500)
+                except Exception:
+                    v = str(v).replace("\x00", "")[:500]
+            elif k == "min_order_label" and isinstance(v, str):
+                try:
+                    from catalog_cleanup import storefront_label
+
+                    v = storefront_label(v, 40)
+                except Exception:
+                    v = " ".join(v.split())[:40]
             cols.append(f"{k} = ?")
             vals.append(v)
     if not cols:
@@ -1204,7 +1225,7 @@ def parse_shipping_zones(shop: dict | None) -> list[dict] | None:
         try:
             from catalog_cleanup import storefront_label
 
-            zid = storefront_label(zid, 40) or zid
+            zid = storefront_label(zid, 40)
             label = storefront_label(label, 80) or zid
         except Exception:
             pass
@@ -1425,8 +1446,25 @@ def update_product(product_id: int, **fields: Any) -> bool:
     }
     cols = ["updated_at = ?"]
     vals: list[Any] = [_utc_now()]
+    _label_caps = {
+        "sku": 40,
+        "category": 40,
+        "variant_group": 80,
+        "variant_label": 80,
+        "unit": 20,
+    }
     for k, v in fields.items():
         if k in allowed:
+            if isinstance(v, str):
+                try:
+                    from catalog_cleanup import sanitize_catalog_text, storefront_label
+
+                    if k in ("name", "description", "photo_file_id"):
+                        v = sanitize_catalog_text(v)
+                    elif k in _label_caps:
+                        v = storefront_label(v, _label_caps[k]) or None
+                except Exception:
+                    v = " ".join(v.split())
             cols.append(f"{k} = ?")
             vals.append(v)
     vals.append(product_id)
@@ -1968,8 +2006,18 @@ def add_payment_method(
         from catalog_cleanup import storefront_label, sanitize_catalog_text
 
         cleaned = storefront_label(clean_name, 60)
-        clean_name = cleaned if cleaned else (clean_name[:60] or "Payment")
+        clean_name = cleaned or "Payment"
         clean_instr = sanitize_catalog_text(clean_instr)
+        if cashtag:
+            cashtag = storefront_label(cashtag, 40) or None
+        if handle:
+            handle = storefront_label(handle, 80) or None
+        if chain:
+            chain = storefront_label(chain, 40) or None
+        if address:
+            address = storefront_label(address, 120) or None
+        if network_note:
+            network_note = storefront_label(network_note, 80) or None
     except Exception:
         clean_name = " ".join(clean_name.split())[:60]
         clean_instr = " ".join(clean_instr.split())
@@ -2035,9 +2083,9 @@ def update_payment_method(method_id: int, **fields: Any) -> bool:
             try:
                 from catalog_cleanup import storefront_label
 
-                v = storefront_label(v, 60) or v[:60]
+                v = storefront_label(v, 60) or "Payment"
             except Exception:
-                v = " ".join(v.split())[:60]
+                v = " ".join(v.split())[:60] or "Payment"
         elif k == "instructions" and isinstance(v, str):
             try:
                 from catalog_cleanup import sanitize_catalog_text
@@ -2045,6 +2093,19 @@ def update_payment_method(method_id: int, **fields: Any) -> bool:
                 v = sanitize_catalog_text(v)
             except Exception:
                 v = " ".join(v.split())
+        elif k in (
+            "cashtag",
+            "handle",
+            "chain",
+            "address",
+            "network_note",
+        ) and isinstance(v, str):
+            try:
+                from catalog_cleanup import storefront_label
+
+                v = storefront_label(v, 120)
+            except Exception:
+                v = " ".join(v.split())[:120]
         cols.append(f"{k} = ?")
         vals.append(v)
     if not cols:

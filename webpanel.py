@@ -904,6 +904,17 @@ def _buyer_field(value: Any, max_len: int) -> str | None:
     return s or None
 
 
+def _buyer_http_url(value: Any, max_len: int = 500) -> str:
+    """Buyer-facing http(s) URL: junk stripped, non-http dropped."""
+    raw = str(value or "").strip()
+    if not (raw.startswith("http://") or raw.startswith("https://")):
+        return ""
+    cleaned = _buyer_field(raw, max_len) or ""
+    if not (cleaned.startswith("http://") or cleaned.startswith("https://")):
+        return ""
+    return cleaned
+
+
 def _buyer_payment_name(m: dict) -> str:
     raw = str(m.get("name") or "")
     return _buyer_field(raw, 60) or "Payment"
@@ -964,8 +975,7 @@ def api_storefront(raw_key: str) -> tuple[int, dict]:
                 "sku": _buyer_field(p.get("sku"), 40),
                 "variant_group": _buyer_field(p.get("variant_group"), 80),
                 "variant_label": _buyer_field(p.get("variant_label"), 80),
-                "photo_url": ((p.get("photo_file_id") or "").strip()
-                              if (p.get("photo_file_id") or "").startswith("http") else ""),
+                "photo_url": _buyer_http_url(p.get("photo_file_id")),
                 "category": _buyer_field(p.get("category"), 40),
                 "sort_order": int(p.get("sort_order") or 0),
             }
@@ -1017,7 +1027,7 @@ def api_order_status(raw_key: str, payment_code: str) -> tuple[int, dict]:
     return 200, {
         "ok": True,
         "status": status,
-        "code": code,
+        "code": _buyer_field(code, 32) or str(code or ""),
         "needs_payment": needs_payment,
         "can_mark_paid": can_mark_paid,
         "mark_paid_hint": vendor_stores.mark_paid_buyer_hint(status),
@@ -1076,11 +1086,16 @@ def _optional_text(value: Any, max_len: int) -> str | None:
 
 
 def _product_public(p: dict) -> dict:
-    photo = (p.get("photo_file_id") or "").strip()
+    photo = _buyer_http_url(p.get("photo_file_id")) or (
+        (p.get("photo_file_id") or "").strip()
+        if not str(p.get("photo_file_id") or "").startswith("http")
+        else ""
+    )
     cat = _optional_text(p.get("category"), 40) or ""
     sku = _optional_text(p.get("sku"), 40) or ""
     shown = _buyer_product_name(p)
     stored = str(p.get("name") or "")
+    unit = _optional_text(p.get("unit") or "vial", 20) or "vial"
     return {
         "id": p["id"],
         "name": p["name"],
@@ -1092,13 +1107,13 @@ def _product_public(p: dict) -> dict:
         "sku": sku,
         "variant_group": _optional_text(p.get("variant_group"), 80) or "",
         "variant_label": _optional_text(p.get("variant_label"), 80) or "",
-        "unit": p.get("unit") or "vial",
+        "unit": unit,
         "active": int(p.get("active") or 0),
         "site_key": p.get("site_key"),
         # only URL photos can be shown in a browser (Telegram file_ids can't)
-        "photo_url": photo if photo.startswith("http") else "",
-        "has_photo": bool(photo),
-        "coa_url": (p.get("coa_url") or "").strip(),
+        "photo_url": photo if str(photo).startswith("http") else "",
+        "has_photo": bool((p.get("photo_file_id") or "").strip()),
+        "coa_url": _buyer_http_url(p.get("coa_url")),
         "has_coa_file": bool((p.get("coa_file_id") or "").strip()),
         "category": cat or None,
         "sort_order": int(p.get("sort_order") or 0),
@@ -1113,12 +1128,18 @@ def api_state(tok: dict) -> tuple[int, dict]:
     checkout_ready = any(int(m.get("active") or 0) for m in payments)
     import vendor_stores
 
+    try:
+        from catalog_cleanup import sanitize_multiline
+
+        welcome = sanitize_multiline(shop.get("welcome_text"), 500)
+    except Exception:
+        welcome = shop.get("welcome_text") or ""
     return 200, {
         "ok": True,
         "shop": {
             "chat_id": chat_id,
-            "title": shop["title"],
-            "welcome_text": shop.get("welcome_text") or "",
+            "title": _buyer_field(shop.get("title"), 80) or "Shop",
+            "welcome_text": welcome or "",
             "currency_symbol": "$",
             "shipping_enabled": int(shop.get("shipping_enabled") or 0),
             "shipping_fee": float(shop.get("shipping_fee") or 0),
@@ -1389,11 +1410,11 @@ def _payment_payload_to_fields(payload: dict) -> dict[str, Any]:
     method_type = str(payload.get("method_type") or "custom").strip().lower()
     if method_type not in payment_templates.METHOD_TYPES:
         method_type = "custom"
-    handle = str(payload.get("handle") or "").strip()
-    address = str(payload.get("address") or "").strip()
-    chain = str(payload.get("chain") or "").strip()
-    network_note = str(payload.get("network_note") or "").strip()
-    cashtag = str(payload.get("cashtag") or "").strip()
+    handle = _optional_text(payload.get("handle"), 80) or ""
+    address = _optional_text(payload.get("address"), 120) or ""
+    chain = _optional_text(payload.get("chain"), 40) or ""
+    network_note = _optional_text(payload.get("network_note"), 80) or ""
+    cashtag = _optional_text(payload.get("cashtag"), 40) or ""
     name = (_optional_text(payload.get("name"), 60) or "").strip()[:60]
     instructions = str(payload.get("instructions") or "").strip()[:1000]
 

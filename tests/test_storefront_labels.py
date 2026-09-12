@@ -403,6 +403,173 @@ class LabelFuzzTests(unittest.TestCase):
         self.assertEqual(zones[0]["id"], "intl")
         self.assertEqual(zones[0]["label"], "Intl")
 
+    def test_fuzz_mixed_mojibake_controls_and_zwj(self) -> None:
+        family = "👨\u200d👩\u200d👧\u200d👦"
+        raw = (
+            "\ufeff"
+            + _mojibake("🧬 ")
+            + family
+            + "\u0000\ufffd "
+            + _mojibake("Café")
+        )
+        out = cc.sanitize_catalog_text(raw)
+        self.assertIn("🧬", out)
+        self.assertIn(family, out)
+        self.assertIn("Café", out)
+        self.assertNotIn("\ufffd", out)
+        self.assertNotIn("\u0000", out)
+        self.assertNotIn("\ufeff", out)
+        glued = _mojibake("🧬") + family + _mojibake(" Café")
+        glued_out = cc.sanitize_catalog_text(glued)
+        self.assertIn("🧬", glued_out)
+        self.assertIn(family, glued_out)
+        self.assertIn("Café", glued_out)
+
+
+class StorefrontGapTests(unittest.TestCase):
+    """Leftover buyer fields the first audit passes did not cover."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        db.set_db_path(Path(self._tmp.name) / "labels.db")
+        db.init_db()
+        db.ensure_shop(SHOP, title="Unicorn Magic Factory")
+        webpanel.ensure_webpanel_tables()
+        self.tok = {"chat_id": SHOP, "user_id": USER}
+        self.sf_key = webpanel._ensure_storefront_key(SHOP)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_storefront_photo_url_strips_junk_keeps_https(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE products SET photo_file_id = ? WHERE id = ?",
+                ("https://cdn.example.com/p\u0000.png\ufffd", pid),
+            )
+        code, body = webpanel.api_storefront(self.sf_key)
+        self.assertEqual(code, 200, body)
+        url = body["products"][0]["photo_url"]
+        self.assertTrue(url.startswith("https://"))
+        self.assertIn("cdn.example.com/p.png", url)
+        self.assertNotIn("\u0000", url)
+        self.assertNotIn("\ufffd", url)
+
+    def test_storefront_rejects_non_http_photo(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE products SET photo_file_id = ? WHERE id = ?",
+                ("javascript:alert(1)\u0000", pid),
+            )
+        code, body = webpanel.api_storefront(self.sf_key)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["products"][0]["photo_url"], "")
+
+    def test_order_status_payment_target_sanitized(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        db.add_payment_method(SHOP, "Venmo", "@wineboos", handle="@wineboos\u0000\ufffd")
+        order = db.create_order(
+            SHOP,
+            BUYER,
+            "buyer",
+            "Buyer",
+            [
+                {
+                    "product_id": pid,
+                    "product_name": "SEMA 10MG",
+                    "unit_price": 10.0,
+                    "quantity": 1,
+                }
+            ],
+            {"id": None, "name": "Venmo"},
+            "Buyer",
+            "1 St",
+            "",
+        )
+        code, body = webpanel.api_order_status(self.sf_key, order["payment_code"])
+        self.assertEqual(code, 200, body)
+        target = body["payment_methods"][0].get("target") or ""
+        self.assertEqual(target, "@wineboos")
+        self.assertNotIn("\u0000", target)
+        self.assertNotIn("\ufffd", target)
+        pay_url = body["payment_methods"][0].get("pay_url") or ""
+        self.assertNotIn("%00", pay_url)
+        self.assertNotIn("\ufffd", pay_url)
+
+    def test_admin_state_title_welcome_and_unit_sanitized(self) -> None:
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE shops SET title = ?, welcome_text = ? WHERE chat_id = ?",
+                (
+                    "Unicorn\u0000 Magic\ufffd",
+                    _mojibake("🦄 Hello\nthere") + "\u0000",
+                    SHOP,
+                ),
+            )
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE products SET unit = ? WHERE id = ?",
+                ("vial\u0000\ufffd", pid),
+            )
+        code, state = webpanel.api_state(self.tok)
+        self.assertEqual(code, 200)
+        self.assertEqual(state["shop"]["title"], "Unicorn Magic")
+        self.assertIn("🦄", state["shop"]["welcome_text"])
+        self.assertIn("\n", state["shop"]["welcome_text"])
+        self.assertNotIn("\u0000", state["shop"]["welcome_text"])
+        row = next(p for p in state["products"] if p["id"] == pid)
+        self.assertEqual(row["unit"], "vial")
+
+    def test_payment_handle_write_strips_junk(self) -> None:
+        code, data = webpanel.api_payment(
+            self.tok,
+            {
+                "name": "Venmo",
+                "method_type": "venmo",
+                "handle": "@wineboos\u0000\ufffd",
+            },
+        )
+        self.assertEqual(code, 200, data)
+        row = db.get_payment_method(data["id"])
+        self.assertEqual(row["handle"], "@wineboos")
+        pub = vendor_stores.payment_method_public(row, 10.0, "ABC123")
+        self.assertEqual(pub["target"], "@wineboos")
+        self.assertNotIn("\ufffd", pub["target"])
+
+    def test_db_update_product_strips_sku_junk(self) -> None:
+        pid = db.add_product(SHOP, "SEMA 10MG", 10.0, 3)
+        db.update_product(pid, sku="UMF\u0000-X\ufffd", category="Pep\u200btides")
+        row = db.get_product(pid)
+        self.assertEqual(row["sku"], "UMF-X")
+        self.assertEqual(row["category"], "Peptides")
+
+    def test_junk_only_shipping_zone_not_on_storefront(self) -> None:
+        import json
+
+        db.update_shop(
+            SHOP,
+            shipping_zones=json.dumps(
+                [{"id": "\u0000\ufffd", "label": "Nope", "fee": 5, "free_above": 0}]
+            ),
+        )
+        code, body = webpanel.api_storefront(self.sf_key)
+        self.assertEqual(code, 200, body)
+        self.assertFalse(body["shop"]["shipping_zones"])
+
+    def test_scratch_db_only_gap_suite(self) -> None:
+        repo_db = ROOT / "inventory.db"
+        current = Path(db._db_path).resolve()
+        self.assertTrue(str(current).endswith("labels.db"))
+        self.assertNotEqual(current, repo_db.resolve())
+        if repo_db.exists():
+            before = (repo_db.stat().st_mtime_ns, repo_db.stat().st_size)
+            webpanel.api_storefront(self.sf_key)
+            after = (repo_db.stat().st_mtime_ns, repo_db.stat().st_size)
+            self.assertEqual(before, after)
+
 
 if __name__ == "__main__":
     unittest.main()
