@@ -89,6 +89,38 @@ class BackupTests(unittest.TestCase):
         self.assertTrue(latest.is_file())
         self.assertFalse(old.exists())
 
+    def test_create_backup_does_not_wipe_live_db(self) -> None:
+        before = self.db_path.read_bytes()
+        stock = db.list_products(self.shop)[0]["stock"]
+        backup.create_encrypted_backup(
+            self.db_path, self.vault, self.passphrase, reason="manual"
+        )
+        self.assertTrue(self.db_path.is_file())
+        self.assertGreater(self.db_path.stat().st_size, 0)
+        self.assertEqual(db.list_products(self.shop)[0]["stock"], stock)
+        self.assertTrue((self.vault / "latest.enc").is_file())
+        # Live file still present (sqlite may checkpoint WAL; contents stay valid).
+        self.assertTrue(self.db_path.exists())
+        _ = before
+
+    def test_maybe_backup_writes_latest_when_opted_in(self) -> None:
+        import os
+        from unittest import mock
+
+        env = {
+            "BACKUP_PASSPHRASE": self.passphrase,
+            "BACKUP_DIR": str(self.vault),
+            "BACKUP_ALLOW_IN_PYTEST": "1",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            path = backup.maybe_backup_after_event(
+                self.db_path, reason="paid_confirm"
+            )
+        self.assertIsNotNone(path)
+        self.assertTrue((self.vault / "latest.enc").is_file())
+        self.assertTrue(self.db_path.is_file())
+        self.assertEqual(db.list_products(self.shop)[0]["stock"], 12)
+
 
 class TokenPoolTests(unittest.TestCase):
     def test_parse_and_failover_index(self) -> None:

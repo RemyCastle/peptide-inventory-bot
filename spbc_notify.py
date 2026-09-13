@@ -1889,6 +1889,27 @@ class NotifyHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(raw)
             return
+        if path == "/panel/api/backup.enc":
+            # Owner-only encrypted inventory snapshot. Token required.
+            import webpanel
+
+            query = urllib.parse.parse_qs(parsed.query)
+            code, ctype, body = webpanel.handle_panel_get(path, query)
+            if code != 200:
+                self._send_raw(code, ctype, body)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header(
+                "Content-Disposition", 'attachment; filename="latest.enc"'
+            )
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Robots-Tag", "noindex")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/track":
             # Narrow order-action token auth (ot=). Not the admin panel.
             import webpanel

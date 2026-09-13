@@ -8,6 +8,7 @@ edits the SAME rows Telegram sells from — no second database, no sync drift.
 Endpoints (JSON API is pure-function first for testability):
   GET  /panel?t=…               the single-file HTML app
   GET  /panel/api/state?t=…     shop + products + payments + shipping
+  GET  /panel/api/backup.enc?t=…  owner-only encrypted inventory snapshot
   POST /panel/api/product       upsert one product (stock change → audit row)
   POST /panel/api/bulk          paste-import "name | price | stock" lines
   POST /panel/api/payment       add / update / delete a payment method
@@ -25,6 +26,7 @@ import hashlib
 import html
 import json
 import logging
+import os
 import re
 import secrets
 import urllib.parse
@@ -1212,6 +1214,8 @@ def api_state(tok: dict) -> tuple[int, dict]:
             "shipping_zones": _buyer_zones(db.parse_shipping_zones(shop)),
             "is_unicorn": _shop_is_unicorn(chat_id, shop.get("title")),
             "checkout_ready": checkout_ready,
+            "is_owner": db.is_owner(int(tok.get("user_id") or 0)),
+            "backup_ready": bool(os.getenv("BACKUP_PASSPHRASE", "").strip()),
         },
         "products": [_product_public(p) for p in products],
         "payments": [
@@ -2103,6 +2107,7 @@ def api_confirm_payment(tok: dict, payload: dict) -> tuple[int, dict]:
         "It's being prepared — you'll get tracking here when it ships."
     )
     notified = notify_order_customer(chat_id, int(order["user_id"]), text)
+    _vault_after_paid_confirm()
     return 200, {
         "ok": True,
         "status": order.get("status") or "paid",
@@ -2744,6 +2749,7 @@ def handle_confirm_post(
         "It's being prepared — you'll get tracking here when it ships."
     )
     notified = notify_order_customer(shop_chat_id, int(order["user_id"]), text)
+    _vault_after_paid_confirm()
 
     if wants_json:
         body = {
@@ -2984,6 +2990,55 @@ def handle_cancel_post(
 
 # ── HTTP layer (called from spbc_notify's request handler) ──────────────────
 
+def _vault_after_paid_confirm() -> None:
+    """Write latest.enc after a stock-changing paid confirm. Never wipes live DB."""
+    try:
+        import backup as backup_mod
+
+        path = backup_mod.maybe_backup_after_event(
+            db.get_db_path(), reason="paid_confirm"
+        )
+        if path:
+            log.info("Post-paid backup ok: %s", path)
+    except Exception as exc:
+        log.exception("Post-paid backup error: %s", exc)
+
+
+def api_inventory_backup_enc(tok: dict) -> tuple[int, str, bytes]:
+    """Owner-only: snapshot live DB to latest.enc and return the blob.
+
+    Never restores, unlinks, or truncates inventory.db.
+    """
+    user_id = int(tok.get("user_id") or 0)
+    if not db.is_owner(user_id):
+        body = json.dumps(
+            {"ok": False, "error": "owners_only"}, ensure_ascii=False
+        )
+        return 403, "application/json; charset=utf-8", body.encode("utf-8")
+    import backup as backup_mod
+
+    passphrase = backup_mod.passphrase_from_env()
+    if not passphrase:
+        body = json.dumps(
+            {"ok": False, "error": "backup_passphrase_not_set"},
+            ensure_ascii=False,
+        )
+        return 503, "application/json; charset=utf-8", body.encode("utf-8")
+    db_path = Path(db.get_db_path())
+    if not db_path.is_file():
+        body = json.dumps(
+            {"ok": False, "error": "db_missing"}, ensure_ascii=False
+        )
+        return 500, "application/json; charset=utf-8", body.encode("utf-8")
+    bdir = backup_mod.backup_dir_from_env(backup_mod.default_backup_dir(db_path))
+    dated = backup_mod.create_encrypted_backup(
+        db_path, bdir, passphrase, reason="panel_download"
+    )
+    latest = bdir / "latest.enc"
+    blob = latest.read_bytes() if latest.is_file() else Path(dated).read_bytes()
+    return 200, "application/octet-stream", blob
+
+
 def handle_panel_get(path: str, query: dict) -> tuple[int, str, bytes]:
     """Returns (status, content_type, body).
 
@@ -3020,6 +3075,15 @@ def handle_panel_get(path: str, query: dict) -> tuple[int, str, bytes]:
         # content type + special marker so spbc_notify can attach Content-Disposition
         ctype = f"text/plain; charset=utf-8; name={filename}"
         return 200, ctype, body
+    if path == "/panel/api/backup.enc":
+        tok = resolve_token((query.get("t") or [""])[0])
+        if not tok:
+            body = json.dumps(
+                {"ok": False, "error": "invalid_or_expired_link"},
+                ensure_ascii=False,
+            )
+            return 401, "application/json; charset=utf-8", body.encode("utf-8")
+        return api_inventory_backup_enc(tok)
     return 404, "application/json", b'{"error":"not_found"}'
 
 
@@ -3370,6 +3434,16 @@ function render(){
       <div><button class="sub" id="ord-set-save">Save</button></div></div>
     <span class="tag">Min qty 0 = no minimum. Low-stock alerts when shelf count hits this number.</span>
   </div>
+  ${(S.shop&&S.shop.is_owner)?`<div class="card"><h2>Encrypted backup</h2>
+    <p class="tag" style="margin:0 0 10px">Owner-only. Downloads <code>latest.enc</code>
+      (encrypted inventory snapshot). Does not change or wipe the live database.</p>
+    <div class="flex">
+      <button type="button" class="sub" id="bk-dl">Download latest.enc</button>
+      <span class="tag grow">${S.shop.backup_ready
+        ? 'Vault ready — copy this file to the laptop backups folder.'
+        : 'Set BACKUP_PASSPHRASE on the host first.'}</span>
+    </div>
+  </div>`:''}
   </div>`:''}
   ${TAB==='orders'?`<div id="tab-orders">
   <div class="card"><h2>Orders</h2>
@@ -3607,6 +3681,11 @@ function wire(){
     if(end)q.set('end',end);
     // open attachment download (token in query; one-shot browser GET)
     window.location.href='panel/api/orders.txt?'+q.toString();
+  };
+  const bkDl=$('#bk-dl');
+  if(bkDl)bkDl.onclick=()=>{
+    const q=new URLSearchParams({t:T});
+    window.location.href='panel/api/backup.enc?'+q.toString();
   };
   const catQ=$('#cat-q'), catH=$('#cat-hidden');
   if(catQ){

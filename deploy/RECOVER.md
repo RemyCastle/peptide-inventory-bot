@@ -106,9 +106,17 @@ Paid **Confirm** also writes a snapshot when `BACKUP_PASSPHRASE` is set.
 
 ## Laptop vault habit
 
-1. Keep `BACKUP_PASSPHRASE` only in a password manager.  
-2. Copy `latest.enc` (or whole `backups/`) to the laptop weekly (or after big stock changes).  
-3. Retention on host is ~30 days; laptop can keep its own copies longer if you want.
+Folder: `C:\Users\Remy\peptide_inventory_bot\backups` (gitignored). **Never** copy over `inventory.db` — only `.enc` files.
+
+1. Keep `BACKUP_PASSPHRASE` only in a password manager.
+2. Pull `latest.enc` after paid confirms / big stock changes (or weekly):
+   - Owner webpanel → **Settings** → **Download latest.enc**
+   - Then: `.\scripts\pull-vault.ps1` (picks up Downloads\latest.enc)
+   - Or with a fresh `/webpanel` token:
+     `.\scripts\pull-vault.ps1 -Url "https://unicornfartzz-bot.onrender.com/panel/api/backup.enc" -Token "<t>"`
+   - Telegram `/backup` still writes the host vault at `/data/backups/latest.enc`
+3. Retention on host is ~30 days; laptop dated `laptop-*.enc` copies can be kept longer.
+4. Restore is a separate command (`scripts\restore_backup.py`) and copies the live DB aside first. `pull-vault.ps1` never restores.
 
 ## Indefinite redeploys
 

@@ -94,6 +94,18 @@ class ConfirmPaymentTests(PanelOrdersBase):
         self.assertIn(o["payment_code"], args[2])
         self.assertIn("Payment received", args[2])
 
+    def test_confirm_payment_triggers_vault_snapshot(self):
+        o = self._order()
+        db.mark_order_awaiting_confirmation(int(o["id"]))
+        with mock.patch.object(webpanel, "notify_order_customer", return_value=True), mock.patch.object(
+            webpanel, "_vault_after_paid_confirm"
+        ) as vault:
+            code, data = webpanel.api_confirm_payment(
+                self.tok, {"order_id": o["id"]}
+            )
+        self.assertEqual(code, 200, data)
+        vault.assert_called_once()
+
     def test_confirm_rejects_cross_shop_order(self):
         foreign = self._order(shop=OTHER_SHOP, pid=self.other_pid)
         code, data = webpanel.api_confirm_payment(

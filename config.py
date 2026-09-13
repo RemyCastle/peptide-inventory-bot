@@ -47,8 +47,10 @@ TOKEN_FAILOVER = os.getenv("TOKEN_FAILOVER", "1").strip().lower() in (
 PUBLIC_BOT_USERNAME = os.getenv("PUBLIC_BOT_USERNAME", "").strip().lstrip("@")
 RECOVERY_URL = os.getenv("RECOVERY_URL", "").strip()
 
-# Encrypted backup vault (live DB stays at DB_PATH; vault is for restore)
-BACKUP_DIR = Path(os.getenv("BACKUP_DIR", str(BASE_DIR / "backups")))
+# Encrypted backup vault (live DB stays at DB_PATH; vault is for restore).
+# Default next to the live DB so Render DB_PATH=/data/inventory.db → /data/backups
+# even if BACKUP_DIR is missing from the dashboard.
+BACKUP_DIR = Path(os.getenv("BACKUP_DIR", str(Path(DB_PATH).resolve().parent / "backups")))
 BACKUP_PASSPHRASE = os.getenv("BACKUP_PASSPHRASE", "").strip()
 try:
     BACKUP_RETENTION_DAYS = max(1, int(os.getenv("BACKUP_RETENTION_DAYS", "30")))

@@ -47,7 +47,8 @@ Details: [`deploy/ALWAYS_ON.md`](deploy/ALWAYS_ON.md)
 ### Ban recovery / multi-token standby
 
 - Put spare BotFather tokens in `BOT_TOKENS` (different accounts OK). On invalid/banned token the process can fail over to the next while keeping the **same** `inventory.db`.
-- Set `BACKUP_PASSPHRASE` + `BACKUP_DIR` for encrypted snapshots (`latest.enc`) after each paid confirm, plus owner `/backup`.
+- Set `BACKUP_PASSPHRASE` + `BACKUP_DIR` (`/data/backups` on Render) for encrypted snapshots (`latest.enc`) after each paid confirm, plus owner `/backup`.
+- Owner webpanel **Settings → Download latest.enc**, then `.\scripts\pull-vault.ps1` into `C:\Users\Remy\peptide_inventory_bot\backups`. Never overwrites `inventory.db`.
 - Restore: `python scripts/restore_backup.py backups/latest.enc` — see [`deploy/RECOVER.md`](deploy/RECOVER.md).
 
 ---

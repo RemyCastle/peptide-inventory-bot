@@ -28,7 +28,7 @@ OWNER_IDS=your_telegram_id
 BRAND_NAME=YourShopName
 DB_PATH=/data/inventory.db
 LOG_PATH=/data/bot.log
-# Encrypted vault (paid confirm + /backup):
+# Encrypted vault (paid confirm + /backup + owner panel download):
 # BACKUP_PASSPHRASE=long-secret
 # BACKUP_DIR=/data/backups
 # BACKUP_RETENTION_DAYS=30

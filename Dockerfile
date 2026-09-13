@@ -4,9 +4,12 @@ WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1 \
     DB_PATH=/data/inventory.db \
-    LOG_PATH=/data/bot.log
+    LOG_PATH=/data/bot.log \
+    BACKUP_DIR=/data/backups \
+    TOKEN_STATE_PATH=/data/token_state.json \
+    MEDIA_DIR=/data/uploads
 
-RUN mkdir -p /data
+RUN mkdir -p /data /data/backups /data/uploads
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

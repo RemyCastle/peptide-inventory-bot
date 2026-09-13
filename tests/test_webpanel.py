@@ -734,6 +734,8 @@ class ApiTests(WebPanelBase):
         self.assertEqual(int(shop["low_stock_threshold"]), 4)
         code, state = webpanel.api_state(self.tok)
         self.assertEqual(code, 200)
+        self.assertIn("is_owner", state["shop"])
+        self.assertIn("backup_ready", state["shop"])
         self.assertEqual(state["shop"]["shipping_label"], "2-day air")
         self.assertEqual(int(state["shop"]["min_order_qty"]), 2)
         self.assertEqual(int(state["shop"]["low_stock_threshold"]), 4)
@@ -922,6 +924,14 @@ class HttpLayerTests(WebPanelBase):
         self.assertGreater(html.find('id="low-stock"'), settings_at)
         self.assertLess(html.find('id="low-stock"'), payments_at)
 
+    def test_panel_html_owner_backup_download(self):
+        html = webpanel.PANEL_HTML
+        self.assertIn('id="bk-dl"', html)
+        self.assertIn("Download latest.enc", html)
+        self.assertIn("panel/api/backup.enc", html)
+        self.assertIn("S.shop.is_owner", html)
+        self.assertLess(html.find('id="bk-dl"'), html.find('id="tab-payments"'))
+
     def test_state_json_declares_utf8(self):
         raw = webpanel.issue_token(SHOP, USER)
         code, ctype, body = webpanel.handle_panel_get(
@@ -953,6 +963,64 @@ class HttpLayerTests(WebPanelBase):
     def test_unknown_endpoint(self):
         code, _, _ = webpanel.handle_panel_post("/panel/api/nope", {"t": "x"})
         self.assertEqual(code, 404)
+
+    def test_backup_enc_requires_token(self):
+        code, _, body = webpanel.handle_panel_get(
+            "/panel/api/backup.enc", {"t": ["bad"]}
+        )
+        self.assertEqual(code, 401)
+        self.assertIn(b"invalid_or_expired_link", body)
+
+    def test_backup_enc_rejects_non_owner(self):
+        raw = webpanel.issue_token(SHOP, USER)
+        with mock.patch.object(db, "is_owner", return_value=False):
+            code, _, body = webpanel.handle_panel_get(
+                "/panel/api/backup.enc", {"t": [raw]}
+            )
+        self.assertEqual(code, 403)
+        self.assertIn(b"owners_only", body)
+        self.assertTrue(Path(self._tmp.name).joinpath("panel.db").is_file())
+
+    def test_backup_enc_requires_passphrase(self):
+        import os
+
+        raw = webpanel.issue_token(SHOP, USER)
+        with mock.patch.object(db, "is_owner", return_value=True), mock.patch.dict(
+            os.environ, {"BACKUP_PASSPHRASE": ""}, clear=False
+        ):
+            code, _, body = webpanel.handle_panel_get(
+                "/panel/api/backup.enc", {"t": [raw]}
+            )
+        self.assertEqual(code, 503)
+        self.assertIn(b"backup_passphrase_not_set", body)
+
+    def test_owner_backup_download_writes_latest_without_wiping_db(self):
+        import os
+
+        import backup as backup_mod
+
+        vault = Path(self._tmp.name) / "vault"
+        db_path = Path(self._tmp.name) / "panel.db"
+        self.assertTrue(db_path.is_file())
+        before_size = db_path.stat().st_size
+        raw = webpanel.issue_token(SHOP, USER)
+        env = {
+            "BACKUP_PASSPHRASE": "panel-test-passphrase-not-prod",
+            "BACKUP_DIR": str(vault),
+        }
+        with mock.patch.object(db, "is_owner", return_value=True), mock.patch.dict(
+            os.environ, env, clear=False
+        ):
+            code, ctype, body = webpanel.handle_panel_get(
+                "/panel/api/backup.enc", {"t": [raw]}
+            )
+        self.assertEqual(code, 200, body[:200])
+        self.assertEqual(ctype, "application/octet-stream")
+        self.assertTrue(body.startswith(backup_mod.MAGIC))
+        self.assertTrue((vault / "latest.enc").is_file())
+        self.assertTrue(db_path.is_file())
+        self.assertGreater(db_path.stat().st_size, 0)
+        self.assertGreaterEqual(db_path.stat().st_size, before_size)
 
 
 if __name__ == "__main__":

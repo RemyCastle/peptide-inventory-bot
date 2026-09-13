@@ -167,8 +167,15 @@ def extract_db_from_zip(zip_bytes: bytes, dest_db: Path) -> dict:
     return meta
 
 
-def backup_dir_from_env(default: Path) -> Path:
-    return Path(os.getenv("BACKUP_DIR", str(default)))
+def default_backup_dir(db_path: Optional[Path] = None) -> Path:
+    """Vault next to the live DB: /data/inventory.db → /data/backups."""
+    if db_path is not None:
+        return Path(db_path).resolve().parent / "backups"
+    return Path(os.getenv("DB_PATH", "inventory.db")).resolve().parent / "backups"
+
+
+def backup_dir_from_env(default: Optional[Path] = None) -> Path:
+    return Path(os.getenv("BACKUP_DIR", str(default or default_backup_dir())))
 
 
 def passphrase_from_env() -> str:
@@ -192,6 +199,8 @@ def create_encrypted_backup(
 ) -> Path:
     """
     Write latest.enc always; also a dated file for history.
+    Snapshots sqlite via backup API into a temp file — never unlinks or
+    truncates the live inventory.db.
     Returns path to the dated (or latest) file written.
     """
     if not passphrase:
@@ -242,7 +251,12 @@ def restore_encrypted_backup(
     *,
     backup_existing: bool = True,
 ) -> dict:
-    """Decrypt enc_path and replace dest_db. Optionally save prior DB aside."""
+    """Decrypt enc_path and replace dest_db. Optionally save prior DB aside.
+
+    Never deletes dest_db without writing a restored copy. When
+    backup_existing is True (default), the previous file is copied aside
+    first; replace is atomic via a sibling .restore_tmp.
+    """
     enc_path = Path(enc_path)
     dest_db = Path(dest_db)
     blob = enc_path.read_bytes()
@@ -287,6 +301,18 @@ def prune_old_backups(backup_dir: Path, retention_days: int = 30) -> int:
     return removed
 
 
+def _pytest_blocks_host_vault() -> bool:
+    """Refuse host-vault writes during pytest unless tests opt in.
+
+    load_dotenv() can inject BACKUP_PASSPHRASE / BACKUP_DIR from the laptop
+    .env; a paid-confirm test must not overwrite the real latest.enc.
+    """
+    if not os.getenv("PYTEST_CURRENT_TEST"):
+        return False
+    flag = os.getenv("BACKUP_ALLOW_IN_PYTEST", "").strip().lower()
+    return flag not in ("1", "true", "yes", "on")
+
+
 def maybe_backup_after_event(
     db_path: Path,
     *,
@@ -294,18 +320,21 @@ def maybe_backup_after_event(
 ) -> Optional[Path]:
     """
     Best-effort backup when BACKUP_PASSPHRASE is set.
+    Snapshots via sqlite backup API — never unlinks or truncates the live DB.
     Returns path or None if skipped/failed.
     """
+    if _pytest_blocks_host_vault():
+        log.debug("Skip backup (%s): pytest host-vault guard", reason)
+        return None
     passphrase = passphrase_from_env()
     if not passphrase:
         log.debug("Skip backup (%s): BACKUP_PASSPHRASE not set", reason)
         return None
-    bdir = backup_dir_from_env(
-        Path(os.getenv("DB_PATH", "inventory.db")).resolve().parent / "backups"
-    )
+    db_path = Path(db_path)
+    bdir = backup_dir_from_env(default_backup_dir(db_path))
     try:
         path = create_encrypted_backup(
-            Path(db_path), bdir, passphrase, reason=reason
+            db_path, bdir, passphrase, reason=reason
         )
         prune_old_backups(bdir, retention_days())
         return path
