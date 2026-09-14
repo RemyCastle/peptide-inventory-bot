@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # App modules (must include every imported .py or cloud shows "No module named …")
 # reservation_janitor.py: run_cloud.main. tg_payments.py: bot + vendor_stores + spbc_notify.
-COPY bot.py config.py db.py permissions.py payment_templates.py setup_wizard.py reports.py run_cloud.py collab.py franchise.py inventory_import.py backup.py token_pool.py spbc_notify.py site_sync.py webpanel.py order_router.py vendor_stores.py autobiller.py orders_admin.py vendor_links.py payables.py reservation_janitor.py tg_payments.py unicorn_shop.py catalog_cleanup.py unicorn_catalog.py ./
+COPY bot.py config.py db.py permissions.py payment_templates.py setup_wizard.py reports.py run_cloud.py collab.py franchise.py inventory_import.py backup.py token_pool.py spbc_notify.py site_sync.py webpanel.py order_router.py vendor_stores.py autobiller.py orders_admin.py vendor_links.py payables.py reservation_janitor.py tg_payments.py unicorn_shop.py catalog_cleanup.py unicorn_catalog.py oneshot_catalog_stock.py ./
 COPY static/catalog ./static/catalog
 
 # Optional docs

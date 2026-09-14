@@ -1141,6 +1141,7 @@ def live_git_sha() -> str:
 _catalog_cleanup_last: dict[str, Any] | None = None
 _keep_only_last: dict[str, Any] | None = None
 _stock_recall_last: dict[str, Any] | None = None
+_oneshot_stock_last: dict[str, Any] | None = None
 
 
 def set_catalog_cleanup_result(result: dict | None) -> None:
@@ -1220,6 +1221,35 @@ def set_stock_recall_result(result: dict | None) -> None:
     _stock_recall_last = out
 
 
+def set_oneshot_stock_result(result: dict | None) -> None:
+    """Remember last catalog stock=100 oneshot for /health (counts only)."""
+    global _oneshot_stock_last
+    if not result:
+        _oneshot_stock_last = None
+        return
+    out: dict[str, Any] = {
+        "ok": bool(result.get("ok")),
+        "applied": int(result.get("applied") or 0),
+        "sku_before": int(result.get("sku_before") or 0),
+        "sku_after": int(result.get("sku_after") or 0),
+        "n100_before": int(result.get("n100_before") or 0),
+        "n100_after": int(result.get("n100_after") or 0),
+        "n0_before": int(result.get("n0_before") or 0),
+        "n0_after": int(result.get("n0_after") or 0),
+        "min_before": int(result.get("min_before") or 0),
+        "max_before": int(result.get("max_before") or 0),
+        "min_after": int(result.get("min_after") or 0),
+        "max_after": int(result.get("max_after") or 0),
+        "sum_before": int(result.get("sum_before") or 0),
+        "sum_after": int(result.get("sum_after") or 0),
+        "other_shops_unchanged": bool(result.get("other_shops_unchanged")),
+    }
+    skipped = result.get("skipped")
+    if skipped:
+        out["skipped"] = str(skipped)[:80]
+    _oneshot_stock_last = out
+
+
 def _status_body() -> dict:
     with _state_lock:
         token_ok = bool(_bot_token)
@@ -1251,6 +1281,8 @@ def _status_body() -> dict:
         body["catalog_cleanup"] = dict(_catalog_cleanup_last)
     if _stock_recall_last is not None:
         body["stock_recall"] = dict(_stock_recall_last)
+    if _oneshot_stock_last is not None:
+        body["oneshot_stock"] = dict(_oneshot_stock_last)
     try:
         import db as _db
         import unicorn_shop

@@ -187,6 +187,37 @@ def _recall_catalog_stock() -> None:
     print(f"[run_cloud] unicorn stock recall: {result}", flush=True)
 
 
+def _oneshot_catalog_stock() -> None:
+    """ONE-SHOT: set catalog shop products.stock=100. Marker on /data skips rerun.
+
+    Live disk only (`DB_PATH=/data/inventory.db`) unless ONESHOT_CATALOG_STOCK=1.
+    Never deletes inventory.db. Other shops are not updated.
+    """
+    import oneshot_catalog_stock as oneshot
+    import unicorn_shop
+
+    db_path = (os.getenv("DB_PATH") or "").replace("\\", "/").strip()
+    live_disk = db_path == "/data/inventory.db"
+    forced = (os.getenv("ONESHOT_CATALOG_STOCK") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not live_disk and not forced:
+        log.info("oneshot catalog stock: skip (not live /data DB)")
+        print("[run_cloud] oneshot catalog stock: skip (not live disk)", flush=True)
+        return
+    if not unicorn_shop.is_unicorn_customer_bot() and not forced:
+        log.info("oneshot catalog stock: skip (not customer bot)")
+        print("[run_cloud] oneshot catalog stock: skip (not customer bot)", flush=True)
+        return
+    result = oneshot.apply_oneshot_catalog_stock()
+    spbc_notify.set_oneshot_stock_result(result)
+    log.info("unicorn oneshot catalog stock: %s", result)
+    print("[run_cloud] " + oneshot.format_report(result), flush=True)
+    print(f"[run_cloud] unicorn oneshot catalog stock: {result}", flush=True)
+
+
 def _bind_vendor_miniapps() -> None:
     """Re-attach claim tokens + issue public storefront keys for vendor shops.
 
@@ -260,6 +291,11 @@ def _bind_vendor_miniapps() -> None:
         _recall_catalog_stock()
     except Exception:
         log.exception("unicorn stock recall failed (continuing boot)")
+
+    try:
+        _oneshot_catalog_stock()
+    except Exception:
+        log.exception("unicorn oneshot catalog stock failed (continuing boot)")
 
     # Optional multi-vendor JSON: each entry may include invite + shop_chat_id + name
     raw = (os.getenv("VENDOR_STORES_JSON") or "").strip()

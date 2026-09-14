@@ -706,6 +706,28 @@ def recall_catalog_stock() -> dict:
     find_catalog_shop(). Idempotent when live stock already matches the source.
     """
     db.init_db()
+    marker = os.path.join(
+        os.path.dirname(str(db.get_db_path())),
+        ".oneshot-catalog-stock-100",
+    )
+    if os.path.isfile(marker):
+        shop = find_catalog_shop()
+        live = db.list_products(int(shop["chat_id"]), active_only=False) if shop else []
+        snap = _sku_snapshot(live)
+        return {
+            "ok": True,
+            "skipped": "oneshot_stock_100",
+            "source": "oneshot",
+            "updated": 0,
+            "sku_before": snap["sku"],
+            "sku_after": snap["sku"],
+            "nonzero_before": snap["nonzero"],
+            "nonzero_after": snap["nonzero"],
+            "placeholder_10_before": snap["placeholder_10"],
+            "placeholder_10_after": snap["placeholder_10"],
+            "skipped_placeholder": 0,
+            "keeper": int(shop["chat_id"]) if shop else 0,
+        }
     shop = find_catalog_shop()
     if not shop:
         return {
