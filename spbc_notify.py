@@ -1033,6 +1033,8 @@ def handle_notify(payload: dict) -> tuple[int, dict]:
                 }
             )
 
+    # Paid SPBC orders are not copied into Unicorn Magic Factory and do not
+    # deduct her stock. She is not an SPBC fulfillment queue (see order_router).
     # Quote-and-suggest: offer the owner any vendor shop that can fill the
     # whole order from bot stock. Advisory only — never blocks the response.
     suggestion_sent = False

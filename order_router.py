@@ -7,6 +7,10 @@ shop (all bot shops except the SPBC master shop) against the order's lines:
 - vial lines cost qty × price; kit lines use kit_price when set (stock must
   cover qty × KIT_SIZE vials), else KIT_SIZE × vial price
 
+Unicorn Magic Factory is customer-facing only. SPBC website orders are not
+quoted against that shop, not imported into it, and not deducted from it.
+A paid `/notify` stays on the supplier-alert path.
+
 The owner gets a DM listing the top quotes (with margin) and an approve button.
 
 Approving sends the vendor an OFFER, not an order:
@@ -112,9 +116,32 @@ def parse_line(item: dict) -> Optional[dict]:
     return {"base": base, "qty": qty, "kind": kind}
 
 
+def spbc_routing_skips_shop(shop_chat_id: int, shop_title: str | None = None) -> bool:
+    """True when this shop must not be quoted or deducted for an SPBC order.
+
+    Unicorn stays open for Ghostie's own customers. Paid springfieldpbc.com
+    orders are not written into her shop and do not take her stock.
+    """
+    try:
+        from unicorn_shop import is_unicorn_shop
+
+        return bool(is_unicorn_shop(shop_chat_id, title=shop_title))
+    except Exception as exc:
+        log.warning("unicorn skip check failed shop=%s: %s", shop_chat_id, exc)
+        return False
+
+
 def quote_shop(shop_chat_id: int, lines: list[dict]) -> Optional[dict]:
     """Total + per-line breakdown if this shop can fill every line, else None."""
-    products = db.list_products(int(shop_chat_id), active_only=True)
+    try:
+        sid = int(shop_chat_id)
+    except (TypeError, ValueError):
+        return None
+    shop = db.get_shop(sid) or {}
+    # Direct callers must not bypass the compute_quotes skip.
+    if spbc_routing_skips_shop(sid, shop.get("title")):
+        return None
+    products = db.list_products(sid, active_only=True)
     by_name = {_norm(p["name"]): p for p in products}
     total = 0.0
     breakdown: list[dict] = []
@@ -179,13 +206,8 @@ def compute_quotes(payload: dict) -> list[dict]:
         if SPBC_SHOP_CHAT_ID and cid == int(SPBC_SHOP_CHAT_ID):
             continue  # the master shop is the site itself, not a vendor
         # Unicorn Magic Factory is customer-facing only — never an SPBC vendor.
-        try:
-            from unicorn_shop import is_unicorn_shop
-
-            if is_unicorn_shop(cid, title=shop.get("title")):
-                continue
-        except Exception as exc:
-            log.warning("unicorn skip check failed shop=%s: %s", cid, exc)
+        if spbc_routing_skips_shop(cid, shop.get("title")):
+            continue
         try:
             q = quote_shop(cid, lines)
         except Exception as exc:
@@ -417,13 +439,8 @@ def apply_route(quote_id: str, actor_id: int) -> tuple[bool, str, Optional[dict]
             return False, "Quote expired or unknown.", None
         if quote["applied"]:
             return False, "Already routed.", dict(quote)
-        try:
-            from unicorn_shop import is_unicorn_shop
-
-            if is_unicorn_shop(quote.get("shop_chat_id"), title=quote.get("shop_title")):
-                return False, "Unicorn Magic Factory is not an SPBC fulfillment vendor.", dict(quote)
-        except Exception as exc:
-            log.warning("unicorn apply_route guard failed: %s", exc)
+        if spbc_routing_skips_shop(quote.get("shop_chat_id"), quote.get("shop_title")):
+            return False, "Unicorn Magic Factory is not an SPBC fulfillment vendor.", dict(quote)
         quote["applied"] = True  # claim before slow work; revert on failure
 
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())

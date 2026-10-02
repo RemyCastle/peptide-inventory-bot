@@ -100,3 +100,8 @@ Append-only log. Newest at bottom.
 - Decision: `shop_title_looks_unicorn` strips `unicornfartzzbot` / `unicornfartzz` so group titles like "Ash, UnicornFartzzBot and Samantha" do not bind as the catalog shop. `find_catalog_shop` prefers stocked Unicorn-titled shops, then any stocked shop (newest paid), never an empty brand-false-positive. No shop deletes.
 - Why: #14 live bind used chat_id=-5215898165 title=Ash… products=0; Mini App got ok:true with empty shelf.
 - Tests: `tests/test_unicorn_storefront_host.py` brand-group cases
+
+### 2026-10-02
+- Decision: Do not merge #6 (paid SPBC `/notify` → Unicorn shop order + `confirm_order_payment`) or #11 (duplicate skip list on a pre-cut base). Master already skips Unicorn in `compute_quotes` / `apply_route` via `unicorn_shop.is_unicorn_shop`. `quote_shop` now refuses that shop too, so a direct caller cannot quote her. Paid `/notify` still only alerts suppliers; it does not insert an Unicorn order or change her stock. A title that is only "Ghostie" is not treated as Unicorn — the live shop is `@unicornmagicfactory` / `UNICORN_SHOP_CHAT_ID`.
+- Why: #6 and #11 conflict. #6 would deduct Ghostie's catalog for website orders Remy fulfills. #11's intent already landed in the 2026-08-30 cut; merging that branch would fight current `order_router.py`.
+- Tests: `tests/test_spbc_unicorn_routing.py`
