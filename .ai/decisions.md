@@ -100,3 +100,8 @@ Append-only log. Newest at bottom.
 - Decision: `shop_title_looks_unicorn` strips `unicornfartzzbot` / `unicornfartzz` so group titles like "Ash, UnicornFartzzBot and Samantha" do not bind as the catalog shop. `find_catalog_shop` prefers stocked Unicorn-titled shops, then any stocked shop (newest paid), never an empty brand-false-positive. No shop deletes.
 - Why: #14 live bind used chat_id=-5215898165 title=Ash… products=0; Mini App got ok:true with empty shelf.
 - Tests: `tests/test_unicorn_storefront_host.py` brand-group cases
+
+### 2026-10-02
+- Decision: A missing or Telegram-rejected SPBC token (`InvalidToken` / getMe 401) logs the fingerprint and stays in the HTTP process instead of `sys.exit(1)`. `SKIP_BOT_POLLING=1` skips the SPBC poller and vendor pollers after the catalog bind. Did not clear or rewrite `/data/inventory.db`. Did not resume Render services.
+- Why: `spbc-supplier-bot` (`srv-d9d7f3mrnols73d6664g`) was healthy on commit `c04601a` until a user redeploy on 2026-09-07. From then it exited 1 about every 5 minutes until Render added `stuck_crashlooping` on 2026-09-10 05:11Z. The 05:09:18Z log is `SPBC Shop starting… fp=8583721412:A3G8` then `getMe` `401 Unauthorized` / `telegram.error.InvalidToken` from `bot.py` initialize. `unicornfartzz-bot` uses a different token (`fp=8911150109:-z3s`, getMe 200 on 2026-09-11) and did not fail in that window, so this was not a 409 Conflict. App logs have since aged out of the Render API; the 401 line is from the log captured that day.
+- Tests: `tests/test_spbc_token_boot.py`

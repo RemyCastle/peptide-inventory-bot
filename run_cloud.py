@@ -332,6 +332,23 @@ def _bind_vendor_miniapps() -> None:
         log.info("vendor storefront bind (%s): %s", name or invite[:12], result)
 
 
+def skip_bot_polling() -> bool:
+    """HTTP-only boot. For spbc-supplier-bot when it must not poll Telegram."""
+    return (os.getenv("SKIP_BOT_POLLING") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _hold_http_only(message: str) -> None:
+    """Log and block so Render does not restart a web process that exited 1."""
+    log.error(message)
+    print(f"[run_cloud] {message}", flush=True)
+    threading.Event().wait()
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -347,6 +364,13 @@ def main() -> None:
         _bind_vendor_miniapps()
     except Exception:
         log.exception("miniapp storefront bind failed (continuing boot)")
+
+    if skip_bot_polling():
+        _hold_http_only(
+            "SKIP_BOT_POLLING is set. Telegram pollers were not started "
+            "(no SPBC bot, no vendor store receivers). HTTP API stays up."
+        )
+        return
 
     # Vendor mini-app order receivers (one branded bot per vendor, all sharing
     # this process and database). Configured via VENDOR_STORES_JSON, with the
@@ -375,19 +399,39 @@ def main() -> None:
 
 
 def _run_foreground() -> None:
-    """Block on the main SPBC bot, or stay up for Unicorn-only (no SPBC token)."""
+    """Block on the main SPBC bot, or stay up when that token is missing or rejected."""
     from config import resolve_bot_tokens
 
-    if resolve_bot_tokens():
-        import bot
+    import bot
 
-        bot.main()
+    if not resolve_bot_tokens():
+        _hold_http_only(
+            "Missing config: TELEGRAM_BOT_TOKEN and BOT_TOKENS are unset. "
+            "SPBC Telegram polling is off. HTTP API stays up."
+        )
         return
-    log.info(
-        "No TELEGRAM_BOT_TOKEN/BOT_TOKENS — vendor-only mode "
-        "(HTTP + Unicorn/vendor bots; SPBC main bot not required)"
-    )
-    threading.Event().wait()
+
+    try:
+        outcome = bot.main()
+    except SystemExit as exc:
+        _hold_http_only(
+            "SPBC bot exited "
+            f"({exc}). HTTP API stays up and will not crash-loop. "
+            "Check TELEGRAM_BOT_TOKEN / BOT_TOKENS."
+        )
+        return
+    except Exception as exc:
+        if bot.token_config_failure(exc):
+            _hold_http_only(bot.token_rejected_message("unknown", exc))
+            return
+        raise
+    if outcome in ("no_token", "token_rejected"):
+        _hold_http_only(
+            "SPBC Telegram polling is off "
+            f"({outcome}). HTTP API stays up and will not crash-loop. "
+            "Set a valid TELEGRAM_BOT_TOKEN or BOT_TOKENS to resume polling. "
+            "Vendor receivers that already started keep their own tokens."
+        )
 
 
 if __name__ == "__main__":
