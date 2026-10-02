@@ -7964,7 +7964,42 @@ def _acquire_single_instance_lock() -> object | None:
         return None
 
 
-def main() -> None:
+def token_config_failure(exc: BaseException) -> bool:
+    """True when Telegram rejected the bot token or the token is missing.
+
+    Conflict (409, another poller) is not a config failure.
+    """
+    if token_pool.is_fatal_token_error(exc):
+        return True
+    if type(exc).__name__ in ("InvalidToken", "Unauthorized"):
+        return True
+    msg = str(exc).lower()
+    return (
+        "invalid token" in msg
+        or "unauthorized" in msg
+        or "token unusable" in msg
+        or ("401" in msg and "token" in msg)
+    )
+
+
+def token_rejected_message(fp: str, exc: BaseException) -> str:
+    """One line for Render logs. Never includes the token secret."""
+    return (
+        "SPBC Telegram token rejected "
+        f"(fingerprint={fp}, {type(exc).__name__}). "
+        "TELEGRAM_BOT_TOKEN / BOT_TOKENS is missing or Telegram getMe "
+        "returned 401 Unauthorized. Polling stopped so this process does "
+        "not crash-loop. Set a valid token and redeploy to resume the SPBC bot."
+    )
+
+
+def main() -> str | None:
+    """Poll the SPBC bot.
+
+    Returns ``no_token`` / ``token_rejected`` instead of exiting. A rejected
+    token used to raise and Render restarted the web process until
+    ``stuck_crashlooping``. ``None`` means polling stopped cleanly.
+    """
     setup_logging()
     # Python 3.12+ / 3.14: ensure a main-thread event loop exists for PTB
     try:
@@ -7977,8 +8012,16 @@ def main() -> None:
 
     tokens = resolve_bot_tokens()
     if not tokens:
-        print("ERROR: Set TELEGRAM_BOT_TOKEN or BOT_TOKENS in .env")
-        sys.exit(1)
+        log.error(
+            "Missing config: TELEGRAM_BOT_TOKEN and BOT_TOKENS are unset. "
+            "SPBC Telegram polling is off."
+        )
+        print(
+            "ERROR: Missing config: set TELEGRAM_BOT_TOKEN or BOT_TOKENS. "
+            "SPBC polling is off.",
+            file=sys.stderr,
+        )
+        return "no_token"
 
     start_idx = token_pool.resolve_active_index(
         tokens, ACTIVE_BOT_INDEX, TOKEN_STATE_PATH
@@ -8039,25 +8082,45 @@ def main() -> None:
                 log.warning("Failing over to token index %s", idx)
                 continue
             log.info("Polling stopped cleanly for token %s", fp)
-            return
-        except SystemExit:
-            raise
+            return None
+        except SystemExit as exc:
+            if not token_config_failure(exc):
+                raise
+            log.critical(token_rejected_message(fp, exc))
+            print("[bot] " + token_rejected_message(fp, exc), flush=True)
+            if not TOKEN_FAILOVER or len(tokens) < 2:
+                return "token_rejected"
+            idx = token_pool.mark_token_dead(
+                TOKEN_STATE_PATH, token, tokens, idx
+            )
+            log.warning("Failing over to token index %s", idx)
+            continue
         except Exception as exc:
-            # InvalidToken often raised at startup before / during init
-            if (
-                TOKEN_FAILOVER
-                and token_pool.is_fatal_token_error(exc)
-                and len(tokens) > 1
-            ):
-                log.critical("Startup token error (%s): %s", fp, exc)
-                idx = token_pool.mark_token_dead(
-                    TOKEN_STATE_PATH, token, tokens, idx
-                )
-                log.warning("Failing over to token index %s", idx)
-                continue
+            # InvalidToken is raised at startup, before the error handler runs.
+            # spbc-supplier-bot hit this on 2026-09-10: getMe 401 for the SPBC
+            # token, then exit 1, until Render suspended it for crash-looping.
+            if token_config_failure(exc):
+                log.critical(token_rejected_message(fp, exc))
+                print("[bot] " + token_rejected_message(fp, exc), flush=True)
+                if TOKEN_FAILOVER and len(tokens) > 1:
+                    idx = token_pool.mark_token_dead(
+                        TOKEN_STATE_PATH, token, tokens, idx
+                    )
+                    log.warning("Failing over to token index %s", idx)
+                    continue
+                return "token_rejected"
             raise
 
-    raise SystemExit("All BOT_TOKENS failed or failover disabled")
+    log.critical(
+        "All BOT_TOKENS failed or failover is disabled. "
+        "SPBC polling is off. HTTP can stay up."
+    )
+    print(
+        "[bot] All BOT_TOKENS failed or failover is disabled. "
+        "SPBC polling is off.",
+        flush=True,
+    )
+    return "token_rejected"
 
 
 if __name__ == "__main__":
