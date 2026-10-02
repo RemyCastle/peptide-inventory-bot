@@ -72,7 +72,20 @@ class OrdersAdminTests(unittest.TestCase):
         self.assertNotIn("emailed", msg)
         _, _, payload = self.calls[0]
         self.assertIs(payload["send_email"], False)
-        self.assertNotIn("tracking_carrier", payload)
+        # 1Z… is UPS even when the caller left the carrier blank.
+        self.assertEqual(payload["tracking_carrier"], "UPS")
+
+    def test_tracking_format_overrides_email_label(self):
+        with mock.patch.object(
+            orders_admin, "_request", side_effect=self._fake(200, {"order": {}})
+        ):
+            ok, msg, _ = orders_admin.set_tracking(
+                "SMS-605", "1Z1J329C0217555166", "USPS", True
+            )
+        self.assertTrue(ok, msg)
+        _, _, payload = self.calls[0]
+        self.assertEqual(payload["tracking_number"], "1Z1J329C0217555166")
+        self.assertEqual(payload["tracking_carrier"], "UPS")
 
     def test_errors_are_reported_not_swallowed(self):
         for code, expect in (

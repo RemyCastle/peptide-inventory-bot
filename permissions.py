@@ -9,9 +9,25 @@ from telegram.constants import ChatMemberStatus
 from telegram.error import TelegramError
 
 import db
-from config import OWNER_IDS
 
 log = logging.getLogger("inventory_bot.permissions")
+
+
+def is_allowlisted_admin(user_id: int | None) -> bool:
+    """True only when user_id is listed in ADMIN_TELEGRAM_IDS.
+
+    An empty allowlist denies every sender. This is checked before shop-admin
+    or owner rights, so a database admin row cannot unlock commands by itself.
+    """
+    try:
+        uid = int(user_id)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    if uid <= 0:
+        return False
+    from config import ADMIN_TELEGRAM_IDS
+
+    return uid in ADMIN_TELEGRAM_IDS
 
 
 async def is_group_admin(bot: Any, chat_id: int, user_id: int) -> bool:
@@ -40,7 +56,9 @@ def is_global_owner(user_id: int) -> bool:
 
 
 async def can_setup_group_shop(bot: Any, chat_id: int, user_id: int) -> bool:
-    """OWNER_IDS or Telegram group admin may run setup for a group."""
+    """Allowlisted owner or allowlisted Telegram group admin may run setup."""
+    if not is_allowlisted_admin(user_id):
+        return False
     if is_global_owner(user_id):
         return True
     return await is_group_admin(bot, chat_id, user_id)

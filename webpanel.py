@@ -1682,7 +1682,7 @@ def ensure_unicorn_shop_payments(chat_id: int) -> dict[str, Any]:
     import unicorn_shop
 
     return ensure_shop_payments(
-        int(chat_id), list(unicorn_shop.DEFAULT_PAYMENT_METHODS)
+        int(chat_id), unicorn_shop.default_payment_methods()
     )
 
 

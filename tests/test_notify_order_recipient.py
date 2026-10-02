@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import bot  # noqa: E402
+import config  # noqa: E402
 import db  # noqa: E402
 import spbc_notify  # noqa: E402
 import vendor_stores  # noqa: E402
@@ -260,7 +261,9 @@ class ResendCommandTests(unittest.TestCase):
         self.assertIn("Owners only", self.replies[0])
 
     def test_resend_unknown_order_friendly(self) -> None:
-        with mock.patch.object(db, "is_owner", return_value=True):
+        with mock.patch.object(db, "is_owner", return_value=True), mock.patch.object(
+            config, "ADMIN_TELEGRAM_IDS", {OWNER}
+        ):
             _run(
                 bot.cmd_resend(
                     self._update(OWNER), self._context(["NO_SUCH_CODE"])
@@ -280,6 +283,8 @@ class ResendCommandTests(unittest.TestCase):
             return True
 
         with mock.patch.object(db, "is_owner", return_value=True), mock.patch.object(
+            config, "ADMIN_TELEGRAM_IDS", {OWNER}
+        ), mock.patch.object(
             vendor_stores, "notify_order_recipient", side_effect=fake_notify
         ), mock.patch.object(
             vendor_stores,
@@ -314,6 +319,8 @@ class ResendCommandTests(unittest.TestCase):
             return True
 
         with mock.patch.object(db, "is_owner", return_value=True), mock.patch.object(
+            config, "ADMIN_TELEGRAM_IDS", {OWNER}
+        ), mock.patch.object(
             vendor_stores, "notify_order_recipient", side_effect=fake_notify
         ), mock.patch.object(
             vendor_stores, "base_notify_ids_for_shop", return_value=[]

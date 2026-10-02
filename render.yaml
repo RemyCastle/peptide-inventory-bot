@@ -17,6 +17,9 @@ services:
       # Optional: BOT_TOKENS=token_a,token_b  TOKEN_FAILOVER=1
       - key: OWNER_IDS
         sync: false
+      # Admin/inventory/order commands. Empty denies everyone.
+      - key: ADMIN_TELEGRAM_IDS
+        sync: false
       - key: BRAND_NAME
         value: SPBC Order Bot
       # Vendor mini-app store bots — one JSON entry per vendor (vendor_stores.py)

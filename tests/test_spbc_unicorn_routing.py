@@ -52,6 +52,7 @@ class SpbcUnicornRoutingTests(unittest.TestCase):
         self._env.stop()
         self._cfg.stop()
         order_router._pending.clear()
+        spbc_notify._sessions.clear()
         self._tmp.cleanup()
 
     def _lines(self):

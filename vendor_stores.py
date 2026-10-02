@@ -1843,12 +1843,19 @@ def _fmt_money(x: float) -> str:
 def can_access_vendor_webpanel(
     user_id: int, shop_chat_id: int, notify_ids: list[int] | None = None
 ) -> bool:
-    """True for shop admins, configured notify_ids, or global owners."""
+    """True for allowlisted shop admins, notify_ids, or global owners.
+
+    ADMIN_TELEGRAM_IDS is required. An empty allowlist denies everyone.
+    """
     try:
         uid = int(user_id)
     except (TypeError, ValueError):
         return False
     if uid <= 0:
+        return False
+    from permissions import is_allowlisted_admin
+
+    if not is_allowlisted_admin(uid):
         return False
     try:
         if db.is_admin(int(shop_chat_id), uid):

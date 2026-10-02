@@ -44,9 +44,9 @@ On a 200, `api_order` (`spbc_notify.py:1226`) returns:
   "ok": true,
   "code": "UMF-AB12CD",
   "total": 149.00,
-  "payments": ["Venmo: 💙 *Venmo*\nSend payment to: `@wineboos`…", …],
+  "payments": ["Venmo: 💙 *Venmo*\nSend payment to: `@handle`…", …],
   "payment_methods": [
-    {"name": "Venmo", "method_type": "venmo", "target": "@wineboos",
+    {"name": "Venmo", "method_type": "venmo", "target": "@handle",
      "pay_url": "https://account.venmo.com/pay?…", "line": "Venmo: …"}
   ],
   "message": "…buyer-facing confirmation text…",
@@ -296,16 +296,14 @@ There are **three** ways to add methods — all write the same table.
 On Unicorn boot, `run_cloud._seed_unicorn_payments` runs from
 `_bind_unicorn_pages_storefront` (the Pages catalog shop) **even when
 `UNICORN_CLAIM_TOKEN` is unset**, and again from the claim-bind path if that
-env is set. Both call `webpanel.ensure_unicorn_shop_payments` with
-`unicorn_shop.DEFAULT_PAYMENT_METHODS`:
+env is set. Both call `webpanel.ensure_unicorn_shop_payments`, which reads
+`unicorn_shop.default_payment_methods()` from the environment:
 
-```python
-[
-  {"method_type": "venmo",  "handle": "@wineboos"},
-  {"method_type": "paypal", "handle": "unicornfartzz@proton.me",
-   "network_note": "friends_family"},
-]
-```
+- `UNICORN_VENMO_HANDLE`
+- `UNICORN_PAYPAL_EMAIL`
+- `UNICORN_PAYPAL_NETWORK` (optional, default `friends_family`)
+
+Empty handles are not seeded. Do not put the account values in git.
 
 - **Idempotent by `method_type`**: `ensure_shop_payments`
   only inserts a type that isn't already present. It reads
@@ -318,8 +316,8 @@ env is set. Both call `webpanel.ensure_unicorn_shop_payments` with
   the default handle. To make a default go away and *stay*
   gone, **pause it** (`⏸`, sets `active=0`) instead of deleting — the paused row
   still counts as present and is never shown to buyers. Deleting only sticks if
-  you also drop it from `unicorn_shop.DEFAULT_PAYMENT_METHODS` (a redeploy).
-- To change the seeded defaults, edit `unicorn_shop.DEFAULT_PAYMENT_METHODS`. To add a
+  you also clear `UNICORN_VENMO_HANDLE` or `UNICORN_PAYPAL_EMAIL` (a redeploy).
+- To change the seeded defaults, set those env vars. To add a
   brand-new rail permanently, prefer the Telegram/panel path below so you don't
   redeploy for a handle change.
 
@@ -669,7 +667,7 @@ right after `POST /order` succeeds.
 | Field → template routing | `payment_templates.py:228` |
 | Idempotent payment seed | `webpanel.ensure_shop_payments` |
 | Unicorn boot payment seed | `run_cloud._seed_unicorn_payments` |
-| Default Unicorn rails | `unicorn_shop.DEFAULT_PAYMENT_METHODS` |
+| Default Unicorn rails | `unicorn_shop.default_payment_methods` (`UNICORN_VENMO_HANDLE`, `UNICORN_PAYPAL_EMAIL`) |
 | Panel payment write API (add/update/delete/seed) | `webpanel.api_payment` |
 | Tap-to-pay deep-link builder | `vendor_stores.py:476` |
 | Payment method HTML render (receipt) | `vendor_stores.py:511` |

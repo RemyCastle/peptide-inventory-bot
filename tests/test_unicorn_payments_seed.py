@@ -24,11 +24,17 @@ import webpanel  # noqa: E402
 
 UNICORN = 82001
 OTHER = 82002
-PAGES_KEY = unicorn_shop.PAGES_STOREFRONT_KEY
+PAGES_KEY = "0123456789abcdef01234567"
+PAY_ENV = {
+    "UNICORN_VENMO_HANDLE": "@examplevenmo",
+    "UNICORN_PAYPAL_EMAIL": "pay@example.com",
+}
 
 
 class UnicornPaymentSeedTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._pay_env = mock.patch.dict(os.environ, PAY_ENV, clear=False)
+        self._pay_env.start()
         self._tmp = tempfile.TemporaryDirectory()
         db.set_db_path(Path(self._tmp.name) / "pay_seed.db")
         db.init_db()
@@ -40,6 +46,7 @@ class UnicornPaymentSeedTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
+        self._pay_env.stop()
 
     def test_pages_bind_seeds_without_claim_token(self) -> None:
         self.assertEqual(db.list_payment_methods(UNICORN, active_only=False), [])
@@ -52,7 +59,7 @@ class UnicornPaymentSeedTests(unittest.TestCase):
         methods = db.list_payment_methods(UNICORN, active_only=True)
         types = {m["method_type"] for m in methods}
         self.assertEqual(types, {"venmo", "paypal"})
-        self.assertTrue(any("@wineboos" in (m.get("handle") or "") for m in methods))
+        self.assertTrue(any("@examplevenmo" in (m.get("handle") or "") for m in methods))
         # Other shops are not seeded
         self.assertEqual(db.list_payment_methods(OTHER, active_only=False), [])
 
