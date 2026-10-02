@@ -123,9 +123,9 @@ not send money.
 | Web panel Payments card | Typed fields, quick-add, Save/Delete. Field labels follow `PAYMENT_TARGET_COPY` (cashtag / wallet / Zelle email or phone). Warns when nothing is enabled; same seed CTA when Venmo or PayPal types are missing. Save of an **enabled** typed method with no target returns 400 (pause still allowed). Crypto missing a network note shows `rail_warning` but stays usable. |
 | `POST /panel/api/payment` | Add / update / delete. This ship: `{seed_defaults: true}` (Unicorn shop only). |
 
-Seeded Unicorn defaults (buyer-facing handles, not secrets): Venmo `@wineboos`,
-PayPal `unicornfartzz@proton.me` as friends & family. Edit in the panel; boot
-will not overwrite an existing type.
+Seeded Unicorn defaults come from `UNICORN_VENMO_HANDLE` and
+`UNICORN_PAYPAL_EMAIL` (optional `UNICORN_PAYPAL_NETWORK`). Edit in the panel;
+boot will not overwrite an existing type. Do not commit the account values.
 
 ---
 

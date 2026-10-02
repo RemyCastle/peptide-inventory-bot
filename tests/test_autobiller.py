@@ -21,17 +21,16 @@ import franchise  # noqa: E402
 
 
 class MasterVenmoConfigTests(unittest.TestCase):
-    def test_default_is_remycastle(self) -> None:
-        self.assertEqual(config.MASTER_VENMO, "@remycastle")
+    def test_unset_is_empty(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MASTER_VENMO", None)
+            self.assertEqual(config.master_venmo_handle(), "")
 
     def test_env_override(self) -> None:
         with mock.patch.dict(os.environ, {"MASTER_VENMO": "@payme_please"}):
-            # Re-read the same logic config uses
-            val = (os.getenv("MASTER_VENMO", "") or "").strip() or "@remycastle"
-            self.assertEqual(val, "@payme_please")
+            self.assertEqual(config.master_venmo_handle(), "@payme_please")
         with mock.patch.dict(os.environ, {"MASTER_VENMO": ""}):
-            val = (os.getenv("MASTER_VENMO", "") or "").strip() or "@remycastle"
-            self.assertEqual(val, "@remycastle")
+            self.assertEqual(config.master_venmo_handle(), "")
 
 
 class PreviousWeekBillerTests(unittest.TestCase):

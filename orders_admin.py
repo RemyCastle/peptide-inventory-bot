@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
+import carrier_detect
 from config import SPBC_ORDERS_ADMIN_TOKEN, SPBC_ORDERS_URL
 
 log = logging.getLogger("orders_admin")
@@ -104,6 +105,10 @@ def set_tracking(
             "Not configured — set SPBC_ORDERS_ADMIN_TOKEN on this service.",
             None,
         )
+    # Number format wins over the supplier email's carrier label.
+    detected = carrier_detect.carrier_from_format(tn)
+    if detected:
+        carrier = detected
     payload: dict[str, Any] = {
         "status": "shipped",
         "tracking_number": tn,

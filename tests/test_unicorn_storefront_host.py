@@ -22,17 +22,18 @@ import webpanel  # noqa: E402
 UNICORN = 81001
 OTHER = 81002
 EMPTY = 81003
-PAGES_KEY = unicorn_shop.PAGES_STOREFRONT_KEY
+# Fixture invite only. The live Pages key is UNICORN_STOREFRONT_KEY, not source.
+PAGES_KEY = "0123456789abcdef01234567"
 BUYER = 91001
 
 
 class PagesKeyTests(unittest.TestCase):
-    def test_default_matches_pages_html(self) -> None:
+    def test_unset_key_is_empty(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("UNICORN_STOREFRONT_KEY", None)
-            self.assertEqual(unicorn_shop.pages_storefront_key(), PAGES_KEY)
-            self.assertTrue(unicorn_shop.is_pages_storefront_key(PAGES_KEY))
-            self.assertTrue(unicorn_shop.is_pages_storefront_key("vendor" + PAGES_KEY))
+            self.assertEqual(unicorn_shop.pages_storefront_key(), "")
+            self.assertFalse(unicorn_shop.is_pages_storefront_key(PAGES_KEY))
+            self.assertFalse(unicorn_shop.is_pages_storefront_key(""))
             self.assertFalse(unicorn_shop.is_pages_storefront_key("aa" * 12))
 
     def test_env_override(self) -> None:
@@ -156,21 +157,22 @@ class StorefrontBindTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_pages_key_resolves_without_prior_row(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.dict(
+            os.environ, {"UNICORN_STOREFRONT_KEY": PAGES_KEY}, clear=False
+        ):
             os.environ.pop("UNICORN_SHOP_CHAT_ID", None)
-            os.environ.pop("UNICORN_STOREFRONT_KEY", None)
             sid = webpanel.resolve_storefront_key(PAGES_KEY)
-        self.assertEqual(sid, UNICORN)
-        code, body = webpanel.api_storefront(PAGES_KEY)
-        self.assertEqual(code, 200, body)
-        self.assertTrue(body["ok"])
-        self.assertGreater(len(body["products"]), 0)
-        self.assertEqual(body["products"][0]["name"], "Klow 80mg")
-        self.assertEqual(body["products"][0]["category"], "Skin")
-        self.assertTrue(body["products"][0]["description"])
-        self.assertIn("/catalog-img/", body["products"][0]["photo_url"])
-        self.assertTrue(body.get("categories"))
-        self.assertTrue(any(c.get("id") == "Skin" for c in body["categories"]))
+            self.assertEqual(sid, UNICORN)
+            code, body = webpanel.api_storefront(PAGES_KEY)
+            self.assertEqual(code, 200, body)
+            self.assertTrue(body["ok"])
+            self.assertGreater(len(body["products"]), 0)
+            self.assertEqual(body["products"][0]["name"], "Klow 80mg")
+            self.assertEqual(body["products"][0]["category"], "Skin")
+            self.assertTrue(body["products"][0]["description"])
+            self.assertIn("/catalog-img/", body["products"][0]["photo_url"])
+            self.assertTrue(body.get("categories"))
+            self.assertTrue(any(c.get("id") == "Skin" for c in body["categories"]))
 
     def test_unknown_key_still_404(self) -> None:
         code, body = webpanel.api_storefront("ffffffffffffffffffffffff")
@@ -360,7 +362,10 @@ class MiniAppPagesContractTests(unittest.TestCase):
         cls.src = MINIAPP_HTML.read_text(encoding="utf-8")
 
     def test_public_key_matches_bot(self) -> None:
-        self.assertIn(PAGES_KEY, self.src)
+        key = (os.getenv("UNICORN_STOREFRONT_KEY") or "").strip().lower()
+        if not key:
+            self.skipTest("UNICORN_STOREFRONT_KEY is not set in this environment")
+        self.assertIn(key, self.src)
         self.assertIn("unicornfartzz-bot.onrender.com", self.src)
 
     def test_uses_structured_pay_rails(self) -> None:

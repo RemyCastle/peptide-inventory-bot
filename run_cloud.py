@@ -69,7 +69,10 @@ def _bind_unicorn_pages_storefront() -> None:
     except Exception:
         log.exception("unicorn shop scan failed")
     key = unicorn_shop.pages_storefront_key()
-    webpanel.ensure_storefront_key_plain(sid, key)
+    if key:
+        webpanel.ensure_storefront_key_plain(sid, key)
+    else:
+        log.info("UNICORN_STOREFRONT_KEY unset; catalog key not bound")
     log.info(
         "unicorn pages storefront shop=%s title=%r products=%s host=unicornfartzz-bot",
         sid,

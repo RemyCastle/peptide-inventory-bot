@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import config  # noqa: E402
 import db  # noqa: E402
 import vendor_stores  # noqa: E402
 import webpanel  # noqa: E402
@@ -105,8 +106,13 @@ class VendorWebpanelAccessTests(unittest.TestCase):
         db.ensure_shop(SHOP, title="Unicorn Test Shop")
         db.add_admin(SHOP, ADMIN, "ghostie", OWNER)
         webpanel.ensure_webpanel_tables()
+        self._allow = mock.patch.object(
+            config, "ADMIN_TELEGRAM_IDS", {ADMIN, NOTIFY, OWNER}
+        )
+        self._allow.start()
 
     def tearDown(self) -> None:
+        self._allow.stop()
         self._tmp.cleanup()
 
     def test_admin_notify_owner_allowed_stranger_denied(self) -> None:
@@ -166,8 +172,13 @@ class VendorWebpanelCommandTests(unittest.TestCase):
         db.add_admin(SHOP, ADMIN, "ghostie", OWNER)
         webpanel.ensure_webpanel_tables()
         self.replies: list[str] = []
+        self._allow = mock.patch.object(
+            config, "ADMIN_TELEGRAM_IDS", {ADMIN, NOTIFY, OWNER}
+        )
+        self._allow.start()
 
     def tearDown(self) -> None:
+        self._allow.stop()
         self._tmp.cleanup()
 
     def _msg(self):

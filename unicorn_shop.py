@@ -8,24 +8,33 @@ and hand website orders to Ghostie's bot. Remy cut that back-room link only.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import db
 
-# Public read-only catalog key baked into remy-miniapp-demos.pages.dev/unicorn/.
-# Not a claim/admin token. Override with UNICORN_STOREFRONT_KEY if Pages rotates.
-PAGES_STOREFRONT_KEY = "dd6dec3482e1572886868657"
 
-# Buyer-facing Unicorn rails (not secrets). Boot/admin seed inserts a type only
-# when it is absent — paused rows block a re-seed. Pause instead of delete.
-DEFAULT_PAYMENT_METHODS: tuple[dict[str, str], ...] = (
-    {"method_type": "venmo", "handle": "@wineboos"},
-    {
-        "method_type": "paypal",
-        "handle": "unicornfartzz@proton.me",
-        "network_note": "friends_family",
-    },
-)
+def default_payment_methods() -> list[dict[str, str]]:
+    """Venmo/PayPal rails from env. Missing handles are skipped.
+
+    Boot/admin seed inserts a type only when it is absent — paused rows block
+    a re-seed. Pause instead of delete. No payment account is hardcoded.
+    """
+    methods: list[dict[str, str]] = []
+    venmo = (os.getenv("UNICORN_VENMO_HANDLE") or "").strip()
+    paypal = (os.getenv("UNICORN_PAYPAL_EMAIL") or "").strip()
+    note = (os.getenv("UNICORN_PAYPAL_NETWORK") or "friends_family").strip()
+    if venmo:
+        methods.append({"method_type": "venmo", "handle": venmo})
+    if paypal:
+        methods.append(
+            {
+                "method_type": "paypal",
+                "handle": paypal,
+                "network_note": note or "friends_family",
+            }
+        )
+    return methods
 
 _PAID_STATUSES = ("paid", "shipped", "complete")
 
@@ -127,23 +136,33 @@ def vendor_accepts_spbc_fulfillment(
 
 
 def pages_storefront_key() -> str:
-    """24-hex catalog key the Cloudflare Pages Mini App sends as ?invite=."""
+    """24-hex catalog key the Cloudflare Pages Mini App sends as ?invite=.
+
+    Comes only from UNICORN_STOREFRONT_KEY. Unset or malformed values return
+    an empty string so a live invite is never baked into source.
+    """
     raw = (os.getenv("UNICORN_STOREFRONT_KEY") or "").strip().strip("\"'")
-    key = raw or PAGES_STOREFRONT_KEY
+    key = raw
     if key.lower().startswith("vendor_"):
         key = key[7:]
     elif key.lower().startswith("vendor"):
         key = key[6:]
-    return key.strip().lower()
+    key = key.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{24}", key):
+        return ""
+    return key
 
 
 def is_pages_storefront_key(raw_key: str | None) -> bool:
+    expected = pages_storefront_key()
+    if not expected:
+        return False
     got = (raw_key or "").strip()
     if got.lower().startswith("vendor_"):
         got = got[7:]
     elif got.lower().startswith("vendor"):
         got = got[6:]
-    return got.strip().lower() == pages_storefront_key()
+    return got.strip().lower() == expected
 
 
 def is_unicorn_customer_bot() -> bool:

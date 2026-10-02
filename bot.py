@@ -43,6 +43,7 @@ import tg_payments
 import backup as backup_mod
 import catalog_cleanup
 import db
+import permissions
 import inventory_import
 import payment_templates as pt
 import reports
@@ -76,6 +77,21 @@ from config import (
 )
 
 log = logging.getLogger("inventory_bot")
+
+def _staff_admin(chat_id: int, user_id: int) -> bool:
+    """Shop admin who is also on ADMIN_TELEGRAM_IDS. Empty allowlist denies."""
+    if not permissions.is_allowlisted_admin(user_id):
+        return False
+    return db.is_admin(chat_id, user_id)
+
+
+def _staff_owner(user_id: int) -> bool:
+    """Global owner who is also on ADMIN_TELEGRAM_IDS. Empty allowlist denies."""
+    if not permissions.is_allowlisted_admin(user_id):
+        return False
+    return db.is_owner(user_id)
+
+
 
 # ConversationHandler entry for Admin → 💳 Payments quick-add. Built from
 # payment_templates.METHOD_TYPES so a new typed rail cannot ship a button
@@ -644,7 +660,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             ]
         ]
-        base_kb = main_menu_kb(db.is_admin(chat.id, user.id))
+        base_kb = main_menu_kb(_staff_admin(chat.id, user.id))
         await update.message.reply_text(
             text,
             parse_mode=ParseMode.MARKDOWN,
@@ -668,9 +684,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Tap *Open the Store* to browse live stock and send your order "
             "straight back here. Research use only · 21+."
         )
-        if shop and db.is_admin(int(shop["chat_id"]), user.id):
+        if shop and _staff_admin(int(shop["chat_id"]), user.id):
             welcome += "\n\nAdmins: /webpanel for the shop console."
-        elif db.is_owner(user.id):
+        elif _staff_owner(user.id):
             welcome += "\n\nAdmins: /webpanel for the shop console."
         await update.message.reply_markdown(
             welcome, reply_markup=vendor_stores.unicorn_open_store_markup()
@@ -684,7 +700,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     all_shops = shops
     if not all_shops:
         # If owner, list all; else show setup help
-        if db.is_owner(user.id):
+        if _staff_owner(user.id):
             with db.get_db() as conn:
                 rows = conn.execute("SELECT * FROM shops ORDER BY title").fetchall()
             all_shops = [dict(r) for r in rows]
@@ -715,7 +731,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # No shops yet — owner can bootstrap a personal shop (uses private chat id)
-    if db.is_owner(user.id):
+    if _staff_owner(user.id):
         shop = db.ensure_shop(user.id, title=f"{user.first_name or 'Owner'}'s Shop")
         db.add_admin(user.id, user.id, user.username, user.id)
         set_shop(context, user.id)
@@ -824,7 +840,7 @@ async def _show_main(
 ) -> None:
     user = update.effective_user
     assert user
-    is_adm = db.is_admin(shop["chat_id"], user.id)
+    is_adm = _staff_admin(shop["chat_id"], user.id)
     try:
         import unicorn_shop
 
@@ -1032,7 +1048,7 @@ async def _send_catalog(
     if not products:
         user = update.effective_user
         extra = []
-        if user and db.is_admin(int(sid), user.id):
+        if user and _staff_admin(int(sid), user.id):
             extra = [
                 [
                     InlineKeyboardButton("➕ Add product", callback_data="adm_addprod"),
@@ -2355,7 +2371,7 @@ async def cb_franchise_proof_start(
     user = update.effective_user
     oid = int(query.data.split(":")[1])
     order = db.get_order(oid)
-    if not order or not user or not db.is_admin(order["chat_id"], user.id):
+    if not order or not user or not _staff_admin(order["chat_id"], user.id):
         await query.answer("Not allowed", show_alert=True)
         return ConversationHandler.END
     if not _is_franchisee_order(order):
@@ -2394,7 +2410,7 @@ async def franchise_proof_message(
         clear_awaiting(context)
         return ConversationHandler.END
     order = db.get_order(int(oid))
-    if not order or not db.is_admin(order["chat_id"], user.id):
+    if not order or not _staff_admin(order["chat_id"], user.id):
         await update.message.reply_text("Not allowed.")
         clear_awaiting(context)
         return ConversationHandler.END
@@ -2604,7 +2620,7 @@ async def cb_mark_shipped(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     oid = int(query.data.split(":")[1])
     order = db.get_order(oid)
-    if not order or not db.is_admin(order["chat_id"], user.id):
+    if not order or not _staff_admin(order["chat_id"], user.id):
         await query.answer("Not allowed", show_alert=True)
         return
     ok, msg = db.mark_order_shipped(oid)
@@ -2680,7 +2696,7 @@ async def cb_view_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not order:
         await query.answer("Not found", show_alert=True)
         return
-    is_adm = db.is_admin(order["chat_id"], user.id)
+    is_adm = _staff_admin(order["chat_id"], user.id)
     if order["user_id"] != user.id and not is_adm:
         await query.answer("Not allowed", show_alert=True)
         return
@@ -2756,7 +2772,7 @@ async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 def _require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[int | None, bool]:
     user = update.effective_user
     sid = shop_id(context, update)
-    if not user:
+    if not user or not permissions.is_allowlisted_admin(user.id):
         return None, False
     # MagicFactory2: OWNER + catalog admins must see Mini App orders on the
     # Pages catalog shop, not a personal /start shop or title-sorted extra.
@@ -2779,7 +2795,7 @@ def _require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[
             set_shop(context, sid)
     if sid is None:
         return None, False
-    return sid, db.is_admin(sid, user.id)
+    return sid, _staff_admin(sid, user.id)
 
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2891,7 +2907,7 @@ async def cb_adm_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ],
         [InlineKeyboardButton("📋 Clone shop", callback_data="adm_clone")],
     ]
-    if update.effective_user and db.is_owner(update.effective_user.id):
+    if update.effective_user and _staff_owner(update.effective_user.id):
         rows.append(
             [InlineKeyboardButton("👑 Master fees / invoices", callback_data="master_home")]
         )
@@ -2925,7 +2941,7 @@ async def cb_owner_clean_cat(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await safe_edit(
             query,
             "Bot owner only. Your Telegram ID must be in `OWNER_IDS`.",
@@ -2976,7 +2992,7 @@ async def cb_owner_clean_cat_yes(
     query = update.callback_query
     await query.answer()
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await safe_edit(
             query,
             "Bot owner only.",
@@ -3017,7 +3033,7 @@ async def cb_owner_clear_inv(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await safe_edit(
             query,
             "Bot owner only. Your Telegram ID must be in `OWNER_IDS`.",
@@ -3062,7 +3078,7 @@ async def cb_owner_clear_inv_yes(
     query = update.callback_query
     await query.answer()
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await safe_edit(
             query,
             "Bot owner only.",
@@ -3306,7 +3322,7 @@ async def cmd_claim_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def cmd_master(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """OWNER_IDS only: service fees + weekly invoices."""
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await update.message.reply_text("Master admin only.")
         return
     await _master_home(update, context, edit=False)
@@ -3318,7 +3334,7 @@ async def cmd_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     Replies in-chat and DMs the same summary so it is usable from a group.
     """
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await update.message.reply_text("Master admin only.")
         return
     import franchise
@@ -3410,7 +3426,7 @@ async def cb_master_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     await query.answer()
     try:
-        if not update.effective_user or not db.is_owner(update.effective_user.id):
+        if not update.effective_user or not _staff_owner(update.effective_user.id):
             await safe_edit(
                 query,
                 "Master admin only. Your Telegram ID must be in OWNER_IDS on the server.",
@@ -3427,7 +3443,7 @@ async def cb_master_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def cb_master_setfee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if not update.effective_user or not db.is_owner(update.effective_user.id):
+    if not update.effective_user or not _staff_owner(update.effective_user.id):
         await safe_edit(query, "Master admin only.")
         return
     import franchise
@@ -3453,7 +3469,7 @@ async def cb_master_setfee(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def cb_master_feeshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    if not update.effective_user or not db.is_owner(update.effective_user.id):
+    if not update.effective_user or not _staff_owner(update.effective_user.id):
         await safe_edit(query, "Master admin only.")
         return ConversationHandler.END
     chat_id = int(query.data.split(":")[1])
@@ -3471,7 +3487,7 @@ async def cb_master_feeshop(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def master_fee_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.effective_user or not db.is_owner(update.effective_user.id):
+    if not update.effective_user or not _staff_owner(update.effective_user.id):
         await update.message.reply_text("Master admin only.")
         return ConversationHandler.END
     raw = (update.message.text or "").strip().replace("$", "")
@@ -3501,7 +3517,7 @@ async def master_fee_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def cb_master_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if not update.effective_user or not db.is_owner(update.effective_user.id):
+    if not update.effective_user or not _staff_owner(update.effective_user.id):
         await safe_edit(query, "Master admin only.")
         return
     import franchise
@@ -3530,7 +3546,7 @@ async def cb_master_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def cb_master_geninv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if not update.effective_user or not db.is_owner(update.effective_user.id):
+    if not update.effective_user or not _staff_owner(update.effective_user.id):
         await safe_edit(query, "Master admin only.")
         return
     import franchise
@@ -3561,7 +3577,7 @@ async def cb_master_geninv(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def cb_master_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if not update.effective_user or not db.is_owner(update.effective_user.id):
+    if not update.effective_user or not _staff_owner(update.effective_user.id):
         await safe_edit(query, "Master admin only.")
         return
     import franchise
@@ -3598,7 +3614,7 @@ async def cb_master_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def cb_master_invpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if not update.effective_user or not db.is_owner(update.effective_user.id):
+    if not update.effective_user or not _staff_owner(update.effective_user.id):
         await safe_edit(query, "Master admin only.")
         return
     inv_id = int(query.data.split(":")[1])
@@ -4604,7 +4620,7 @@ async def cb_view_coa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer("Product not found", show_alert=True)
         return
     sid = shop_id(context, update)
-    is_adm = db.is_admin(int(p["chat_id"]), user.id)
+    is_adm = _staff_admin(int(p["chat_id"]), user.id)
     # Buyers: product must be in current shop catalog (own or collab share).
     # Shop admin of the product's shop may open even if inactive.
     if not is_adm:
@@ -5217,7 +5233,7 @@ async def cb_adm_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = update.effective_user
     oid = int(query.data.split(":")[1])
     order = db.get_order(oid)
-    if not order or not db.is_admin(order["chat_id"], user.id):
+    if not order or not _staff_admin(order["chat_id"], user.id):
         await query.answer("Not allowed", show_alert=True)
         return ConversationHandler.END
     if order["status"] not in ("pending_payment", "awaiting_confirmation"):
@@ -5260,7 +5276,7 @@ async def tracking_input_value(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
 
     order = db.get_order(int(oid))
-    if not order or not db.is_admin(order["chat_id"], user.id):
+    if not order or not _staff_admin(order["chat_id"], user.id):
         await update.message.reply_text("Not allowed or order missing.")
         clear_awaiting(context)
         return ConversationHandler.END
@@ -5284,7 +5300,7 @@ async def cb_adm_confirm_notrack(
     user = update.effective_user
     oid = int(query.data.split(":")[1])
     order = db.get_order(oid)
-    if not order or not user or not db.is_admin(order["chat_id"], user.id):
+    if not order or not user or not _staff_admin(order["chat_id"], user.id):
         await query.answer("Not allowed", show_alert=True)
         return ConversationHandler.END
     if order["status"] not in ("pending_payment", "awaiting_confirmation"):
@@ -5395,7 +5411,7 @@ async def cb_add_tracking_start(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     oid = int(query.data.split(":")[1])
     order = db.get_order(oid)
-    if not order or not db.is_admin(order["chat_id"], user.id):
+    if not order or not _staff_admin(order["chat_id"], user.id):
         await query.answer("Not allowed", show_alert=True)
         return ConversationHandler.END
     if order["status"] not in ("paid", "shipped"):
@@ -5428,7 +5444,7 @@ async def tracking_only_or_confirm(update: Update, context: ContextTypes.DEFAULT
             await update.message.reply_text("Cancelled or empty tracking.")
             return ConversationHandler.END
         order = db.get_order(int(oid))
-        if not order or not db.is_admin(order["chat_id"], user.id):
+        if not order or not _staff_admin(order["chat_id"], user.id):
             clear_awaiting(context)
             await update.message.reply_text("Not allowed.")
             return ConversationHandler.END
@@ -5460,7 +5476,7 @@ async def cb_view_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = update.effective_user
     oid = int(query.data.split(":")[1])
     order = db.get_order(oid)
-    if not order or not db.is_admin(order["chat_id"], user.id):
+    if not order or not _staff_admin(order["chat_id"], user.id):
         await query.answer("Not allowed", show_alert=True)
         return
     fid = (order.get("payment_proof_file_id") or "").strip()
@@ -5488,7 +5504,7 @@ async def cb_adm_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = update.effective_user
     oid = int(query.data.split(":")[1])
     order = db.get_order(oid)
-    if not order or not db.is_admin(order["chat_id"], user.id):
+    if not order or not _staff_admin(order["chat_id"], user.id):
         await query.answer("Not allowed", show_alert=True)
         return
     ok, msg = db.reject_order(oid, user.id)
@@ -6107,7 +6123,7 @@ async def cb_rm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     # Only owners can remove admins (or self-removal allowed)
     target = int(query.data.split(":")[1])
-    if not db.is_owner(user.id) and target != user.id:
+    if not _staff_owner(user.id) and target != user.id:
         await query.answer("Only owners can remove other admins", show_alert=True)
         return
     db.remove_admin(sid, target)
@@ -6122,7 +6138,7 @@ async def cb_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     sid, ok = _require_admin(update, context)
     if not ok:
         return ConversationHandler.END
-    if not db.is_owner(user.id) and not ok:
+    if not _staff_owner(user.id) and not ok:
         await safe_edit(query, "Only owners/admins can add.")
         return ConversationHandler.END
     set_awaiting(context, "add_admin")
@@ -6209,7 +6225,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "_Stock only drops after an admin confirms payment._",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_menu_kb(
-            db.is_admin(sid or 0, update.effective_user.id)
+            _staff_admin(sid or 0, update.effective_user.id)
             if update.effective_user
             else False
         ),
@@ -6325,7 +6341,7 @@ def _schedule_paid_backup() -> None:
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only: write encrypted snapshot now."""
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         if update.message:
             await update.message.reply_text("Owners only.")
         return
@@ -6362,7 +6378,7 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_backup_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only: list recent vault files + token pool info."""
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         if update.message:
             await update.message.reply_text("Owners only.")
         return
@@ -6508,7 +6524,7 @@ async def cb_route_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Owner taps Offer → ask the vendor first. No stock moves, no address."""
     query = update.callback_query
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await query.answer("Owners only.", show_alert=True)
         return
     import order_router
@@ -6594,7 +6610,7 @@ async def _finish_route(update, context, quote_id: str, *, forced: bool) -> None
             "\n⚠️ Could not deliver the details — forward the order manually."
         )
     owner_id = min(OWNER_IDS) if OWNER_IDS else None
-    if forced or (user and db.is_owner(user.id)):
+    if forced or (user and _staff_owner(user.id)):
         await safe_edit(query, note)
     else:
         # vendor accepted — confirm to them, report to the owner
@@ -6680,7 +6696,7 @@ async def cb_route_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Owner override: skip the handshake and push the order now."""
     query = update.callback_query
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await query.answer("Owners only.", show_alert=True)
         return
     quote_id = query.data.split(":", 1)[1]
@@ -6691,7 +6707,7 @@ async def cb_route_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def cb_route_dismiss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await query.answer("Owners only.", show_alert=True)
         return
     import order_router
@@ -6718,7 +6734,7 @@ async def cmd_webpanel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if sid is None:
         await update.message.reply_text("No shop selected. Send /start first.")
         return
-    if not user or not db.is_admin(sid, user.id):
+    if not user or not _staff_admin(sid, user.id):
         await update.message.reply_text("Admins only.")
         return
     if context.args and context.args[0].lower() == "revoke":
@@ -6838,7 +6854,7 @@ async def cmd_resend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     Uses the same text builder + dual-bot delivery as mini-app checkout.
     """
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await update.message.reply_text("Owners only.")
         return
     args = context.args or []
@@ -6877,7 +6893,7 @@ async def cmd_resend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_rescue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner: recovery kit for getting everyone back after a ban/token swap."""
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await update.message.reply_text("Owners only.")
         return
     bot_username = (context.bot.username or "unknown").lstrip("@")
@@ -6912,7 +6928,7 @@ async def cmd_restock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if sid is None:
         await update.message.reply_text("No shop selected. Send /start first.")
         return
-    if not user or not db.is_admin(sid, user.id):
+    if not user or not _staff_admin(sid, user.id):
         await update.message.reply_text("Admins only.")
         return
     raw = " ".join(context.args) if context.args else ""
@@ -7025,7 +7041,7 @@ async def cmd_owed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     import payables
 
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await update.message.reply_text("Owners only.")
         return
     totals = payables.open_totals()
@@ -7052,7 +7068,7 @@ async def cb_settle_vendor(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     query = update.callback_query
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await query.answer("Owners only.", show_alert=True)
         return
     shop_id_val = int(query.data.split(":")[1])
@@ -7079,7 +7095,7 @@ async def cmd_sitepaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     import orders_admin
 
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await update.message.reply_text("Owners only.")
         return
     if not context.args:
@@ -7120,7 +7136,7 @@ async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     import orders_admin
 
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await update.message.reply_text("Owners only.")
         return
     args = list(context.args or [])
@@ -7165,7 +7181,7 @@ async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_newvendor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner: build a vendor's shop NOW, stock it, invite them once it's ready."""
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await update.message.reply_text("Owners only.")
         return
     name = " ".join(context.args).strip() if context.args else ""
@@ -7201,7 +7217,7 @@ async def cmd_newvendor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner: invite link that hands a pre-built shop to its vendor."""
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await update.message.reply_text("Owners only.")
         return
     sid = None
@@ -7236,7 +7252,7 @@ async def cmd_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_invitevendor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner: one-time invite link that sets a new vendor up end-to-end."""
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         await update.message.reply_text("Owners only.")
         return
     bot_username = (context.bot.username or "").lstrip("@")
@@ -7366,7 +7382,7 @@ async def cmd_linksite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if sid is None:
         await update.message.reply_text("No shop selected. Send /start first.")
         return
-    if not user or not db.is_admin(sid, user.id):
+    if not user or not _staff_admin(sid, user.id):
         await update.message.reply_text("Admins only.")
         return
     if not context.args:
@@ -7393,7 +7409,7 @@ async def cmd_linksite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_syncsite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only: pull the website catalog into the SPBC shop now."""
     user = update.effective_user
-    if not user or not db.is_owner(user.id):
+    if not user or not _staff_owner(user.id):
         if update.message:
             await update.message.reply_text("Owners only.")
         return

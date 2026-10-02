@@ -57,13 +57,22 @@ try:
 except ValueError:
     BACKUP_RETENTION_DAYS = 30
 
+def _telegram_id_set(raw: str) -> set[int]:
+    """Parse a comma-separated list of Telegram user IDs. Invalid parts are ignored."""
+    found: set[int] = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            found.add(int(part))
+    return found
+
+
 # Comma-separated Telegram user IDs with global owner privileges
-_owner_raw = os.getenv("OWNER_IDS", "").strip()
-OWNER_IDS: set[int] = set()
-for part in _owner_raw.split(","):
-    part = part.strip()
-    if part.isdigit():
-        OWNER_IDS.add(int(part))
+OWNER_IDS: set[int] = _telegram_id_set(os.getenv("OWNER_IDS", ""))
+
+# Comma-separated Telegram user IDs allowed to run admin/inventory/order commands.
+# Empty means nobody. Shop-admin rows in the database are not enough on their own.
+ADMIN_TELEGRAM_IDS: set[int] = _telegram_id_set(os.getenv("ADMIN_TELEGRAM_IDS", ""))
 
 # Instance-level branding defaults (overridable per shop in DB)
 BRAND_NAME = os.getenv("BRAND_NAME", "UnicornFartzzBot")
@@ -132,8 +141,14 @@ SPBC_ORDERS_ADMIN_TOKEN = os.getenv("SPBC_ORDERS_ADMIN_TOKEN", "").strip()
 # Where panel-uploaded product photos / COA files are stored (persistent disk)
 MEDIA_DIR = os.getenv("MEDIA_DIR", str(DB_PATH.parent / "uploads"))
 
+def master_venmo_handle() -> str:
+    """Platform-fee Venmo from MASTER_VENMO. Empty when unset (no built-in handle)."""
+    return (os.getenv("MASTER_VENMO") or "").strip()
+
+
 # Master Venmo handle for vendor platform-fee invoices (weekly autobill + /invoices).
-MASTER_VENMO = (os.getenv("MASTER_VENMO", "") or "").strip() or "@remycastle"
+# Read again via master_venmo_handle() if the process env can change.
+MASTER_VENMO = master_venmo_handle()
 
 # Soft checkout hold (minutes). Real stock still deducts only on admin confirm.
 try:

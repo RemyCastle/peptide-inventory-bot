@@ -757,7 +757,8 @@ def format_vendor_invoice_dm(
     """Vendor-facing weekly invoice text (plain; * markers kept for light emphasis)."""
     from config import MASTER_VENMO
 
-    venmo = (master_venmo if master_venmo is not None else MASTER_VENMO) or "@remycastle"
+    venmo = master_venmo if master_venmo is not None else MASTER_VENMO
+    venmo = (venmo or "").strip() or "(set MASTER_VENMO)"
     label = week_range_label(inv.get("week_start") or "")
     title = (inv.get("title") or f"Shop {inv.get('chat_id')}").strip()
     n = int(inv.get("order_count") or 0)

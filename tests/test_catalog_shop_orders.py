@@ -204,9 +204,9 @@ class CatalogShopOrderTests(unittest.TestCase):
             "PUBLIC_BOT_USERNAME": "UnicornMagicFactory2Bot",
             "PANEL_BASE_URL": "https://unicornfartzz-bot.onrender.com",
         }
-        with mock.patch.object(db, "OWNER_IDS", {OWNER}), mock.patch.dict(
-            os.environ, env, clear=False
-        ):
+        with mock.patch.object(db, "OWNER_IDS", {OWNER}), mock.patch.object(
+            config, "ADMIN_TELEGRAM_IDS", {OWNER}
+        ), mock.patch.dict(os.environ, env, clear=False):
             _run(bot.cmd_orders(update, context))
         self.assertTrue(replies)
         blob = replies[0]
@@ -222,7 +222,9 @@ class CatalogShopOrderTests(unittest.TestCase):
         )
         context = SimpleNamespace(user_data={"shop_id": PERSONAL})
         env = {"PUBLIC_BOT_USERNAME": "UnicornMagicFactory2Bot"}
-        with mock.patch.dict(os.environ, env, clear=False):
+        with mock.patch.object(
+            config, "ADMIN_TELEGRAM_IDS", {ADMIN}
+        ), mock.patch.dict(os.environ, env, clear=False):
             sid, ok = bot._require_admin(update, context)
         self.assertTrue(ok)
         self.assertEqual(int(sid), CATALOG)
