@@ -126,7 +126,7 @@ PANEL_BASE_URL = os.getenv("PANEL_BASE_URL", "").strip().rstrip("/")
 # spbc-orders worker admin API — lets the owner confirm a payment from
 # Telegram when the Gmail receipt matcher misses one.
 SPBC_ORDERS_URL = os.getenv(
-    "SPBC_ORDERS_URL", "https://spbc-orders.spbc.workers.dev"
+    "SPBC_ORDERS_URL", "https://spbc-orders.remycastle.workers.dev"
 ).strip().rstrip("/")
 SPBC_ORDERS_ADMIN_TOKEN = os.getenv("SPBC_ORDERS_ADMIN_TOKEN", "").strip()
 # Where panel-uploaded product photos / COA files are stored (persistent disk)
